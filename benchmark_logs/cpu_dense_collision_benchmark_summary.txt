@@ -1,0 +1,8 @@
+label=cpu_dense_collision_benchmark
+measured_steps=850
+warmup_steps=50
+avg_step_seconds=7.205243494
+min_step_seconds=0.563881526
+max_step_seconds=16.274433529
+avg_fps=0.138788
+csv_path=/mnt/c/Users/arfin/Desktop/GPU SOFA/benchmark_logs/cpu_dense_collision_benchmark_timings.csv
