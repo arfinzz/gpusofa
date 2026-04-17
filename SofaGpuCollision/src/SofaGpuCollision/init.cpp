@@ -26,12 +26,12 @@ SOFA_GPU_COLLISION_API const char* getModuleLicense()
 
 SOFA_GPU_COLLISION_API const char* getModuleDescription()
 {
-    return "GPU-first broad phase and narrow phase wrappers for SOFA collision detection.";
+    return "GPU-first collision phases with native profiling and deterministic rigid-path helpers for SOFA.";
 }
 
 SOFA_GPU_COLLISION_API const char* getModuleComponentList()
 {
-    return "GpuCollisionBroadPhase,GpuCollisionNarrowPhase";
+    return "GpuCollisionBroadPhase,GpuCollisionNarrowPhase,GpuKinematicRigidController,GpuPipelineBenchmarkController";
 }
 
 } // extern "C"

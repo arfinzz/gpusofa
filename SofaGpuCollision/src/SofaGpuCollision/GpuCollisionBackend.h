@@ -40,16 +40,70 @@ struct BackendStatus
     std::string message;
 };
 
+struct BackendExecutionStats
+{
+    double gpuKernelMilliseconds { 0.0 };
+    std::uint64_t hostToDeviceBytes { 0 };
+    std::uint64_t deviceToHostBytes { 0 };
+    std::uint64_t deviceAllocationBytes { 0 };
+    std::uint32_t kernelLaunchCount { 0 };
+    std::uint32_t inputPrimitiveCount { 0 };
+    std::uint32_t outputPairCount { 0 };
+    std::uint32_t outputCandidateCount { 0 };
+};
+
+struct NarrowPhaseContactCandidate
+{
+    std::uint32_t pairIndex { 0 };
+    std::uint32_t firstLeafIndex { 0 };
+    std::uint32_t secondLeafIndex { 0 };
+};
+
+struct TriangleVertex
+{
+    float x { 0.0f };
+    float y { 0.0f };
+    float z { 0.0f };
+};
+
+struct TrianglePrimitive
+{
+    TriangleVertex p0;
+    TriangleVertex p1;
+    TriangleVertex p2;
+    std::uint32_t triangleIndex { 0 };
+};
+
+struct ExactContact
+{
+    std::uint32_t firstTriangleIndex { 0 };
+    std::uint32_t secondTriangleIndex { 0 };
+    TriangleVertex pointOnFirst;
+    TriangleVertex pointOnSecond;
+    TriangleVertex normal;
+    float signedDistance { 0.0f };
+};
+
 SOFA_GPU_COLLISION_API BackendStatus probe();
 
 SOFA_GPU_COLLISION_API bool computeBroadPhasePairs(
     const std::vector<AxisAlignedBoundingBox>& boxes,
     std::vector<BroadPhaseIndexPair>& pairs,
-    std::string& diagnostic);
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
 
 SOFA_GPU_COLLISION_API bool prefilterNarrowPhasePairs(
     const std::vector<NarrowPhaseTreePair>& inputTrees,
     std::vector<std::uint32_t>& survivingPairIndices,
-    std::string& diagnostic);
+    std::vector<NarrowPhaseContactCandidate>* contactCandidates,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
+
+SOFA_GPU_COLLISION_API bool computeExactTriangleContacts(
+    const std::vector<TrianglePrimitive>& firstTriangles,
+    const std::vector<TrianglePrimitive>& secondTriangles,
+    std::vector<ExactContact>& contacts,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
 
 } // namespace SofaGpuCollision::backend

@@ -101,4 +101,4 @@ def build_blade_grid(rows=4, cols=4, spacing_x=3.1, spacing_z=3.1, start_y=3.6):
 
 
 def default_benchmark_log_dir(base_dir):
-    return os.path.join(base_dir, "benchmark_logs")
+    return os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(base_dir, "benchmark_logs"))

@@ -6,9 +6,7 @@ current_dir = os.path.dirname(__file__)
 sys.path.append(current_dir)
 
 from deterministic_blade_controller import (
-    BenchmarkTimingController,
     DeterministicBladeForceController,
-    KinematicBladePathController,
 )
 
 # -----------------------------------------------------------------------------
@@ -17,7 +15,7 @@ from deterministic_blade_controller import (
 #   USE_KINEMATIC_PATH = True   -> exact position path (most repeatable benchmark)
 # -----------------------------------------------------------------------------
 USE_KINEMATIC_PATH = True
-BENCHMARK_LOG_DIR = os.path.join(current_dir, "benchmark_logs")
+BENCHMARK_LOG_DIR = os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(current_dir, "benchmark_logs"))
 
 
 def generate_tissue_mesh(nx=21, ny=3, nz=21,
@@ -126,14 +124,15 @@ def createScene(root):
     root.addObject('ParallelBVHNarrowPhase')
     root.addObject('LocalMinDistance', alarmDistance=0.10, contactDistance=0.03, angleCone=0.05)
     root.addObject('CollisionResponse', response='FrictionContactConstraint', responseParams='mu=0.6')
-    root.addObject(BenchmarkTimingController(
+    root.addObject('GpuPipelineBenchmarkController',
         name='GpuTissueBenchmarkTiming',
         label='gpu_tissue_deterministic_fixed',
-        output_dir=BENCHMARK_LOG_DIR,
-        warmup_steps=50,
-        flush_interval=50,
-        log_interval=200,
-    ))
+        outputDir=BENCHMARK_LOG_DIR,
+        warmupSteps=50,
+        flushInterval=50,
+        logInterval=200,
+        printProgress=True,
+    )
 
     positions, tetrahedra, fixed_indices, surface_tris = generate_tissue_mesh()
 
@@ -186,6 +185,20 @@ def createScene(root):
                                   name='externalForce',
                                   forces=[[0, 0, 0, 0, 0, 0]])
     blade.addObject('LinearSolverConstraintCorrection', linearSolver='@LinearSolver')
+    if USE_KINEMATIC_PATH:
+        blade.addObject(
+            'GpuKinematicRigidController',
+            name='BladePathController',
+            startPosition=[0.0, 3.0, 0.0, 0, 0, 0, 1],
+            settleSteps=100,
+            descendSteps=350,
+            sweepSteps=700,
+            liftSteps=200,
+            totalDown=2.6,
+            totalSweepX=2.5,
+            totalLift=2.0,
+            sweepSign=1.0,
+        )
 
     blade_col = blade.addChild('Collision')
     blade_verts = [
@@ -211,20 +224,7 @@ def createScene(root):
                         color='0.75 0.75 0.85 1.0')
     blade_vis.addObject('RigidMapping', input='@../rigidDof', output='@visualModel')
 
-    if USE_KINEMATIC_PATH:
-        root.addObject(KinematicBladePathController(
-            name='BladePathController',
-            rigid_dofs=blade.rigidDof,
-            start_pos=[0.0, 3.0, 0.0, 0, 0, 0, 1],
-            settle_steps=100,
-            descend_steps=350,
-            sweep_steps=700,
-            lift_steps=200,
-            total_down=2.6,
-            total_sweep_x=2.5,
-            total_lift=2.0,
-        ))
-    else:
+    if not USE_KINEMATIC_PATH:
         root.addObject(DeterministicBladeForceController(
             name='BladeForceSchedule',
             force_field=blade_force,

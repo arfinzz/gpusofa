@@ -30,10 +30,12 @@ private:
     DataBool d_enableGpu;
     DataBool d_allowCpuFallback;
     DataBool d_logBackendStatus;
+    DataBool d_logBoxesOnce;
 
     std::vector<sofa::core::CollisionModel*> m_pendingModels;
     bool m_backendAvailable { false };
     bool m_reportedFallback { false };
+    bool m_loggedBoxes { false };
 };
 
 } // namespace SofaGpuCollision

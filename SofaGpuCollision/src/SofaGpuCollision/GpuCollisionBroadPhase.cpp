@@ -1,12 +1,15 @@
 #include <SofaGpuCollision/GpuCollisionBackend.h>
 #include <SofaGpuCollision/GpuCollisionBroadPhase.h>
+#include <SofaGpuCollision/GpuPipelineProfiling.h>
 
 #include <sofa/component/collision/geometry/CubeModel.h>
+#include <sofa/component/collision/geometry/TriangleCollisionModel.h>
 #include <sofa/core/collision/Intersection.h>
 #include <sofa/core/ObjectFactory.h>
 #include <sofa/helper/logging/Messaging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace
 
 using Cube = sofa::component::collision::geometry::Cube;
 using CubeCollisionModel = sofa::component::collision::geometry::CubeCollisionModel;
+using TriangleCollisionModel = sofa::component::collision::geometry::TriangleCollisionModel<sofa::defaulttype::Vec3Types>;
 
 struct CollisionModelEntry
 {
@@ -28,11 +32,59 @@ struct CollisionModelEntry
 };
 
 bool tryExtractRootAabb(
-    sofa::core::CollisionModel* rootCollisionModel,
+    sofa::core::CollisionModel* collisionModel,
     backend::AxisAlignedBoundingBox& outBox)
 {
-    auto* cubeModel = dynamic_cast<CubeCollisionModel*>(rootCollisionModel);
-    if (cubeModel == nullptr || cubeModel->empty() || cubeModel->getSize() == 0)
+    auto* triangleModel = dynamic_cast<TriangleCollisionModel*>(collisionModel == nullptr ? nullptr : collisionModel->getLast());
+    if (triangleModel != nullptr && !triangleModel->empty())
+    {
+        const auto& positions = triangleModel->getX();
+        const auto& triangles = triangleModel->getTriangles();
+        if (!positions.empty() && !triangles.empty())
+        {
+            const auto& firstTriangle = triangles.front();
+            const auto& seed = positions[firstTriangle[0]];
+
+            float minX = static_cast<float>(seed[0]);
+            float minY = static_cast<float>(seed[1]);
+            float minZ = static_cast<float>(seed[2]);
+            float maxX = minX;
+            float maxY = minY;
+            float maxZ = minZ;
+
+            for (const auto& triangle : triangles)
+            {
+                for (unsigned int vertexOffset = 0; vertexOffset < 3; ++vertexOffset)
+                {
+                    const auto& p = positions[triangle[vertexOffset]];
+                    minX = std::min(minX, static_cast<float>(p[0]));
+                    minY = std::min(minY, static_cast<float>(p[1]));
+                    minZ = std::min(minZ, static_cast<float>(p[2]));
+                    maxX = std::max(maxX, static_cast<float>(p[0]));
+                    maxY = std::max(maxY, static_cast<float>(p[1]));
+                    maxZ = std::max(maxZ, static_cast<float>(p[2]));
+                }
+            }
+
+            outBox.minX = minX;
+            outBox.minY = minY;
+            outBox.minZ = minZ;
+            outBox.maxX = maxX;
+            outBox.maxY = maxY;
+            outBox.maxZ = maxZ;
+            return true;
+        }
+    }
+
+    auto* cubeModel = dynamic_cast<CubeCollisionModel*>(collisionModel == nullptr ? nullptr : collisionModel->getFirst());
+    if (cubeModel == nullptr)
+    {
+        return false;
+    }
+
+    cubeModel->computeBoundingTree();
+
+    if (cubeModel->empty() || cubeModel->getSize() == 0)
     {
         return false;
     }
@@ -61,6 +113,7 @@ GpuCollisionBroadPhase::GpuCollisionBroadPhase()
     , d_enableGpu(initData(&d_enableGpu, true, "enableGPU", "Try to execute the GPU broad phase backend."))
     , d_allowCpuFallback(initData(&d_allowCpuFallback, true, "allowCPUFallback", "Use the SOFA CPU broad phase if GPU execution is unavailable."))
     , d_logBackendStatus(initData(&d_logBackendStatus, true, "logBackendStatus", "Log the selected broad phase backend during init."))
+    , d_logBoxesOnce(initData(&d_logBoxesOnce, false, "logBoxesOnce", "Log the first-frame root AABBs collected for GPU broad phase."))
 {
 }
 
@@ -107,9 +160,16 @@ void GpuCollisionBroadPhase::addCollisionModel(sofa::core::CollisionModel* cm)
 
 void GpuCollisionBroadPhase::endBroadPhase()
 {
+    const auto phaseStart = std::chrono::steady_clock::now();
+    profiling::StageSnapshot stageSnapshot;
+
     if (!d_enableGpu.getValue())
     {
         sofa::component::collision::detection::algorithm::BruteForceBroadPhase::endBroadPhase();
+        stageSnapshot.cpuFallbackUsed = true;
+        stageSnapshot.wallMilliseconds =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
+        profiling::recordBroadPhase(stageSnapshot);
         return;
     }
 
@@ -188,13 +248,34 @@ void GpuCollisionBroadPhase::endBroadPhase()
         }
     }
 
+    if (d_logBoxesOnce.getValue() && !m_loggedBoxes)
+    {
+        m_loggedBoxes = true;
+        for (std::size_t i = 0; i < entries.size(); ++i)
+        {
+            const auto& entry = entries[i];
+            if (!entry.gpuEligible)
+            {
+                msg_info() << "[GpuCollisionBroadPhase] model[" << i << "] gpuEligible=false";
+                continue;
+            }
+
+            msg_info() << "[GpuCollisionBroadPhase] model[" << i << "] "
+                       << "min=(" << entry.box.minX << ", " << entry.box.minY << ", " << entry.box.minZ << ") "
+                       << "max=(" << entry.box.maxX << ", " << entry.box.maxY << ", " << entry.box.maxZ << ")";
+        }
+    }
+
+    stageSnapshot.inputPrimitiveCount = static_cast<std::uint32_t>(gpuBoxes.size());
+
     bool gpuSucceeded = false;
     std::string diagnostic;
     std::vector<backend::BroadPhaseIndexPair> gpuPairs;
+    backend::BackendExecutionStats backendStats;
 
     if (m_backendAvailable && gpuBoxes.size() >= 2)
     {
-        gpuSucceeded = backend::computeBroadPhasePairs(gpuBoxes, gpuPairs, diagnostic);
+        gpuSucceeded = backend::computeBroadPhasePairs(gpuBoxes, gpuPairs, diagnostic, &backendStats);
     }
     else if (m_backendAvailable)
     {
@@ -210,11 +291,23 @@ void GpuCollisionBroadPhase::endBroadPhase()
     if (!gpuSucceeded && !d_allowCpuFallback.getValue())
     {
         this->cmPairs.clear();
+        stageSnapshot.cpuFallbackUsed = true;
+        stageSnapshot.wallMilliseconds =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
+        profiling::recordBroadPhase(stageSnapshot);
         return;
     }
 
     if (gpuSucceeded)
     {
+        stageSnapshot.gpuUsed = true;
+        stageSnapshot.gpuKernelMilliseconds = backendStats.gpuKernelMilliseconds;
+        stageSnapshot.hostToDeviceBytes = backendStats.hostToDeviceBytes;
+        stageSnapshot.deviceToHostBytes = backendStats.deviceToHostBytes;
+        stageSnapshot.deviceAllocationBytes = backendStats.deviceAllocationBytes;
+        stageSnapshot.kernelLaunchCount = backendStats.kernelLaunchCount;
+        stageSnapshot.inputPrimitiveCount = backendStats.inputPrimitiveCount;
+        stageSnapshot.outputPairCount = backendStats.outputPairCount;
         for (const auto& pair : gpuPairs)
         {
             const auto entryIndexA = gpuEntryIndices[pair.first];
@@ -223,6 +316,10 @@ void GpuCollisionBroadPhase::endBroadPhase()
             const auto& b = entries[entryIndexB];
             appendPotentialPair(a.firstCollisionModel, a.lastCollisionModel, b.firstCollisionModel, b.lastCollisionModel);
         }
+    }
+    else
+    {
+        stageSnapshot.cpuFallbackUsed = true;
     }
 
     for (std::size_t i = 0; i < entries.size(); ++i)
@@ -239,6 +336,10 @@ void GpuCollisionBroadPhase::endBroadPhase()
             appendPotentialPair(a.firstCollisionModel, a.lastCollisionModel, b.firstCollisionModel, b.lastCollisionModel);
         }
     }
+
+    stageSnapshot.wallMilliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
+    profiling::recordBroadPhase(stageSnapshot);
 }
 
 } // namespace SofaGpuCollision

@@ -215,7 +215,8 @@ class BenchmarkTimingController(Sofa.Core.Controller):
         self.warmup_steps = int(kwargs.get("warmup_steps", 50))
         self.flush_interval = int(kwargs.get("flush_interval", 50))
         self.log_interval = int(kwargs.get("log_interval", 200))
-        self.output_dir = os.path.abspath(str(kwargs.get("output_dir", os.path.join(os.getcwd(), "benchmark_logs"))))
+        default_output_dir = os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(os.getcwd(), "benchmark_logs"))
+        self.output_dir = os.path.abspath(str(kwargs.get("output_dir", default_output_dir)))
         self.current_step = 0
         self.step_start_time = None
         self.measured_count = 0

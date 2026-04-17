@@ -12,8 +12,19 @@ from dense_collision_benchmark_common import (
     default_benchmark_log_dir,
     generate_tissue_mesh,
 )
+from gpu_phase2_tissue_common import (
+    PHASE2_EXPERIMENTAL_NOTES,
+    add_cpu_collision_surface,
+    add_phase2_gpu_tissue,
+    add_tissue_visual,
+)
+
 
 BENCHMARK_LOG_DIR = default_benchmark_log_dir(current_dir)
+
+
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
 
 
 def createScene(root):
@@ -30,7 +41,6 @@ def createScene(root):
         'Sofa.Component.Mass',
         'Sofa.Component.ODESolver.Backward',
         'Sofa.Component.LinearSolver.Iterative',
-        'Sofa.Component.LinearSolver.Direct',
         'Sofa.Component.Collision.Detection.Algorithm',
         'Sofa.Component.Collision.Detection.Intersection',
         'Sofa.Component.Collision.Geometry',
@@ -48,24 +58,27 @@ def createScene(root):
 
     root.addObject('FreeMotionAnimationLoop', name='FreeMotion')
     root.addObject('BlockGaussSeidelConstraintSolver', maxIterations=1000, tolerance=1e-6)
-
     root.addObject('CollisionPipeline')
-    root.addObject('GpuCollisionBroadPhase',
-                   enableGPU=True,
-                   allowCPUFallback=True,
-                   logBackendStatus=True)
-    root.addObject('GpuCollisionNarrowPhase',
-                   enableGPU=True,
-                   allowCPUFallback=True,
-                   logBackendStatus=True,
-                   minGPUPairCount=8)
+    root.addObject('GpuCollisionBroadPhase', enableGPU=True, allowCPUFallback=True, logBackendStatus=True)
+    root.addObject(
+        'GpuCollisionNarrowPhase',
+        enableGPU=True,
+        allowCPUFallback=True,
+        logBackendStatus=True,
+        minGPUPairCount=8,
+    )
     root.addObject('LocalMinDistance', alarmDistance=0.12, contactDistance=0.04, angleCone=0.05)
     root.addObject('CollisionResponse', response='FrictionContactConstraint', responseParams='mu=0.6')
-    root.addObject('GpuPipelineBenchmarkController',
-        name='GpuDenseCollisionTiming',
-        label='gpu_dense_collision_plugin_benchmark',
+    root.addObject(
+        'GpuPipelineBenchmarkController',
+        name='GpuDenseCollisionPhase2Timing',
+        label='gpu_dense_collision_phase2_experimental',
         outputDir=BENCHMARK_LOG_DIR,
-        warmupSteps=50,
+        pipelinePhase='phase2-experimental',
+        tissueSolver='CGLinearSolver(iterative, graph-scattered)',
+        tissueForceField='TetrahedronFEMForceField(template=CudaVec3f, computeGlobalMatrix=false)',
+        notes=PHASE2_EXPERIMENTAL_NOTES,
+        warmupSteps=_env_int('SOFA_PIPELINE_WARMUP_STEPS', 50),
         flushInterval=50,
         logInterval=200,
         printProgress=True,
@@ -74,31 +87,17 @@ def createScene(root):
     positions, tetrahedra, fixed_indices, surface_tris = generate_tissue_mesh()
 
     tissue = root.addChild('Tissue')
-    tissue.addObject('EulerImplicitSolver', name='OdeSolver', rayleighStiffness=0.1, rayleighMass=0.1)
-    tissue.addObject('SparseLDLSolver', name='LinearSolver', template='CompressedRowSparseMatrixd')
-    tissue.addObject('TetrahedronSetTopologyContainer', name='topo', tetrahedra=tetrahedra)
-    tissue.addObject('TetrahedronSetTopologyModifier')
-    tissue.addObject('TetrahedronSetGeometryAlgorithms', template='CudaVec3f')
-    tissue.addObject('MechanicalObject', name='dofs', template='CudaVec3f', position=positions)
-    tissue.addObject('UniformMass', name='mass', totalMass=1.0)
-    tissue.addObject('TetrahedronFEMForceField', name='FEM', template='CudaVec3f',
-                     youngModulus=800, poissonRatio=0.45, method='large',
-                     computeGlobalMatrix=False)
-    tissue.addObject('FixedProjectiveConstraint', name='fixEdges', indices=fixed_indices)
-    tissue.addObject('LinearSolverConstraintCorrection', linearSolver='@LinearSolver')
-
-    tissue_col = tissue.addChild('Collision')
-    tissue_col.addObject('MechanicalObject', name='colDofs', template='Vec3d', position=positions)
-    tissue_col.addObject('MeshTopology', name='colTopo', triangles=surface_tris)
-    tissue_col.addObject('IdentityMapping', input='@../dofs', output='@colDofs')
-    tissue_col.addObject('TriangleCollisionModel', selfCollision=False)
-    tissue_col.addObject('LineCollisionModel')
-    tissue_col.addObject('PointCollisionModel')
-
-    tissue_vis = tissue.addChild('Visual')
-    tissue_vis.addObject('OglModel', name='visualModel', position=positions, triangles=surface_tris,
-                         color='0.88 0.34 0.34 0.8')
-    tissue_vis.addObject('IdentityMapping', input='@../dofs', output='@visualModel')
+    add_phase2_gpu_tissue(
+        tissue,
+        positions,
+        tetrahedra,
+        fixed_indices,
+        total_mass=1.0,
+        young_modulus=800,
+        poisson_ratio=0.45,
+    )
+    add_cpu_collision_surface(tissue, positions, surface_tris)
+    add_tissue_visual(tissue, positions, surface_tris, '0.88 0.34 0.34 0.8')
 
     blade_verts, blade_tris = create_blade_geometry()
     start_positions, sweep_signs = build_blade_grid(rows=4, cols=4, spacing_x=3.1, spacing_z=3.1, start_y=3.6)
@@ -106,7 +105,7 @@ def createScene(root):
     for blade_index, start_pos in enumerate(start_positions):
         blade = root.addChild(f'Blade{blade_index:02d}')
         blade.addObject('EulerImplicitSolver', name='OdeSolver', rayleighStiffness=0.0, rayleighMass=0.1)
-        blade.addObject('SparseLDLSolver', name='LinearSolver', template='CompressedRowSparseMatrixd')
+        blade.addObject('CGLinearSolver', name='LinearSolver', iterations=25, tolerance=1e-9, threshold=1e-9)
         blade.addObject(
             'MechanicalObject',
             name='rigidDof',
@@ -116,7 +115,7 @@ def createScene(root):
             showObjectScale=0.12,
         )
         blade.addObject('UniformMass', name='mass', totalMass=0.25)
-        blade.addObject('LinearSolverConstraintCorrection', linearSolver='@LinearSolver')
+        blade.addObject('UncoupledConstraintCorrection', defaultCompliance=1.0e-6)
         blade.addObject(
             'GpuKinematicRigidController',
             name='RigidPathController',
