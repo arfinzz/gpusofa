@@ -53,7 +53,19 @@ def createScene(root):
     root.addObject('BlockGaussSeidelConstraintSolver', maxIterations=50, tolerance=1e-6)
     root.addObject('CollisionPipeline')
     root.addObject('GpuCollisionBroadPhase', enableGPU=True, allowCPUFallback=True, logBackendStatus=True)
-    root.addObject('GpuCollisionNarrowPhase', enableGPU=True, allowCPUFallback=True, logBackendStatus=True, minGPUPairCount=1)
+    root.addObject(
+        'GpuCollisionNarrowPhase',
+        enableGPU=True,
+        allowCPUFallback=True,
+        logBackendStatus=True,
+        detailedProfiling=_env_bool('SOFA_GPU_DETAILED_PROFILING', False),
+        copyContactsToHost=_env_bool('SOFA_COPY_CONTACTS_TO_HOST', True),
+        deduplicatePairs=_env_bool('SOFA_DEDUPLICATE_PAIRS', True),
+        usePinnedHostStaging=_env_bool('SOFA_USE_PINNED_HOST_STAGING', True),
+        useGpuHashDedupe=_env_bool('SOFA_USE_GPU_HASH_DEDUPE', _env_bool('SOFA_DEDUPLICATE_PAIRS', True)),
+        canonicalPairEmission=_env_bool('SOFA_CANONICAL_PAIR_EMISSION', False),
+        minGPUPairCount=1,
+    )
     root.addObject('LocalMinDistance', alarmDistance=0.20, contactDistance=0.05, angleCone=0.0)
     if _env_bool('SOFA_ENABLE_VALIDATION_RESPONSE', False):
         root.addObject('CollisionResponse', response='FrictionContactConstraint', responseParams='mu=0.4')

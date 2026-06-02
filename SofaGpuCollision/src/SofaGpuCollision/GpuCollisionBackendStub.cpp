@@ -56,4 +56,80 @@ bool computeExactTriangleContacts(
     return false;
 }
 
+bool computeDenseGridTriangleContacts(
+    const std::vector<TrianglePrimitive>&,
+    const std::vector<TrianglePrimitive>&,
+    const DenseGridConfig&,
+    std::vector<ExactContact>&,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+    }
+    diagnostic = "GPU dense-grid triangle collision is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool computeDenseGridIndexedTriangleContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    std::vector<ExactContact>&,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+    }
+    diagnostic = "GPU dense-grid indexed triangle collision is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool computeFeatureBasedProximityContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+    }
+    if (proximityStats != nullptr)
+    {
+        *proximityStats = FeatureBasedProximityStats {};
+    }
+    diagnostic = "GPU feature-based proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool computeFeatureBasedVertexTriangleContacts(
+    const PointCloudSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+    }
+    if (proximityStats != nullptr)
+    {
+        *proximityStats = FeatureBasedProximityStats {};
+    }
+    diagnostic = "GPU feature-based vertex-triangle proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
 } // namespace SofaGpuCollision::backend

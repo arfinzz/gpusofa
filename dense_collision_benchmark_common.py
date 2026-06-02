@@ -1,6 +1,13 @@
 import os
 
 
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def generate_tissue_mesh(nx=31, ny=5, nz=31,
                          sx=14.0, sy=0.9, sz=14.0,
                          border=2):
@@ -84,6 +91,92 @@ def create_blade_geometry(length=1.1, height=0.28, thickness=0.08):
     return blade_verts, blade_tris
 
 
+def create_subdivided_blade_geometry(length=5.5, height=0.8, thickness=0.16,
+                                     segments_x=128, segments_y=24, segments_z=4):
+    positions = []
+    triangles = []
+
+    def add_rect_face(origin, u_vec, v_vec, u_segments, v_segments, flip=False):
+        base = len(positions)
+        ox, oy, oz = origin
+        ux, uy, uz = u_vec
+        vx, vy, vz = v_vec
+
+        for j in range(v_segments + 1):
+            tv = j / v_segments
+            for i in range(u_segments + 1):
+                tu = i / u_segments
+                positions.append([
+                    ox + ux * tu + vx * tv,
+                    oy + uy * tu + vy * tv,
+                    oz + uz * tu + vz * tv,
+                ])
+
+        def idx(i, j):
+            return base + i + j * (u_segments + 1)
+
+        for j in range(v_segments):
+            for i in range(u_segments):
+                a = idx(i, j)
+                b = idx(i + 1, j)
+                c = idx(i + 1, j + 1)
+                d = idx(i, j + 1)
+                if flip:
+                    triangles.append([a, c, b])
+                    triangles.append([a, d, c])
+                else:
+                    triangles.append([a, b, c])
+                    triangles.append([a, c, d])
+
+    hx = 0.5 * length
+    hy = 0.5 * height
+    hz = 0.5 * thickness
+
+    add_rect_face([-hx, -hy, -hz], [length, 0.0, 0.0], [0.0, height, 0.0],
+                  segments_x, segments_y, flip=True)
+    add_rect_face([-hx, -hy, hz], [length, 0.0, 0.0], [0.0, height, 0.0],
+                  segments_x, segments_y, flip=False)
+    add_rect_face([-hx, -hy, -hz], [length, 0.0, 0.0], [0.0, 0.0, thickness],
+                  segments_x, segments_z, flip=False)
+    add_rect_face([-hx, hy, -hz], [length, 0.0, 0.0], [0.0, 0.0, thickness],
+                  segments_x, segments_z, flip=True)
+    add_rect_face([-hx, -hy, -hz], [0.0, height, 0.0], [0.0, 0.0, thickness],
+                  segments_y, segments_z, flip=True)
+    add_rect_face([hx, -hy, -hz], [0.0, height, 0.0], [0.0, 0.0, thickness],
+                  segments_y, segments_z, flip=False)
+
+    return positions, triangles
+
+
+def translate_vertices(vertices, offset):
+    ox, oy, oz = offset
+    return [[x + ox, y + oy, z + oz] for x, y, z in vertices]
+
+
+def generate_tissue_surface_grid(nx=81, nz=81, sx=8.0, sz=8.0, y=0.0):
+    positions = []
+    for k in range(nz):
+        for i in range(nx):
+            x = -sx / 2.0 + i * sx / (nx - 1)
+            z = -sz / 2.0 + k * sz / (nz - 1)
+            positions.append([x, y, z])
+
+    def node(i, k):
+        return i + k * nx
+
+    triangles = []
+    for k in range(nz - 1):
+        for i in range(nx - 1):
+            v0 = node(i, k)
+            v1 = node(i + 1, k)
+            v2 = node(i + 1, k + 1)
+            v3 = node(i, k + 1)
+            triangles.append([v0, v1, v2])
+            triangles.append([v0, v2, v3])
+
+    return positions, triangles
+
+
 def build_blade_grid(rows=4, cols=4, spacing_x=3.1, spacing_z=3.1, start_y=3.6):
     start_positions = []
     sweep_signs = []
@@ -101,4 +194,4 @@ def build_blade_grid(rows=4, cols=4, spacing_x=3.1, spacing_z=3.1, start_y=3.6):
 
 
 def default_benchmark_log_dir(base_dir):
-    return os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(base_dir, "benchmark_logs"))
+    return os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(base_dir, "output", "benchmark_logs"))

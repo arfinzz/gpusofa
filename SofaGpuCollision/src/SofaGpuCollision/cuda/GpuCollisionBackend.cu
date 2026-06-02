@@ -1,7 +1,21 @@
 #include <SofaGpuCollision/GpuCollisionBackend.h>
 
 #include <cuda_runtime.h>
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define SOFAGPUCOLLISION_HAS_NVTX 1
+#else
+#define SOFAGPUCOLLISION_HAS_NVTX 0
+#endif
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -48,6 +62,15 @@ struct DeviceTriangle
     std::uint32_t triangleIndex;
 };
 
+static_assert(std::is_trivially_copyable_v<SofaGpuCollision::backend::TriangleVertex>);
+static_assert(std::is_trivially_copyable_v<SofaGpuCollision::backend::TrianglePrimitive>);
+static_assert(sizeof(SofaGpuCollision::backend::TriangleVertex) == sizeof(float3));
+static_assert(alignof(SofaGpuCollision::backend::TriangleVertex) == alignof(float3));
+static_assert(sizeof(SofaGpuCollision::backend::TrianglePrimitive) == sizeof(DeviceTriangle));
+static_assert(alignof(SofaGpuCollision::backend::TrianglePrimitive) == alignof(DeviceTriangle));
+
+using BackendTriangleVertex = SofaGpuCollision::backend::TriangleVertex;
+
 struct DeviceExactContact
 {
     std::uint32_t firstTriangleIndex;
@@ -57,6 +80,661 @@ struct DeviceExactContact
     float3 normal;
     float signedDistance;
 };
+
+struct DeviceDenseGridConfig
+{
+    float3 gridMin;
+    float3 gridMax;
+    float3 inverseCellSize;
+    std::uint32_t resolutionX;
+    std::uint32_t resolutionY;
+    std::uint32_t resolutionZ;
+    float contactDistance;
+    std::uint32_t maxTissueTrianglesPerCell;
+    std::uint32_t maxToolTrianglesPerCell;
+    std::uint32_t maxCandidatePairs;
+    std::uint32_t pairHashCapacity;
+    bool useGpuHashDedupe;
+    bool canonicalPairEmission;
+};
+
+struct DeviceCellBucket
+{
+    std::uint32_t tissueCount;
+    std::uint32_t toolCount;
+};
+
+struct DeviceDenseGridStats
+{
+    std::uint32_t activeMixedCellCount;
+    std::uint32_t tissueInsertCount;
+    std::uint32_t toolInsertCount;
+    std::uint32_t maxTissueCellOccupancy;
+    std::uint32_t maxToolCellOccupancy;
+    std::uint32_t hashDedupeProbeOverflowCount;
+};
+
+constexpr std::uint64_t kEmptyPairSlot = 0xffffffffffffffffull;
+
+struct ScopedNvtxRange
+{
+    bool enabled { false };
+
+    ScopedNvtxRange(const char* name, const bool active)
+        : enabled(active)
+    {
+#if SOFAGPUCOLLISION_HAS_NVTX
+        if (enabled)
+        {
+            nvtxRangePushA(name);
+        }
+#else
+        (void)name;
+        (void)active;
+#endif
+    }
+
+    ~ScopedNvtxRange()
+    {
+#if SOFAGPUCOLLISION_HAS_NVTX
+        if (enabled)
+        {
+            nvtxRangePop();
+        }
+#endif
+    }
+};
+
+template<class T>
+cudaError_t ensureDeviceArray(T*& pointer, std::size_t& capacity, const std::size_t required, std::uint64_t& newlyAllocatedBytes)
+{
+    if (required <= capacity)
+    {
+        return cudaSuccess;
+    }
+
+    cudaFree(pointer);
+    pointer = nullptr;
+    capacity = 0;
+
+    const cudaError_t err = cudaMalloc(&pointer, required * sizeof(T));
+    if (err == cudaSuccess)
+    {
+        capacity = required;
+        newlyAllocatedBytes += static_cast<std::uint64_t>(required * sizeof(T));
+    }
+    return err;
+}
+
+template<class T>
+cudaError_t ensurePinnedHostArray(T*& pointer, std::size_t& capacity, const std::size_t required, std::uint64_t& newlyAllocatedBytes)
+{
+    if (required <= capacity)
+    {
+        return cudaSuccess;
+    }
+
+    cudaFreeHost(pointer);
+    pointer = nullptr;
+    capacity = 0;
+
+    const cudaError_t err = cudaHostAlloc(&pointer, required * sizeof(T), cudaHostAllocDefault);
+    if (err == cudaSuccess)
+    {
+        capacity = required;
+        newlyAllocatedBytes += static_cast<std::uint64_t>(required * sizeof(T));
+    }
+    return err;
+}
+
+struct DenseGridWorkspace
+{
+    DeviceTriangle* tissueTriangles { nullptr };
+    DeviceTriangle* toolTriangles { nullptr };
+    DeviceAabb* tissueAabbs { nullptr };
+    DeviceAabb* toolAabbs { nullptr };
+    DeviceCellBucket* grid { nullptr };
+    std::uint32_t* activeCellIds { nullptr };
+    std::uint32_t* cellTissueIds { nullptr };
+    std::uint32_t* cellToolIds { nullptr };
+    std::uint64_t* candidatePairs { nullptr };
+    unsigned long long* pairHashKeys { nullptr };
+    DeviceExactContact* contacts { nullptr };
+    std::uint32_t* rawCandidateCount { nullptr };
+    std::uint32_t* candidateCount { nullptr };
+    std::uint32_t* contactCount { nullptr };
+    std::uint32_t* overflowCount { nullptr };
+    std::uint32_t* activeCellCount { nullptr };
+    DeviceDenseGridStats* denseGridStats { nullptr };
+    SofaGpuCollision::backend::TriangleVertex* indexedTissuePositions { nullptr };
+    SofaGpuCollision::backend::TriangleVertex* indexedToolPositions { nullptr };
+    std::uint32_t* indexedTissueIndices { nullptr };
+    std::uint32_t* indexedToolIndices { nullptr };
+    DeviceTriangle* pinnedTissueTriangles { nullptr };
+    DeviceTriangle* pinnedToolTriangles { nullptr };
+    SofaGpuCollision::backend::TriangleVertex* pinnedIndexedTissuePositions { nullptr };
+    SofaGpuCollision::backend::TriangleVertex* pinnedIndexedToolPositions { nullptr };
+    std::uint32_t* pinnedIndexedTissueIndices { nullptr };
+    std::uint32_t* pinnedIndexedToolIndices { nullptr };
+    // Feature-based proximity (VF/EE) outputs and counters
+    void* proximityContacts { nullptr };  // DeviceProximityContact* (forward-typed)
+    std::uint32_t* proximityContactCount { nullptr };
+    std::uint32_t* proximityOverflowCount { nullptr };
+    std::uint32_t* proximityVfCount { nullptr };
+    std::uint32_t* proximityFvCount { nullptr };
+    std::uint32_t* proximityEeCount { nullptr };
+    std::size_t proximityContactCapacity { 0 };
+    // Workspace-owned counter-readback buffer (5 contiguous uint32s). Lets us
+    // do one cudaMemcpyAsync per frame instead of five separate copies.
+    std::uint32_t* proximityCountersHostPinned { nullptr };  // 5 uint32s, pinned for fast D2H
+    // Workspace-owned CUDA events so the FBP path does not pay cudaEventCreate /
+    // cudaEventDestroy on every frame. Created lazily on first use.
+    cudaEvent_t fbpStartEvent { nullptr };
+    cudaEvent_t fbpEndEvent { nullptr };
+    bool fbpEventsReady { false };
+    // Frame counter for sampled deep-counter readback.
+    std::uint64_t frameCounter { 0 };
+
+    std::size_t tissueTriangleCapacity { 0 };
+    std::size_t toolTriangleCapacity { 0 };
+    std::size_t tissueAabbCapacity { 0 };
+    std::size_t toolAabbCapacity { 0 };
+    std::size_t gridCellCapacity { 0 };
+    std::size_t activeCellCapacity { 0 };
+    std::size_t tissueBucketCapacity { 0 };
+    std::size_t toolBucketCapacity { 0 };
+    std::size_t candidateCapacity { 0 };
+    std::size_t pairHashCapacity { 0 };
+    std::size_t contactCapacity { 0 };
+    std::size_t rawCandidateCounterCapacity { 0 };
+    std::size_t candidateCounterCapacity { 0 };
+    std::size_t contactCounterCapacity { 0 };
+    std::size_t overflowCounterCapacity { 0 };
+    std::size_t activeCellCounterCapacity { 0 };
+    std::size_t denseGridStatsCapacity { 0 };
+    std::size_t indexedTissuePositionCapacity { 0 };
+    std::size_t indexedToolPositionCapacity { 0 };
+    std::size_t indexedTissueIndexCapacity { 0 };
+    std::size_t indexedToolIndexCapacity { 0 };
+    std::size_t pinnedTissueTriangleCapacity { 0 };
+    std::size_t pinnedToolTriangleCapacity { 0 };
+    std::size_t pinnedIndexedTissuePositionCapacity { 0 };
+    std::size_t pinnedIndexedToolPositionCapacity { 0 };
+    std::size_t pinnedIndexedTissueIndexCapacity { 0 };
+    std::size_t pinnedIndexedToolIndexCapacity { 0 };
+    std::uint64_t indexedTissueSurfaceId { 0 };
+    std::uint64_t indexedToolSurfaceId { 0 };
+    std::uint64_t indexedTissueTopologyVersion { 0 };
+    std::uint64_t indexedToolTopologyVersion { 0 };
+
+    ~DenseGridWorkspace()
+    {
+        release();
+    }
+
+    void release()
+    {
+        cudaFree(tissueTriangles);
+        cudaFree(toolTriangles);
+        cudaFree(tissueAabbs);
+        cudaFree(toolAabbs);
+        cudaFree(grid);
+        cudaFree(activeCellIds);
+        cudaFree(cellTissueIds);
+        cudaFree(cellToolIds);
+        cudaFree(candidatePairs);
+        cudaFree(pairHashKeys);
+        cudaFree(contacts);
+        cudaFree(rawCandidateCount);
+        cudaFree(candidateCount);
+        cudaFree(contactCount);
+        cudaFree(overflowCount);
+        cudaFree(activeCellCount);
+        cudaFree(denseGridStats);
+        cudaFree(indexedTissuePositions);
+        cudaFree(indexedToolPositions);
+        cudaFree(indexedTissueIndices);
+        cudaFree(indexedToolIndices);
+        cudaFreeHost(pinnedTissueTriangles);
+        cudaFreeHost(pinnedToolTriangles);
+        cudaFreeHost(pinnedIndexedTissuePositions);
+        cudaFreeHost(pinnedIndexedToolPositions);
+        cudaFreeHost(pinnedIndexedTissueIndices);
+        cudaFreeHost(pinnedIndexedToolIndices);
+        cudaFree(proximityContacts);
+        cudaFree(proximityContactCount);
+        cudaFree(proximityOverflowCount);
+        cudaFree(proximityVfCount);
+        cudaFree(proximityFvCount);
+        cudaFree(proximityEeCount);
+        cudaFreeHost(proximityCountersHostPinned);
+        if (fbpEventsReady)
+        {
+            cudaEventDestroy(fbpStartEvent);
+            cudaEventDestroy(fbpEndEvent);
+            fbpEventsReady = false;
+            fbpStartEvent = nullptr;
+            fbpEndEvent = nullptr;
+        }
+        proximityContacts = nullptr;
+        proximityContactCount = nullptr;
+        proximityOverflowCount = nullptr;
+        proximityVfCount = nullptr;
+        proximityFvCount = nullptr;
+        proximityEeCount = nullptr;
+        proximityCountersHostPinned = nullptr;
+        proximityContactCapacity = 0;
+        tissueTriangles = nullptr;
+        toolTriangles = nullptr;
+        tissueAabbs = nullptr;
+        toolAabbs = nullptr;
+        grid = nullptr;
+        activeCellIds = nullptr;
+        cellTissueIds = nullptr;
+        cellToolIds = nullptr;
+        candidatePairs = nullptr;
+        pairHashKeys = nullptr;
+        contacts = nullptr;
+        rawCandidateCount = nullptr;
+        candidateCount = nullptr;
+        contactCount = nullptr;
+        overflowCount = nullptr;
+        activeCellCount = nullptr;
+        denseGridStats = nullptr;
+        indexedTissuePositions = nullptr;
+        indexedToolPositions = nullptr;
+        indexedTissueIndices = nullptr;
+        indexedToolIndices = nullptr;
+        pinnedTissueTriangles = nullptr;
+        pinnedToolTriangles = nullptr;
+        pinnedIndexedTissuePositions = nullptr;
+        pinnedIndexedToolPositions = nullptr;
+        pinnedIndexedTissueIndices = nullptr;
+        pinnedIndexedToolIndices = nullptr;
+        tissueTriangleCapacity = 0;
+        toolTriangleCapacity = 0;
+        tissueAabbCapacity = 0;
+        toolAabbCapacity = 0;
+        gridCellCapacity = 0;
+        activeCellCapacity = 0;
+        tissueBucketCapacity = 0;
+        toolBucketCapacity = 0;
+        candidateCapacity = 0;
+        pairHashCapacity = 0;
+        contactCapacity = 0;
+        rawCandidateCounterCapacity = 0;
+        candidateCounterCapacity = 0;
+        contactCounterCapacity = 0;
+        overflowCounterCapacity = 0;
+        activeCellCounterCapacity = 0;
+        denseGridStatsCapacity = 0;
+        indexedTissuePositionCapacity = 0;
+        indexedToolPositionCapacity = 0;
+        indexedTissueIndexCapacity = 0;
+        indexedToolIndexCapacity = 0;
+        pinnedTissueTriangleCapacity = 0;
+        pinnedToolTriangleCapacity = 0;
+        pinnedIndexedTissuePositionCapacity = 0;
+        pinnedIndexedToolPositionCapacity = 0;
+        pinnedIndexedTissueIndexCapacity = 0;
+        pinnedIndexedToolIndexCapacity = 0;
+        indexedTissueSurfaceId = 0;
+        indexedToolSurfaceId = 0;
+        indexedTissueTopologyVersion = 0;
+        indexedToolTopologyVersion = 0;
+    }
+
+    cudaError_t ensurePinnedHostStaging(
+        const std::size_t tissueTriangleCount,
+        const std::size_t toolTriangleCount,
+        std::uint64_t& newlyAllocatedBytes)
+    {
+        cudaError_t err = ensurePinnedHostArray(
+            pinnedTissueTriangles,
+            pinnedTissueTriangleCapacity,
+            tissueTriangleCount,
+            newlyAllocatedBytes);
+        if (err == cudaSuccess)
+        {
+            err = ensurePinnedHostArray(
+                pinnedToolTriangles,
+                pinnedToolTriangleCapacity,
+                toolTriangleCount,
+                newlyAllocatedBytes);
+        }
+        return err;
+    }
+
+    cudaError_t ensureIndexedPinnedHostStaging(
+        const std::size_t tissueVertexCount,
+        const std::size_t toolVertexCount,
+        const std::size_t tissueIndexCount,
+        const std::size_t toolIndexCount,
+        std::uint64_t& newlyAllocatedBytes)
+    {
+        cudaError_t err = ensurePinnedHostArray(
+            pinnedIndexedTissuePositions,
+            pinnedIndexedTissuePositionCapacity,
+            tissueVertexCount,
+            newlyAllocatedBytes);
+        if (err == cudaSuccess)
+        {
+            err = ensurePinnedHostArray(
+                pinnedIndexedToolPositions,
+                pinnedIndexedToolPositionCapacity,
+                toolVertexCount,
+                newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensurePinnedHostArray(
+                pinnedIndexedTissueIndices,
+                pinnedIndexedTissueIndexCapacity,
+                tissueIndexCount,
+                newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensurePinnedHostArray(
+                pinnedIndexedToolIndices,
+                pinnedIndexedToolIndexCapacity,
+                toolIndexCount,
+                newlyAllocatedBytes);
+        }
+        return err;
+    }
+
+    cudaError_t ensureIndexedInput(
+        const std::size_t tissueVertexCount,
+        const std::size_t toolVertexCount,
+        const std::size_t tissueIndexCount,
+        const std::size_t toolIndexCount,
+        std::uint64_t& newlyAllocatedBytes)
+    {
+        cudaError_t err = ensureDeviceArray(
+            indexedTissuePositions,
+            indexedTissuePositionCapacity,
+            tissueVertexCount,
+            newlyAllocatedBytes);
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(
+                indexedToolPositions,
+                indexedToolPositionCapacity,
+                toolVertexCount,
+                newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(
+                indexedTissueIndices,
+                indexedTissueIndexCapacity,
+                tissueIndexCount,
+                newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(
+                indexedToolIndices,
+                indexedToolIndexCapacity,
+                toolIndexCount,
+                newlyAllocatedBytes);
+        }
+        return err;
+    }
+
+    cudaError_t ensure(
+        const std::size_t tissueTriangleCount,
+        const std::size_t toolTriangleCount,
+        const std::size_t cellCount,
+        const std::size_t tissueBucketCount,
+        const std::size_t toolBucketCount,
+        const std::size_t candidateCountCapacity,
+        const std::size_t pairHashCountCapacity,
+        std::uint64_t& newlyAllocatedBytes)
+    {
+        cudaError_t err = ensureDeviceArray(tissueTriangles, tissueTriangleCapacity, tissueTriangleCount, newlyAllocatedBytes);
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(toolTriangles, toolTriangleCapacity, toolTriangleCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(tissueAabbs, tissueAabbCapacity, tissueTriangleCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(toolAabbs, toolAabbCapacity, toolTriangleCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(grid, gridCellCapacity, cellCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(activeCellIds, activeCellCapacity, cellCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(cellTissueIds, tissueBucketCapacity, tissueBucketCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(cellToolIds, toolBucketCapacity, toolBucketCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(candidatePairs, candidateCapacity, candidateCountCapacity, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(pairHashKeys, pairHashCapacity, pairHashCountCapacity, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(contacts, contactCapacity, candidateCountCapacity, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(rawCandidateCount, rawCandidateCounterCapacity, 1, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(candidateCount, candidateCounterCapacity, 1, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(contactCount, contactCounterCapacity, 1, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(overflowCount, overflowCounterCapacity, 1, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(activeCellCount, activeCellCounterCapacity, 1, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess)
+        {
+            err = ensureDeviceArray(denseGridStats, denseGridStatsCapacity, 1, newlyAllocatedBytes);
+        }
+        return err;
+    }
+
+    // Allocate device storage for feature-based proximity outputs. The element
+    // size argument keeps DeviceProximityContact (declared later in this TU)
+    // out of the workspace's type signature.
+    cudaError_t ensureProximityStorage(
+        const std::size_t contactCount,
+        const std::size_t contactElementBytes,
+        std::uint64_t& newlyAllocatedBytes)
+    {
+        const std::size_t requestedBytes = contactCount * contactElementBytes;
+        const std::size_t currentBytes = proximityContactCapacity * contactElementBytes;
+        cudaError_t err = cudaSuccess;
+        if (requestedBytes > currentBytes)
+        {
+            cudaFree(proximityContacts);
+            proximityContacts = nullptr;
+            void* devicePtr = nullptr;
+            err = cudaMalloc(&devicePtr, requestedBytes);
+            if (err == cudaSuccess)
+            {
+                proximityContacts = devicePtr;
+                proximityContactCapacity = contactCount;
+                newlyAllocatedBytes += static_cast<std::uint64_t>(requestedBytes);
+            }
+        }
+        if (err == cudaSuccess && proximityContactCount == nullptr)
+        {
+            err = cudaMalloc(reinterpret_cast<void**>(&proximityContactCount), sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += sizeof(std::uint32_t);
+        }
+        if (err == cudaSuccess && proximityOverflowCount == nullptr)
+        {
+            err = cudaMalloc(reinterpret_cast<void**>(&proximityOverflowCount), sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += sizeof(std::uint32_t);
+        }
+        if (err == cudaSuccess && proximityVfCount == nullptr)
+        {
+            err = cudaMalloc(reinterpret_cast<void**>(&proximityVfCount), sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += sizeof(std::uint32_t);
+        }
+        if (err == cudaSuccess && proximityFvCount == nullptr)
+        {
+            err = cudaMalloc(reinterpret_cast<void**>(&proximityFvCount), sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += sizeof(std::uint32_t);
+        }
+        if (err == cudaSuccess && proximityEeCount == nullptr)
+        {
+            err = cudaMalloc(reinterpret_cast<void**>(&proximityEeCount), sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += sizeof(std::uint32_t);
+        }
+        if (err == cudaSuccess && proximityCountersHostPinned == nullptr)
+        {
+            err = cudaMallocHost(reinterpret_cast<void**>(&proximityCountersHostPinned), 5u * sizeof(std::uint32_t));
+            if (err == cudaSuccess) newlyAllocatedBytes += 5u * sizeof(std::uint32_t);
+        }
+        return err;
+    }
+
+    cudaError_t ensureFbpEvents()
+    {
+        if (fbpEventsReady) return cudaSuccess;
+        cudaError_t err = cudaEventCreate(&fbpStartEvent);
+        if (err == cudaSuccess) err = cudaEventCreate(&fbpEndEvent);
+        fbpEventsReady = (err == cudaSuccess);
+        return err;
+    }
+};
+
+DenseGridWorkspace& denseGridWorkspace()
+{
+    static DenseGridWorkspace workspace;
+    return workspace;
+}
+
+std::size_t nextPowerOfTwo(std::size_t value)
+{
+    if (value <= 1)
+    {
+        return 1;
+    }
+    --value;
+    for (std::size_t shift = 1; shift < sizeof(std::size_t) * 8; shift <<= 1)
+    {
+        value |= value >> shift;
+    }
+    return value + 1;
+}
+
+double elapsedMillisecondsSince(const std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+template<class Callable>
+cudaError_t timeCudaOperation(
+    cudaEvent_t startEvent,
+    cudaEvent_t endEvent,
+    double& targetMilliseconds,
+    Callable callable)
+{
+    cudaError_t err = cudaEventRecord(startEvent);
+    if (err != cudaSuccess)
+    {
+        return err;
+    }
+
+    err = callable();
+    if (err != cudaSuccess)
+    {
+        return err;
+    }
+
+    err = cudaEventRecord(endEvent);
+    if (err != cudaSuccess)
+    {
+        return err;
+    }
+
+    err = cudaEventSynchronize(endEvent);
+    if (err != cudaSuccess)
+    {
+        return err;
+    }
+
+    float elapsedMs = 0.0f;
+    err = cudaEventElapsedTime(&elapsedMs, startEvent, endEvent);
+    if (err == cudaSuccess)
+    {
+        targetMilliseconds += static_cast<double>(elapsedMs);
+    }
+    return err;
+}
+
+template<class Callable>
+cudaError_t runCudaOperation(
+    const bool detailedProfiling,
+    cudaEvent_t startEvent,
+    cudaEvent_t endEvent,
+    double& targetMilliseconds,
+    Callable callable)
+{
+    if (detailedProfiling)
+    {
+        return timeCudaOperation(startEvent, endEvent, targetMilliseconds, callable);
+    }
+
+    return callable();
+}
+
+template<class T>
+cudaError_t copyHostArrayToDeviceAsync(
+    T* deviceDestination,
+    const T* hostSource,
+    T* pinnedStaging,
+    const std::size_t elementCount,
+    const bool usePinnedStaging)
+{
+    if (elementCount == 0)
+    {
+        return cudaSuccess;
+    }
+
+    const T* uploadSource = hostSource;
+    if (usePinnedStaging)
+    {
+        std::memcpy(pinnedStaging, hostSource, elementCount * sizeof(T));
+        uploadSource = pinnedStaging;
+    }
+
+    return cudaMemcpyAsync(
+        deviceDestination,
+        uploadSource,
+        elementCount * sizeof(T),
+        cudaMemcpyHostToDevice);
+}
 
 __device__ bool overlapsOnAxis(const float aMin, const float aMax, const float bMin, const float bMax)
 {
@@ -76,6 +754,16 @@ __device__ float3 sub3(const float3 a, const float3 b)
 __device__ float3 mul3(const float3 a, const float s)
 {
     return make_float3(a.x * s, a.y * s, a.z * s);
+}
+
+__device__ float3 min3(const float3 a, const float3 b)
+{
+    return make_float3(fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z));
+}
+
+__device__ float3 max3(const float3 a, const float3 b)
+{
+    return make_float3(fmaxf(a.x, b.x), fmaxf(a.y, b.y), fmaxf(a.z, b.z));
 }
 
 __device__ float dot3(const float3 a, const float3 b)
@@ -253,10 +941,6 @@ __global__ void broadPhaseCompactKernel(
     }
 }
 
-__global__ void noopKernel()
-{
-}
-
 __global__ void treePairOverlapKernel(
     const DeviceAabb* firstTrees,
     const DeviceAabb* secondTrees,
@@ -322,6 +1006,1345 @@ __global__ void exactTriangleContactKernel(
         const std::uint32_t outputIndex = atomicAdd(contactCount, 1u);
         contacts[outputIndex] = exactContact;
     }
+}
+
+__global__ void resetDenseGridKernel(
+    DeviceCellBucket* grid,
+    const std::uint32_t cellCount,
+    unsigned long long* pairHashKeys,
+    const std::uint32_t pairHashCapacity,
+    const bool resetPairHash,
+    std::uint32_t* activeCellCount,
+    std::uint32_t* rawCandidateCount,
+    std::uint32_t* candidateCount,
+    std::uint32_t* contactCount,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats,
+    const bool resetDenseGridStats)
+{
+    const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < cellCount)
+    {
+        grid[id] = DeviceCellBucket { 0u, 0u };
+    }
+    if (resetPairHash && id < pairHashCapacity)
+    {
+        pairHashKeys[id] = static_cast<unsigned long long>(kEmptyPairSlot);
+    }
+    if (id == 0)
+    {
+        *activeCellCount = 0u;
+        *rawCandidateCount = 0u;
+        *candidateCount = 0u;
+        *contactCount = 0u;
+        *overflowCount = 0u;
+        if (resetDenseGridStats && denseGridStats != nullptr)
+        {
+            *denseGridStats = DeviceDenseGridStats {};
+        }
+    }
+}
+
+__global__ void compactActiveDenseGridCellsKernel(
+    const DeviceCellBucket* grid,
+    const std::uint32_t cellCount,
+    const DeviceDenseGridConfig config,
+    std::uint32_t* activeCellIds,
+    std::uint32_t* activeCellCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t cellId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cellId >= cellCount)
+    {
+        return;
+    }
+
+    const auto bucket = grid[cellId];
+    const std::uint32_t tissueCount = min(bucket.tissueCount, config.maxTissueTrianglesPerCell);
+    const std::uint32_t toolCount = min(bucket.toolCount, config.maxToolTrianglesPerCell);
+
+    if (denseGridStats != nullptr)
+    {
+        atomicMax(&denseGridStats->maxTissueCellOccupancy, tissueCount);
+        atomicMax(&denseGridStats->maxToolCellOccupancy, toolCount);
+    }
+
+    if (tissueCount == 0 || toolCount == 0)
+    {
+        return;
+    }
+
+    const std::uint32_t outputIndex = atomicAdd(activeCellCount, 1u);
+    activeCellIds[outputIndex] = cellId;
+    if (denseGridStats != nullptr)
+    {
+        atomicAdd(&denseGridStats->activeMixedCellCount, 1u);
+    }
+}
+
+__global__ void triangleAabbKernel(
+    const DeviceTriangle* triangles,
+    const std::uint32_t triangleCount,
+    const float contactDistance,
+    DeviceAabb* aabbs)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount)
+    {
+        return;
+    }
+
+    const auto triangle = triangles[triangleId];
+    const float3 minPoint = min3(min3(triangle.p0, triangle.p1), triangle.p2);
+    const float3 maxPoint = max3(max3(triangle.p0, triangle.p1), triangle.p2);
+
+    aabbs[triangleId] = DeviceAabb {
+        minPoint.x - contactDistance,
+        minPoint.y - contactDistance,
+        minPoint.z - contactDistance,
+        maxPoint.x + contactDistance,
+        maxPoint.y + contactDistance,
+        maxPoint.z + contactDistance
+    };
+}
+
+__device__ DeviceAabb triangleAabb(const DeviceTriangle& triangle, const float contactDistance)
+{
+    const float3 minPoint = min3(min3(triangle.p0, triangle.p1), triangle.p2);
+    const float3 maxPoint = max3(max3(triangle.p0, triangle.p1), triangle.p2);
+
+    return DeviceAabb {
+        minPoint.x - contactDistance,
+        minPoint.y - contactDistance,
+        minPoint.z - contactDistance,
+        maxPoint.x + contactDistance,
+        maxPoint.y + contactDistance,
+        maxPoint.z + contactDistance
+    };
+}
+
+__device__ DeviceTriangle indexedTriangleAt(
+    const BackendTriangleVertex* positions,
+    const std::uint32_t* triangleIndices,
+    const std::uint32_t triangleId)
+{
+    const std::uint32_t i0 = triangleIndices[3u * triangleId + 0u];
+    const std::uint32_t i1 = triangleIndices[3u * triangleId + 1u];
+    const std::uint32_t i2 = triangleIndices[3u * triangleId + 2u];
+    const auto p0 = positions[i0];
+    const auto p1 = positions[i1];
+    const auto p2 = positions[i2];
+    return DeviceTriangle {
+        make_float3(p0.x, p0.y, p0.z),
+        make_float3(p1.x, p1.y, p1.z),
+        make_float3(p2.x, p2.y, p2.z),
+        triangleId
+    };
+}
+
+__device__ bool denseGridCellSpan(
+    const DeviceAabb& aabb,
+    const DeviceDenseGridConfig& config,
+    int3& cellMin,
+    int3& cellMax)
+{
+    if (aabb.maxX < config.gridMin.x || aabb.minX > config.gridMax.x ||
+        aabb.maxY < config.gridMin.y || aabb.minY > config.gridMax.y ||
+        aabb.maxZ < config.gridMin.z || aabb.minZ > config.gridMax.z)
+    {
+        return false;
+    }
+
+    cellMin.x = static_cast<int>(floorf((aabb.minX - config.gridMin.x) * config.inverseCellSize.x));
+    cellMin.y = static_cast<int>(floorf((aabb.minY - config.gridMin.y) * config.inverseCellSize.y));
+    cellMin.z = static_cast<int>(floorf((aabb.minZ - config.gridMin.z) * config.inverseCellSize.z));
+    cellMax.x = static_cast<int>(floorf((aabb.maxX - config.gridMin.x) * config.inverseCellSize.x));
+    cellMax.y = static_cast<int>(floorf((aabb.maxY - config.gridMin.y) * config.inverseCellSize.y));
+    cellMax.z = static_cast<int>(floorf((aabb.maxZ - config.gridMin.z) * config.inverseCellSize.z));
+
+    cellMin.x = max(0, min(cellMin.x, static_cast<int>(config.resolutionX) - 1));
+    cellMin.y = max(0, min(cellMin.y, static_cast<int>(config.resolutionY) - 1));
+    cellMin.z = max(0, min(cellMin.z, static_cast<int>(config.resolutionZ) - 1));
+    cellMax.x = max(0, min(cellMax.x, static_cast<int>(config.resolutionX) - 1));
+    cellMax.y = max(0, min(cellMax.y, static_cast<int>(config.resolutionY) - 1));
+    cellMax.z = max(0, min(cellMax.z, static_cast<int>(config.resolutionZ) - 1));
+    return true;
+}
+
+__device__ std::uint32_t denseCellId(
+    const int x,
+    const int y,
+    const int z,
+    const DeviceDenseGridConfig& config)
+{
+    return static_cast<std::uint32_t>(
+        x + y * static_cast<int>(config.resolutionX) +
+        z * static_cast<int>(config.resolutionX * config.resolutionY));
+}
+
+__device__ void insertTriangleAabbIntoGrid(
+    const DeviceAabb& aabb,
+    const std::uint32_t triangleId,
+    const bool insertTissue,
+    const DeviceDenseGridConfig& config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    int3 cellMin {};
+    int3 cellMax {};
+    if (!denseGridCellSpan(aabb, config, cellMin, cellMax))
+    {
+        return;
+    }
+
+    const std::uint32_t bucketCapacity =
+        insertTissue ? config.maxTissueTrianglesPerCell : config.maxToolTrianglesPerCell;
+
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    {
+        for (int y = cellMin.y; y <= cellMax.y; ++y)
+        {
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t cellId = denseCellId(x, y, z, config);
+                std::uint32_t* bucketCount =
+                    insertTissue ? &grid[cellId].tissueCount : &grid[cellId].toolCount;
+                const std::uint32_t localIndex = atomicAdd(bucketCount, 1u);
+                if (localIndex < bucketCapacity)
+                {
+                    cellIds[cellId * bucketCapacity + localIndex] = triangleId;
+                    if (denseGridStats != nullptr)
+                    {
+                        if (insertTissue)
+                        {
+                            atomicAdd(&denseGridStats->tissueInsertCount, 1u);
+                        }
+                        else
+                        {
+                            atomicAdd(&denseGridStats->toolInsertCount, 1u);
+                        }
+                    }
+                }
+                else
+                {
+                    atomicAdd(overflowCount, 1u);
+                }
+            }
+        }
+    }
+}
+
+__global__ void insertPackedTrianglesKernel(
+    const DeviceTriangle* triangles,
+    const std::uint32_t triangleCount,
+    const bool insertTissue,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount)
+    {
+        return;
+    }
+
+    insertTriangleAabbIntoGrid(
+        triangleAabb(triangles[triangleId], config.contactDistance),
+        triangleId,
+        insertTissue,
+        config,
+        grid,
+        cellIds,
+        overflowCount,
+        denseGridStats);
+}
+
+__global__ void insertIndexedTrianglesKernel(
+    const BackendTriangleVertex* positions,
+    const std::uint32_t* triangleIndices,
+    const std::uint32_t triangleCount,
+    const bool insertTissue,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount)
+    {
+        return;
+    }
+
+    const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+    insertTriangleAabbIntoGrid(
+        triangleAabb(triangle, config.contactDistance),
+        triangleId,
+        insertTissue,
+        config,
+        grid,
+        cellIds,
+        overflowCount,
+        denseGridStats);
+}
+
+__global__ void insertPackedTrianglePairKernel(
+    const DeviceTriangle* tissueTriangles,
+    const std::uint32_t tissueTriangleCount,
+    const DeviceTriangle* toolTriangles,
+    const std::uint32_t toolTriangleCount,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellTissueIds,
+    std::uint32_t* cellToolIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t globalTriangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t totalTriangleCount = tissueTriangleCount + toolTriangleCount;
+    if (globalTriangleId >= totalTriangleCount)
+    {
+        return;
+    }
+
+    if (globalTriangleId < tissueTriangleCount)
+    {
+        insertTriangleAabbIntoGrid(
+            triangleAabb(tissueTriangles[globalTriangleId], config.contactDistance),
+            globalTriangleId,
+            true,
+            config,
+            grid,
+            cellTissueIds,
+            overflowCount,
+            denseGridStats);
+        return;
+    }
+
+    const std::uint32_t toolTriangleId = globalTriangleId - tissueTriangleCount;
+    insertTriangleAabbIntoGrid(
+        triangleAabb(toolTriangles[toolTriangleId], config.contactDistance),
+        toolTriangleId,
+        false,
+        config,
+        grid,
+        cellToolIds,
+        overflowCount,
+        denseGridStats);
+}
+
+__global__ void insertIndexedTrianglePairKernel(
+    const BackendTriangleVertex* tissuePositions,
+    const std::uint32_t* tissueTriangleIndices,
+    const std::uint32_t tissueTriangleCount,
+    const BackendTriangleVertex* toolPositions,
+    const std::uint32_t* toolTriangleIndices,
+    const std::uint32_t toolTriangleCount,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellTissueIds,
+    std::uint32_t* cellToolIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t globalTriangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t totalTriangleCount = tissueTriangleCount + toolTriangleCount;
+    if (globalTriangleId >= totalTriangleCount)
+    {
+        return;
+    }
+
+    if (globalTriangleId < tissueTriangleCount)
+    {
+        const DeviceTriangle triangle = indexedTriangleAt(
+            tissuePositions,
+            tissueTriangleIndices,
+            globalTriangleId);
+        insertTriangleAabbIntoGrid(
+            triangleAabb(triangle, config.contactDistance),
+            globalTriangleId,
+            true,
+            config,
+            grid,
+            cellTissueIds,
+            overflowCount,
+            denseGridStats);
+        return;
+    }
+
+    const std::uint32_t toolTriangleId = globalTriangleId - tissueTriangleCount;
+    const DeviceTriangle triangle = indexedTriangleAt(
+        toolPositions,
+        toolTriangleIndices,
+        toolTriangleId);
+    insertTriangleAabbIntoGrid(
+        triangleAabb(triangle, config.contactDistance),
+        toolTriangleId,
+        false,
+        config,
+        grid,
+        cellToolIds,
+        overflowCount,
+        denseGridStats);
+}
+
+__global__ void insertTissueTrianglesKernel(
+    const DeviceAabb* aabbs,
+    const std::uint32_t triangleCount,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellTissueIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount)
+    {
+        return;
+    }
+
+    int3 cellMin {};
+    int3 cellMax {};
+    if (!denseGridCellSpan(aabbs[triangleId], config, cellMin, cellMax))
+    {
+        return;
+    }
+
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    {
+        for (int y = cellMin.y; y <= cellMax.y; ++y)
+        {
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t cellId = denseCellId(x, y, z, config);
+                const std::uint32_t localIndex = atomicAdd(&grid[cellId].tissueCount, 1u);
+                if (localIndex < config.maxTissueTrianglesPerCell)
+                {
+                    cellTissueIds[cellId * config.maxTissueTrianglesPerCell + localIndex] = triangleId;
+                    if (denseGridStats != nullptr)
+                    {
+                        atomicAdd(&denseGridStats->tissueInsertCount, 1u);
+                    }
+                }
+                else
+                {
+                    atomicAdd(overflowCount, 1u);
+                }
+            }
+        }
+    }
+}
+
+__global__ void insertToolTrianglesKernel(
+    const DeviceAabb* aabbs,
+    const std::uint32_t triangleCount,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* grid,
+    std::uint32_t* cellToolIds,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount)
+    {
+        return;
+    }
+
+    int3 cellMin {};
+    int3 cellMax {};
+    if (!denseGridCellSpan(aabbs[triangleId], config, cellMin, cellMax))
+    {
+        return;
+    }
+
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    {
+        for (int y = cellMin.y; y <= cellMax.y; ++y)
+        {
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t cellId = denseCellId(x, y, z, config);
+                const std::uint32_t localIndex = atomicAdd(&grid[cellId].toolCount, 1u);
+                if (localIndex < config.maxToolTrianglesPerCell)
+                {
+                    cellToolIds[cellId * config.maxToolTrianglesPerCell + localIndex] = triangleId;
+                    if (denseGridStats != nullptr)
+                    {
+                        atomicAdd(&denseGridStats->toolInsertCount, 1u);
+                    }
+                }
+                else
+                {
+                    atomicAdd(overflowCount, 1u);
+                }
+            }
+        }
+    }
+}
+
+__device__ std::uint64_t encodeCandidatePair(const std::uint32_t tissueTriangleId, const std::uint32_t toolTriangleId)
+{
+    return (static_cast<std::uint64_t>(tissueTriangleId) << 32u) | static_cast<std::uint64_t>(toolTriangleId);
+}
+
+__device__ std::uint64_t mixCandidatePairHash(std::uint64_t value)
+{
+    value ^= value >> 33u;
+    value *= 0xff51afd7ed558ccdull;
+    value ^= value >> 33u;
+    value *= 0xc4ceb9fe1a85ec53ull;
+    value ^= value >> 33u;
+    return value;
+}
+
+__device__ bool insertUniqueCandidatePair(
+    const std::uint64_t pair,
+    unsigned long long* pairHashKeys,
+    const std::uint32_t pairHashCapacity,
+    std::uint64_t* candidatePairs,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats,
+    const std::uint32_t maxCandidatePairs)
+{
+    constexpr std::uint32_t kMaxProbeCount = 256u;
+    const std::uint32_t mask = pairHashCapacity - 1u;
+    std::uint32_t slot = static_cast<std::uint32_t>(mixCandidatePairHash(pair)) & mask;
+
+    for (std::uint32_t probe = 0; probe < kMaxProbeCount; ++probe)
+    {
+        const std::uint64_t previous = atomicCAS(
+            &pairHashKeys[slot],
+            static_cast<unsigned long long>(kEmptyPairSlot),
+            static_cast<unsigned long long>(pair));
+
+        if (previous == kEmptyPairSlot)
+        {
+            const std::uint32_t outputIndex = atomicAdd(candidateCount, 1u);
+            if (outputIndex < maxCandidatePairs)
+            {
+                candidatePairs[outputIndex] = pair;
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+            return true;
+        }
+        if (previous == pair)
+        {
+            return false;
+        }
+        slot = (slot + 1u) & mask;
+    }
+
+    if (denseGridStats != nullptr)
+    {
+        atomicAdd(&denseGridStats->hashDedupeProbeOverflowCount, 1u);
+    }
+    atomicAdd(overflowCount, 1u);
+    return false;
+}
+
+__device__ bool isCanonicalPairCell(
+    const std::uint32_t cellId,
+    const DeviceAabb& tissueAabb,
+    const DeviceAabb& toolAabb,
+    const DeviceDenseGridConfig& config)
+{
+    int3 tissueCellMin {};
+    int3 tissueCellMax {};
+    int3 toolCellMin {};
+    int3 toolCellMax {};
+    if (!denseGridCellSpan(tissueAabb, config, tissueCellMin, tissueCellMax) ||
+        !denseGridCellSpan(toolAabb, config, toolCellMin, toolCellMax))
+    {
+        return false;
+    }
+
+    const int canonicalX = max(tissueCellMin.x, toolCellMin.x);
+    const int canonicalY = max(tissueCellMin.y, toolCellMin.y);
+    const int canonicalZ = max(tissueCellMin.z, toolCellMin.z);
+    const int maxX = min(tissueCellMax.x, toolCellMax.x);
+    const int maxY = min(tissueCellMax.y, toolCellMax.y);
+    const int maxZ = min(tissueCellMax.z, toolCellMax.z);
+    if (canonicalX > maxX || canonicalY > maxY || canonicalZ > maxZ)
+    {
+        return false;
+    }
+
+    return cellId == denseCellId(canonicalX, canonicalY, canonicalZ, config);
+}
+
+__global__ void generateDenseGridCandidatePairsKernel(
+    const DeviceCellBucket* grid,
+    const std::uint32_t* cellTissueIds,
+    const std::uint32_t* cellToolIds,
+    const DeviceAabb* tissueAabbs,
+    const DeviceAabb* toolAabbs,
+    const DeviceDenseGridConfig config,
+    std::uint64_t* candidatePairs,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t cellId = blockIdx.x;
+    const auto bucket = grid[cellId];
+    const std::uint32_t tissueCount = min(bucket.tissueCount, config.maxTissueTrianglesPerCell);
+    const std::uint32_t toolCount = min(bucket.toolCount, config.maxToolTrianglesPerCell);
+    const std::uint64_t totalPairs =
+        static_cast<std::uint64_t>(tissueCount) * static_cast<std::uint64_t>(toolCount);
+
+    if (threadIdx.x == 0 && denseGridStats != nullptr)
+    {
+        if (tissueCount > 0 && toolCount > 0)
+        {
+            atomicAdd(&denseGridStats->activeMixedCellCount, 1u);
+        }
+        atomicMax(&denseGridStats->maxTissueCellOccupancy, tissueCount);
+        atomicMax(&denseGridStats->maxToolCellOccupancy, toolCount);
+    }
+
+    for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+    {
+        const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / toolCount);
+        const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % toolCount);
+        const std::uint32_t tissueTriangleId =
+            cellTissueIds[cellId * config.maxTissueTrianglesPerCell + tissueLocal];
+        const std::uint32_t toolTriangleId =
+            cellToolIds[cellId * config.maxToolTrianglesPerCell + toolLocal];
+
+        if (config.canonicalPairEmission &&
+            !isCanonicalPairCell(cellId, tissueAabbs[tissueTriangleId], toolAabbs[toolTriangleId], config))
+        {
+            continue;
+        }
+
+        const std::uint32_t outputIndex = atomicAdd(candidateCount, 1u);
+        if (outputIndex < config.maxCandidatePairs)
+        {
+            candidatePairs[outputIndex] = encodeCandidatePair(tissueTriangleId, toolTriangleId);
+        }
+        else
+        {
+            atomicAdd(overflowCount, 1u);
+        }
+    }
+}
+
+__global__ void generateDenseGridUniqueCandidatePairsKernel(
+    const DeviceCellBucket* grid,
+    const std::uint32_t* cellTissueIds,
+    const std::uint32_t* cellToolIds,
+    const DeviceDenseGridConfig config,
+    std::uint64_t* candidatePairs,
+    unsigned long long* pairHashKeys,
+    std::uint32_t* rawCandidateCount,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t cellId = blockIdx.x;
+    const auto bucket = grid[cellId];
+    const std::uint32_t tissueCount = min(bucket.tissueCount, config.maxTissueTrianglesPerCell);
+    const std::uint32_t toolCount = min(bucket.toolCount, config.maxToolTrianglesPerCell);
+    const std::uint64_t totalPairs =
+        static_cast<std::uint64_t>(tissueCount) * static_cast<std::uint64_t>(toolCount);
+
+    if (threadIdx.x == 0 && denseGridStats != nullptr)
+    {
+        if (tissueCount > 0 && toolCount > 0)
+        {
+            atomicAdd(&denseGridStats->activeMixedCellCount, 1u);
+        }
+        atomicMax(&denseGridStats->maxTissueCellOccupancy, tissueCount);
+        atomicMax(&denseGridStats->maxToolCellOccupancy, toolCount);
+    }
+
+    for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+    {
+        const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / toolCount);
+        const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % toolCount);
+        const std::uint32_t tissueTriangleId =
+            cellTissueIds[cellId * config.maxTissueTrianglesPerCell + tissueLocal];
+        const std::uint32_t toolTriangleId =
+            cellToolIds[cellId * config.maxToolTrianglesPerCell + toolLocal];
+
+        atomicAdd(rawCandidateCount, 1u);
+        insertUniqueCandidatePair(
+            encodeCandidatePair(tissueTriangleId, toolTriangleId),
+            pairHashKeys,
+            config.pairHashCapacity,
+            candidatePairs,
+            candidateCount,
+            overflowCount,
+            denseGridStats,
+            config.maxCandidatePairs);
+    }
+}
+
+__global__ void generateActiveDenseGridCandidatePairsKernel(
+    const DeviceCellBucket* grid,
+    const std::uint32_t* activeCellIds,
+    const std::uint32_t* activeCellCount,
+    const std::uint32_t* cellTissueIds,
+    const std::uint32_t* cellToolIds,
+    const DeviceAabb* tissueAabbs,
+    const DeviceAabb* toolAabbs,
+    const DeviceDenseGridConfig config,
+    std::uint64_t* candidatePairs,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount)
+{
+    const std::uint32_t activeCount = *activeCellCount;
+    for (std::uint32_t activeIndex = blockIdx.x; activeIndex < activeCount; activeIndex += gridDim.x)
+    {
+        const std::uint32_t cellId = activeCellIds[activeIndex];
+        const auto bucket = grid[cellId];
+        const std::uint32_t tissueCount = min(bucket.tissueCount, config.maxTissueTrianglesPerCell);
+        const std::uint32_t toolCount = min(bucket.toolCount, config.maxToolTrianglesPerCell);
+        const std::uint64_t totalPairs =
+            static_cast<std::uint64_t>(tissueCount) * static_cast<std::uint64_t>(toolCount);
+
+        for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+        {
+            const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / toolCount);
+            const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % toolCount);
+            const std::uint32_t tissueTriangleId =
+                cellTissueIds[cellId * config.maxTissueTrianglesPerCell + tissueLocal];
+            const std::uint32_t toolTriangleId =
+                cellToolIds[cellId * config.maxToolTrianglesPerCell + toolLocal];
+
+            if (config.canonicalPairEmission &&
+                !isCanonicalPairCell(cellId, tissueAabbs[tissueTriangleId], toolAabbs[toolTriangleId], config))
+            {
+                continue;
+            }
+
+            const std::uint32_t outputIndex = atomicAdd(candidateCount, 1u);
+            if (outputIndex < config.maxCandidatePairs)
+            {
+                candidatePairs[outputIndex] = encodeCandidatePair(tissueTriangleId, toolTriangleId);
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+        }
+    }
+}
+
+__global__ void generateActiveDenseGridUniqueCandidatePairsKernel(
+    const DeviceCellBucket* grid,
+    const std::uint32_t* activeCellIds,
+    const std::uint32_t* activeCellCount,
+    const std::uint32_t* cellTissueIds,
+    const std::uint32_t* cellToolIds,
+    const DeviceDenseGridConfig config,
+    std::uint64_t* candidatePairs,
+    unsigned long long* pairHashKeys,
+    std::uint32_t* rawCandidateCount,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    DeviceDenseGridStats* denseGridStats)
+{
+    const std::uint32_t activeCount = *activeCellCount;
+    for (std::uint32_t activeIndex = blockIdx.x; activeIndex < activeCount; activeIndex += gridDim.x)
+    {
+        const std::uint32_t cellId = activeCellIds[activeIndex];
+        const auto bucket = grid[cellId];
+        const std::uint32_t tissueCount = min(bucket.tissueCount, config.maxTissueTrianglesPerCell);
+        const std::uint32_t toolCount = min(bucket.toolCount, config.maxToolTrianglesPerCell);
+        const std::uint64_t totalPairs =
+            static_cast<std::uint64_t>(tissueCount) * static_cast<std::uint64_t>(toolCount);
+
+        for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+        {
+            const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / toolCount);
+            const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % toolCount);
+            const std::uint32_t tissueTriangleId =
+                cellTissueIds[cellId * config.maxTissueTrianglesPerCell + tissueLocal];
+            const std::uint32_t toolTriangleId =
+                cellToolIds[cellId * config.maxToolTrianglesPerCell + toolLocal];
+
+            atomicAdd(rawCandidateCount, 1u);
+            insertUniqueCandidatePair(
+                encodeCandidatePair(tissueTriangleId, toolTriangleId),
+                pairHashKeys,
+                config.pairHashCapacity,
+                candidatePairs,
+                candidateCount,
+                overflowCount,
+                denseGridStats,
+                config.maxCandidatePairs);
+        }
+    }
+}
+
+__global__ void exactDenseGridContactKernel(
+    const DeviceTriangle* tissueTriangles,
+    const DeviceTriangle* toolTriangles,
+    const std::uint64_t* candidatePairs,
+    const std::uint32_t candidateCount,
+    DeviceExactContact* contacts,
+    const std::uint32_t maxContactCount,
+    std::uint32_t* contactCount,
+    std::uint32_t* overflowCount)
+{
+    const std::uint32_t candidateIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidateIndex >= candidateCount)
+    {
+        return;
+    }
+
+    const std::uint64_t candidatePair = candidatePairs[candidateIndex];
+    const std::uint32_t tissueTriangleId = static_cast<std::uint32_t>(candidatePair >> 32u);
+    const std::uint32_t toolTriangleId = static_cast<std::uint32_t>(candidatePair & 0xffffffffull);
+
+    DeviceExactContact exactContact {};
+    if (exactTriangleIntersection(tissueTriangles[tissueTriangleId], toolTriangles[toolTriangleId], exactContact))
+    {
+        const std::uint32_t outputIndex = atomicAdd(contactCount, 1u);
+        if (outputIndex < maxContactCount)
+        {
+            contacts[outputIndex] = exactContact;
+        }
+        else
+        {
+            atomicAdd(overflowCount, 1u);
+        }
+    }
+}
+
+__global__ void exactDenseGridIndexedContactKernel(
+    const BackendTriangleVertex* tissuePositions,
+    const std::uint32_t* tissueTriangleIndices,
+    const BackendTriangleVertex* toolPositions,
+    const std::uint32_t* toolTriangleIndices,
+    const std::uint64_t* candidatePairs,
+    const std::uint32_t candidateCount,
+    DeviceExactContact* contacts,
+    const std::uint32_t maxContactCount,
+    std::uint32_t* contactCount,
+    std::uint32_t* overflowCount)
+{
+    const std::uint32_t candidateIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    if (candidateIndex >= candidateCount)
+    {
+        return;
+    }
+
+    const std::uint64_t candidatePair = candidatePairs[candidateIndex];
+    const std::uint32_t tissueTriangleId = static_cast<std::uint32_t>(candidatePair >> 32u);
+    const std::uint32_t toolTriangleId = static_cast<std::uint32_t>(candidatePair & 0xffffffffull);
+    const DeviceTriangle tissueTriangle = indexedTriangleAt(
+        tissuePositions,
+        tissueTriangleIndices,
+        tissueTriangleId);
+    const DeviceTriangle toolTriangle = indexedTriangleAt(
+        toolPositions,
+        toolTriangleIndices,
+        toolTriangleId);
+
+    DeviceExactContact exactContact {};
+    if (exactTriangleIntersection(tissueTriangle, toolTriangle, exactContact))
+    {
+        const std::uint32_t outputIndex = atomicAdd(contactCount, 1u);
+        if (outputIndex < maxContactCount)
+        {
+            contacts[outputIndex] = exactContact;
+        }
+        else
+        {
+            atomicAdd(overflowCount, 1u);
+        }
+    }
+}
+
+// ============================================================================
+// Feature-based proximity (VF / EE) — Ericson closest-point math + kernel
+// ----------------------------------------------------------------------------
+// Replaces the SAT-style exactTriangleIntersection narrow phase with a smooth
+// closest-feature evaluation. For every candidate triangle pair we run 6
+// vertex-face tests (3 verts of A vs face B, 3 verts of B vs face A) and 9
+// edge-edge tests (3 edges A x 3 edges B). The closest feature pair within
+// contactDistance is emitted as a ProximityContact with barycentric weights,
+// suitable for a CUDA constraint solver. No divergent clipping loops; the
+// math is dot products and branchless clamping, which suits the GTX 1650 Ti.
+// ============================================================================
+
+struct DeviceProximityContact
+{
+    std::uint32_t firstPrimitiveIndex;
+    std::uint32_t secondPrimitiveIndex;
+    std::uint8_t  featureKind;             // 0=VF, 1=FV, 2=EE
+    std::uint8_t  firstFeatureLocalIndex;  // 0..2 (vertex or edge start)
+    std::uint8_t  secondFeatureLocalIndex; // 0..2
+    std::uint8_t  reserved;
+    float         firstBary[3];
+    float         secondBary[3];
+    float3        pointOnFirst;
+    float3        pointOnSecond;
+    float3        normal;
+    float         signedDistance;
+};
+
+// Ericson 5.1.5 — closest point on triangle (a,b,c) to point p, in barycentrics.
+// Returns make_float3(u,v,w) with u+v+w==1 such that closest = u*a + v*b + w*c.
+__device__ __forceinline__ float3 closestPointOnTriangleBary(
+    const float3 p, const float3 a, const float3 b, const float3 c)
+{
+    const float3 ab = sub3(b, a);
+    const float3 ac = sub3(c, a);
+    const float3 ap = sub3(p, a);
+    const float d1 = dot3(ab, ap);
+    const float d2 = dot3(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f)
+    {
+        return make_float3(1.0f, 0.0f, 0.0f); // vertex A region
+    }
+    const float3 bp = sub3(p, b);
+    const float d3 = dot3(ab, bp);
+    const float d4 = dot3(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3)
+    {
+        return make_float3(0.0f, 1.0f, 0.0f); // vertex B region
+    }
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+    {
+        const float denom = (d1 - d3);
+        const float v = denom != 0.0f ? d1 / denom : 0.0f;
+        return make_float3(1.0f - v, v, 0.0f); // edge AB region
+    }
+    const float3 cp = sub3(p, c);
+    const float d5 = dot3(ab, cp);
+    const float d6 = dot3(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6)
+    {
+        return make_float3(0.0f, 0.0f, 1.0f); // vertex C region
+    }
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+    {
+        const float denom = (d2 - d6);
+        const float w = denom != 0.0f ? d2 / denom : 0.0f;
+        return make_float3(1.0f - w, 0.0f, w); // edge AC region
+    }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    {
+        const float denom = ((d4 - d3) + (d5 - d6));
+        const float w = denom != 0.0f ? (d4 - d3) / denom : 0.0f;
+        return make_float3(0.0f, 1.0f - w, w); // edge BC region
+    }
+    const float denom = va + vb + vc;
+    const float invDenom = denom != 0.0f ? 1.0f / denom : 0.0f;
+    const float v = vb * invDenom;
+    const float w = vc * invDenom;
+    return make_float3(1.0f - v - w, v, w); // interior
+}
+
+// Reconstruct world-space point from triangle vertices + barycentrics.
+__device__ __forceinline__ float3 reconstructFromBary(
+    const float3 a, const float3 b, const float3 c, const float3 bary)
+{
+    return add3(add3(mul3(a, bary.x), mul3(b, bary.y)), mul3(c, bary.z));
+}
+
+// Ericson 5.1.9 — closest points of two line segments p1q1 and p2q2.
+// Returns s, t and the closest points c1, c2.
+__device__ __forceinline__ void closestPointSegmentSegment(
+    const float3 p1, const float3 q1,
+    const float3 p2, const float3 q2,
+    float& s, float& t,
+    float3& c1, float3& c2)
+{
+    const float3 d1 = sub3(q1, p1);
+    const float3 d2 = sub3(q2, p2);
+    const float3 r  = sub3(p1, p2);
+    const float a = dot3(d1, d1);
+    const float e = dot3(d2, d2);
+    const float f = dot3(d2, r);
+    constexpr float kEps = 1.0e-20f;
+
+    if (a <= kEps && e <= kEps)
+    {
+        s = 0.0f; t = 0.0f;
+        c1 = p1; c2 = p2;
+        return;
+    }
+    if (a <= kEps)
+    {
+        s = 0.0f;
+        t = fminf(1.0f, fmaxf(0.0f, f / e));
+    }
+    else
+    {
+        const float c = dot3(d1, r);
+        if (e <= kEps)
+        {
+            t = 0.0f;
+            s = fminf(1.0f, fmaxf(0.0f, -c / a));
+        }
+        else
+        {
+            const float b = dot3(d1, d2);
+            const float denom = a * e - b * b;
+            s = denom != 0.0f ? fminf(1.0f, fmaxf(0.0f, (b * f - c * e) / denom)) : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f)
+            {
+                t = 0.0f;
+                s = fminf(1.0f, fmaxf(0.0f, -c / a));
+            }
+            else if (t > 1.0f)
+            {
+                t = 1.0f;
+                s = fminf(1.0f, fmaxf(0.0f, (b - c) / a));
+            }
+        }
+    }
+    c1 = add3(p1, mul3(d1, s));
+    c2 = add3(p2, mul3(d2, t));
+}
+
+// One thread per candidate pair. Each thread runs 6 VF + 9 EE and keeps the
+// closest feature pair under the contact-distance threshold.
+__global__ void featureBasedProximityKernel(
+    const BackendTriangleVertex* __restrict__ firstPositions,
+    const std::uint32_t* __restrict__ firstIndices,
+    const BackendTriangleVertex* __restrict__ secondPositions,
+    const std::uint32_t* __restrict__ secondIndices,
+    const std::uint64_t* __restrict__ candidatePairs,
+    const std::uint32_t* __restrict__ candidatePairCount,
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* __restrict__ contactCount,
+    std::uint32_t* __restrict__ overflowCount,
+    std::uint32_t* __restrict__ vfCount,
+    std::uint32_t* __restrict__ fvCount,
+    std::uint32_t* __restrict__ eeCount,
+    const std::uint32_t maxContacts,
+    const float contactDistance,
+    const bool computeBarycentrics)
+{
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t pairCount = *candidatePairCount;
+    if (tid >= pairCount)
+    {
+        return;
+    }
+
+    const std::uint64_t pair = candidatePairs[tid];
+    const std::uint32_t aIdx = static_cast<std::uint32_t>(pair >> 32);
+    const std::uint32_t bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
+
+    const DeviceTriangle ta = indexedTriangleAt(firstPositions, firstIndices, aIdx);
+    const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
+    const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
+    const float3 bV[3] = { tb.p0, tb.p1, tb.p2 };
+
+    const float distThreshSq = contactDistance * contactDistance;
+
+    float bestDistSq = INFINITY;
+    int bestKind = 0;
+    int bestI = 0;
+    int bestJ = 0;
+    float3 bestP1 = make_float3(0.0f, 0.0f, 0.0f);
+    float3 bestP2 = make_float3(0.0f, 0.0f, 0.0f);
+    float3 bestBary1 = make_float3(1.0f, 0.0f, 0.0f);
+    float3 bestBary2 = make_float3(1.0f, 0.0f, 0.0f);
+
+    // 3 VF: vertex of A vs face B
+    #pragma unroll
+    for (int i = 0; i < 3; ++i)
+    {
+        const float3 bary = closestPointOnTriangleBary(aV[i], bV[0], bV[1], bV[2]);
+        const float3 cp = reconstructFromBary(bV[0], bV[1], bV[2], bary);
+        const float3 diff = sub3(aV[i], cp);
+        const float d2v = dot3(diff, diff);
+        if (d2v < bestDistSq)
+        {
+            bestDistSq = d2v;
+            bestKind = 0; bestI = i; bestJ = 0;
+            bestP1 = aV[i]; bestP2 = cp;
+            bestBary1 = make_float3(1.0f, 0.0f, 0.0f);
+            bestBary2 = bary;
+        }
+    }
+
+    // 3 FV: vertex of B vs face A
+    #pragma unroll
+    for (int j = 0; j < 3; ++j)
+    {
+        const float3 bary = closestPointOnTriangleBary(bV[j], aV[0], aV[1], aV[2]);
+        const float3 cp = reconstructFromBary(aV[0], aV[1], aV[2], bary);
+        const float3 diff = sub3(cp, bV[j]);
+        const float d2v = dot3(diff, diff);
+        if (d2v < bestDistSq)
+        {
+            bestDistSq = d2v;
+            bestKind = 1; bestI = 0; bestJ = j;
+            bestP1 = cp; bestP2 = bV[j];
+            bestBary1 = bary;
+            bestBary2 = make_float3(1.0f, 0.0f, 0.0f);
+        }
+    }
+
+    // 9 EE: each edge of A vs each edge of B
+    #pragma unroll
+    for (int i = 0; i < 3; ++i)
+    {
+        const float3 p1 = aV[i];
+        const float3 q1 = aV[(i + 1) % 3];
+        #pragma unroll
+        for (int j = 0; j < 3; ++j)
+        {
+            const float3 p2 = bV[j];
+            const float3 q2 = bV[(j + 1) % 3];
+            float s = 0.0f, t = 0.0f;
+            float3 c1, c2;
+            closestPointSegmentSegment(p1, q1, p2, q2, s, t, c1, c2);
+            const float3 diff = sub3(c1, c2);
+            const float d2v = dot3(diff, diff);
+            if (d2v < bestDistSq)
+            {
+                bestDistSq = d2v;
+                bestKind = 2; bestI = i; bestJ = j;
+                bestP1 = c1; bestP2 = c2;
+                bestBary1 = make_float3(1.0f - s, s, 0.0f);
+                bestBary2 = make_float3(1.0f - t, t, 0.0f);
+            }
+        }
+    }
+
+    if (bestDistSq > distThreshSq)
+    {
+        return;
+    }
+
+    const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
+    if (outIdx >= maxContacts)
+    {
+        atomicAdd(overflowCount, 1u);
+        return;
+    }
+
+    DeviceProximityContact c;
+    c.firstPrimitiveIndex = aIdx;
+    c.secondPrimitiveIndex = bIdx;
+    c.featureKind = static_cast<std::uint8_t>(bestKind);
+    c.firstFeatureLocalIndex = static_cast<std::uint8_t>(bestI);
+    c.secondFeatureLocalIndex = static_cast<std::uint8_t>(bestJ);
+    c.reserved = 0;
+    if (computeBarycentrics)
+    {
+        c.firstBary[0] = bestBary1.x;  c.firstBary[1] = bestBary1.y;  c.firstBary[2] = bestBary1.z;
+        c.secondBary[0] = bestBary2.x; c.secondBary[1] = bestBary2.y; c.secondBary[2] = bestBary2.z;
+    }
+    else
+    {
+        c.firstBary[0] = 1.0f;  c.firstBary[1] = 0.0f;  c.firstBary[2] = 0.0f;
+        c.secondBary[0] = 1.0f; c.secondBary[1] = 0.0f; c.secondBary[2] = 0.0f;
+    }
+    c.pointOnFirst  = bestP1;
+    c.pointOnSecond = bestP2;
+    const float3 sep = sub3(bestP2, bestP1);
+    const float dist = sqrtf(bestDistSq);
+    c.signedDistance = dist;
+    if (dist > 1.0e-12f)
+    {
+        const float invLen = 1.0f / dist;
+        c.normal = make_float3(sep.x * invLen, sep.y * invLen, sep.z * invLen);
+    }
+    else
+    {
+        c.normal = make_float3(0.0f, 1.0f, 0.0f);
+    }
+    contacts[outIdx] = c;
+
+    if (bestKind == 0)      atomicAdd(vfCount, 1u);
+    else if (bestKind == 1) atomicAdd(fvCount, 1u);
+    else                    atomicAdd(eeCount, 1u);
+}
+
+// Resets the proximity contact counters and per-class tallies.
+__global__ void resetProximityCountersKernel(
+    std::uint32_t* contactCount,
+    std::uint32_t* overflowCount,
+    std::uint32_t* vfCount,
+    std::uint32_t* fvCount,
+    std::uint32_t* eeCount)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        *contactCount  = 0u;
+        *overflowCount = 0u;
+        *vfCount = 0u;
+        *fvCount = 0u;
+        *eeCount = 0u;
+    }
+}
+
+// ============================================================================
+// Vertex-Triangle Proximity (Phase 12)
+// ----------------------------------------------------------------------------
+// Treats each vertex of a point cloud as a primitive inserted into the dense
+// grid alongside triangles. The candidate-pair generator then emits
+// (triangleId << 32) | vertexId pairs naturally, and a focused narrow-pass
+// kernel runs closestPointOnTriangleBary per pair. Use cases:
+//   (a) self-collision: pass the same mesh's vertex set + triangle surface
+//   (b) cross-model: a separate PointCollisionModel against a triangle mesh
+// ============================================================================
+
+// Insert each vertex of the cloud into the tool-side cell buckets. The
+// "vertex AABB" is a tiny inflated box around the point; we reuse the same
+// denseGridCellSpan helper as triangles for consistency.
+__global__ void insertIndexedPointsKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t pointCount,
+    const DeviceDenseGridConfig config,
+    DeviceCellBucket* __restrict__ grid,
+    std::uint32_t* __restrict__ cellToolIds,
+    std::uint32_t* __restrict__ overflowCount,
+    DeviceDenseGridStats* __restrict__ stats)
+{
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= pointCount) return;
+
+    const auto p = positions[tid];
+    const float r = config.contactDistance;
+
+    DeviceAabb aabb;
+    aabb.minX = p.x - r; aabb.minY = p.y - r; aabb.minZ = p.z - r;
+    aabb.maxX = p.x + r; aabb.maxY = p.y + r; aabb.maxZ = p.z + r;
+
+    int3 cellMin, cellMax;
+    if (!denseGridCellSpan(aabb, config, cellMin, cellMax)) return;
+
+    const std::uint32_t bucketCapacity = config.maxToolTrianglesPerCell;
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    {
+        for (int y = cellMin.y; y <= cellMax.y; ++y)
+        {
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t cellId =
+                    static_cast<std::uint32_t>(x) +
+                    static_cast<std::uint32_t>(y) * config.resolutionX +
+                    static_cast<std::uint32_t>(z) * config.resolutionX * config.resolutionY;
+                const std::uint32_t localIdx = atomicAdd(&grid[cellId].toolCount, 1u);
+                if (localIdx < bucketCapacity)
+                {
+                    cellToolIds[cellId * bucketCapacity + localIdx] = tid;
+                    if (stats != nullptr)
+                    {
+                        atomicAdd(&stats->toolInsertCount, 1u);
+                    }
+                }
+                else
+                {
+                    atomicAdd(overflowCount, 1u);
+                }
+            }
+        }
+    }
+}
+
+// One thread per (triangleId, vertexId) candidate pair produced by the
+// existing dense-grid candidate generator. Runs closestPointOnTriangleBary.
+__global__ void featureBasedVertexTriangleProximityKernel(
+    const BackendTriangleVertex* __restrict__ trianglePositions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const BackendTriangleVertex* __restrict__ pointPositions,
+    const std::uint64_t* __restrict__ candidatePairs,
+    const std::uint32_t* __restrict__ candidatePairCount,
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* __restrict__ contactCount,
+    std::uint32_t* __restrict__ overflowCount,
+    std::uint32_t* __restrict__ vfCount,
+    const std::uint32_t maxContacts,
+    const float contactDistance,
+    const bool computeBarycentrics,
+    const std::uint32_t selfCollisionVertexExclusionStride)  // 0 to disable; otherwise skip (triId, vertId) where vertId is one of the triangle's 3 vertices
+{
+    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t pairCount = *candidatePairCount;
+    if (tid >= pairCount) return;
+
+    const std::uint64_t pair = candidatePairs[tid];
+    const std::uint32_t triId   = static_cast<std::uint32_t>(pair >> 32);
+    const std::uint32_t pointId = static_cast<std::uint32_t>(pair & 0xffffffffu);
+
+    // Self-collision exclusion: skip pairs where the candidate vertex is one
+    // of the triangle's own corner vertices. Without this every vertex would
+    // report distance 0 to its own adjacent triangles. The stride argument
+    // gates this for cross-model cases (stride=0 means "do not exclude").
+    if (selfCollisionVertexExclusionStride != 0)
+    {
+        const std::uint32_t i0 = triangleIndices[3u * triId + 0u];
+        const std::uint32_t i1 = triangleIndices[3u * triId + 1u];
+        const std::uint32_t i2 = triangleIndices[3u * triId + 2u];
+        if (pointId == i0 || pointId == i1 || pointId == i2)
+        {
+            return;
+        }
+    }
+
+    const DeviceTriangle tri = indexedTriangleAt(trianglePositions, triangleIndices, triId);
+    const auto vp = pointPositions[pointId];
+    const float3 p = make_float3(vp.x, vp.y, vp.z);
+
+    const float3 bary = closestPointOnTriangleBary(p, tri.p0, tri.p1, tri.p2);
+    const float3 cp = reconstructFromBary(tri.p0, tri.p1, tri.p2, bary);
+    const float3 diff = sub3(cp, p);
+    const float distSq = dot3(diff, diff);
+
+    if (distSq > contactDistance * contactDistance) return;
+
+    const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
+    if (outIdx >= maxContacts)
+    {
+        atomicAdd(overflowCount, 1u);
+        return;
+    }
+
+    DeviceProximityContact c;
+    c.firstPrimitiveIndex  = pointId;  // "first" side is the vertex
+    c.secondPrimitiveIndex = triId;    // "second" side is the triangle
+    c.featureKind = static_cast<std::uint8_t>(0);  // VertexFace
+    c.firstFeatureLocalIndex  = 0;
+    c.secondFeatureLocalIndex = 0;
+    c.reserved = 0;
+    if (computeBarycentrics)
+    {
+        c.firstBary[0] = 1.0f; c.firstBary[1] = 0.0f; c.firstBary[2] = 0.0f;
+        c.secondBary[0] = bary.x; c.secondBary[1] = bary.y; c.secondBary[2] = bary.z;
+    }
+    else
+    {
+        c.firstBary[0] = 1.0f; c.firstBary[1] = 0.0f; c.firstBary[2] = 0.0f;
+        c.secondBary[0] = 1.0f; c.secondBary[1] = 0.0f; c.secondBary[2] = 0.0f;
+    }
+    c.pointOnFirst  = p;
+    c.pointOnSecond = cp;
+    const float dist = sqrtf(distSq);
+    if (dist > 1.0e-12f)
+    {
+        const float inv = 1.0f / dist;
+        c.normal = make_float3(diff.x * inv, diff.y * inv, diff.z * inv);
+    }
+    else
+    {
+        c.normal = make_float3(0.0f, 1.0f, 0.0f);
+    }
+    c.signedDistance = dist;
+    contacts[outIdx] = c;
+    atomicAdd(vfCount, 1u);
 }
 
 } // namespace
@@ -953,6 +2976,7 @@ bool computeExactTriangleContacts(
     {
         executionStats->outputPairCount = hostContactCount > 0 ? 1u : 0u;
         executionStats->outputCandidateCount = hostContactCount;
+        executionStats->outputContactCount = hostContactCount;
     }
 
     contacts.reserve(hostContacts.size());
@@ -966,6 +2990,2406 @@ bool computeExactTriangleContacts(
             TriangleVertex { contact.normal.x, contact.normal.y, contact.normal.z },
             contact.signedDistance,
         });
+    }
+
+    diagnostic.clear();
+    return true;
+}
+
+bool computeDenseGridTriangleContacts(
+    const std::vector<TrianglePrimitive>& tissueTriangles,
+    const std::vector<TrianglePrimitive>& toolTriangles,
+    const DenseGridConfig& config,
+    std::vector<ExactContact>& contacts,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    ScopedNvtxRange totalRange("SofaGpuCollision dense-grid narrow phase", config.detailedProfiling);
+    contacts.clear();
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+        executionStats->inputPrimitiveCount =
+            static_cast<std::uint32_t>(tissueTriangles.size() + toolTriangles.size());
+    }
+
+    if (tissueTriangles.empty() || toolTriangles.empty())
+    {
+        diagnostic.clear();
+        return true;
+    }
+
+    if (config.gridResolutionX == 0 || config.gridResolutionY == 0 || config.gridResolutionZ == 0 ||
+        config.maxTissueTrianglesPerCell == 0 || config.maxToolTrianglesPerCell == 0 ||
+        config.maxCandidatePairs == 0 ||
+        config.gridMaxX <= config.gridMinX ||
+        config.gridMaxY <= config.gridMinY ||
+        config.gridMaxZ <= config.gridMinZ)
+    {
+        diagnostic = "Invalid dense-grid configuration.";
+        return false;
+    }
+
+    const std::uint64_t cellCount64 =
+        static_cast<std::uint64_t>(config.gridResolutionX) *
+        static_cast<std::uint64_t>(config.gridResolutionY) *
+        static_cast<std::uint64_t>(config.gridResolutionZ);
+    if (cellCount64 == 0 || cellCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid cell count exceeds uint32_t indexing capacity.";
+        return false;
+    }
+    const auto cellCount = static_cast<std::uint32_t>(cellCount64);
+
+    const std::uint64_t tissueBucketCount =
+        cellCount64 * static_cast<std::uint64_t>(config.maxTissueTrianglesPerCell);
+    const std::uint64_t toolBucketCount =
+        cellCount64 * static_cast<std::uint64_t>(config.maxToolTrianglesPerCell);
+    const std::uint64_t pairHashCount64 = config.useGpuHashDedupe
+        ? static_cast<std::uint64_t>(nextPowerOfTwo(static_cast<std::size_t>(config.maxCandidatePairs) * 2u))
+        : 1ull;
+    if (tissueBucketCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)) ||
+        toolBucketCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)))
+    {
+        diagnostic = "Dense-grid bucket allocation request is too large.";
+        return false;
+    }
+    if (pairHashCount64 == 0 ||
+        pairHashCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid hash dedupe table request exceeds uint32_t indexing capacity.";
+        return false;
+    }
+
+    auto& workspace = denseGridWorkspace();
+    constexpr std::size_t kPinnedStagingMinimumBytes = 1u << 20;
+    const std::size_t tissueTriangleBytes = tissueTriangles.size() * sizeof(DeviceTriangle);
+    const std::size_t toolTriangleBytes = toolTriangles.size() * sizeof(DeviceTriangle);
+    const std::size_t totalTriangleBytes = tissueTriangleBytes + toolTriangleBytes;
+    bool usingPinnedHostStaging = false;
+    if (config.usePinnedHostStaging && totalTriangleBytes >= kPinnedStagingMinimumBytes)
+    {
+        std::uint64_t newlyPinnedHostBytes = 0;
+        const cudaError_t pinnedErr = workspace.ensurePinnedHostStaging(
+            tissueTriangles.size(),
+            toolTriangles.size(),
+            newlyPinnedHostBytes);
+        usingPinnedHostStaging = pinnedErr == cudaSuccess;
+    }
+
+    const DeviceTriangle* hostTissueTriangleData = nullptr;
+    const DeviceTriangle* hostToolTriangleData = nullptr;
+
+    const auto hostPreparationStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange hostPreparationRange("CPU triangle preparation", config.detailedProfiling);
+        if (usingPinnedHostStaging)
+        {
+            if (tissueTriangleBytes != 0)
+            {
+                std::memcpy(workspace.pinnedTissueTriangles, tissueTriangles.data(), tissueTriangleBytes);
+            }
+            if (toolTriangleBytes != 0)
+            {
+                std::memcpy(workspace.pinnedToolTriangles, toolTriangles.data(), toolTriangleBytes);
+            }
+            hostTissueTriangleData = workspace.pinnedTissueTriangles;
+            hostToolTriangleData = workspace.pinnedToolTriangles;
+        }
+        else
+        {
+            hostTissueTriangleData = reinterpret_cast<const DeviceTriangle*>(tissueTriangles.data());
+            hostToolTriangleData = reinterpret_cast<const DeviceTriangle*>(toolTriangles.data());
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        const double packMs = elapsedMillisecondsSince(hostPreparationStart);
+        executionStats->hostPreparationMilliseconds += packMs;
+        executionStats->backendTrianglePackMilliseconds += packMs;
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->gridCellCount = cellCount;
+        executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(tissueTriangleBytes + toolTriangleBytes);
+    }
+
+    std::uint64_t newlyAllocatedBytes = 0;
+    const auto deviceAllocationStart = std::chrono::steady_clock::now();
+    cudaError_t err = workspace.ensure(
+        tissueTriangles.size(),
+        toolTriangles.size(),
+        static_cast<std::size_t>(cellCount64),
+        static_cast<std::size_t>(tissueBucketCount),
+        static_cast<std::size_t>(toolBucketCount),
+        static_cast<std::size_t>(config.maxCandidatePairs),
+        static_cast<std::size_t>(pairHashCount64),
+        newlyAllocatedBytes);
+    const double deviceAllocationMs = elapsedMillisecondsSince(deviceAllocationStart);
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->deviceAllocationBytes += newlyAllocatedBytes;
+        executionStats->deviceAllocationMilliseconds += deviceAllocationMs;
+        executionStats->workspaceResizeCount += newlyAllocatedBytes > 0 ? 1u : 0u;
+    }
+
+    DeviceTriangle* deviceTissueTriangles = workspace.tissueTriangles;
+    DeviceTriangle* deviceToolTriangles = workspace.toolTriangles;
+    DeviceAabb* deviceTissueAabbs = workspace.tissueAabbs;
+    DeviceAabb* deviceToolAabbs = workspace.toolAabbs;
+    DeviceCellBucket* deviceGrid = workspace.grid;
+    std::uint32_t* deviceActiveCellIds = workspace.activeCellIds;
+    std::uint32_t* deviceCellTissueIds = workspace.cellTissueIds;
+    std::uint32_t* deviceCellToolIds = workspace.cellToolIds;
+    std::uint64_t* deviceCandidatePairs = workspace.candidatePairs;
+    unsigned long long* devicePairHashKeys = workspace.pairHashKeys;
+    DeviceExactContact* deviceContacts = workspace.contacts;
+    std::uint32_t* deviceRawCandidateCount = workspace.rawCandidateCount;
+    std::uint32_t* deviceCandidateCount = workspace.candidateCount;
+    std::uint32_t* deviceContactCount = workspace.contactCount;
+    std::uint32_t* deviceOverflowCount = workspace.overflowCount;
+    std::uint32_t* deviceActiveCellCount = workspace.activeCellCount;
+    DeviceDenseGridStats* deviceDenseGridStats = workspace.denseGridStats;
+    const bool readFullDenseGridCounters =
+        config.copyContactsToHost ||
+        config.readCountersWhenContactsStayOnDevice ||
+        config.detailedProfiling;
+    const bool computeDeviceContacts =
+        config.copyContactsToHost ||
+        config.computeDeviceContactsWhenContactsStayOnDevice;
+    const bool readCandidateCounters =
+        readFullDenseGridCounters ||
+        computeDeviceContacts;
+    DeviceDenseGridStats* activeDeviceDenseGridStats =
+        readFullDenseGridCounters ? deviceDenseGridStats : nullptr;
+    auto freeAll = []() {};
+
+    const auto hostToDeviceStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange h2dRange("H2D triangle upload", config.detailedProfiling);
+        err = cudaMemcpyAsync(deviceTissueTriangles, hostTissueTriangleData, tissueTriangleBytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess)
+        {
+            err = cudaMemcpyAsync(deviceToolTriangles, hostToolTriangleData, toolTriangleBytes, cudaMemcpyHostToDevice);
+        }
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->hostToDeviceMilliseconds += elapsedMillisecondsSince(hostToDeviceStart);
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    const DeviceDenseGridConfig deviceConfig {
+        make_float3(config.gridMinX, config.gridMinY, config.gridMinZ),
+        make_float3(config.gridMaxX, config.gridMaxY, config.gridMaxZ),
+        make_float3(
+            static_cast<float>(config.gridResolutionX) / (config.gridMaxX - config.gridMinX),
+            static_cast<float>(config.gridResolutionY) / (config.gridMaxY - config.gridMinY),
+            static_cast<float>(config.gridResolutionZ) / (config.gridMaxZ - config.gridMinZ)),
+        config.gridResolutionX,
+        config.gridResolutionY,
+        config.gridResolutionZ,
+        config.contactDistance,
+        config.maxTissueTrianglesPerCell,
+        config.maxToolTrianglesPerCell,
+        config.maxCandidatePairs,
+        static_cast<std::uint32_t>(pairHashCount64),
+        config.useGpuHashDedupe,
+        config.canonicalPairEmission
+    };
+
+    constexpr std::uint32_t threadCount = 256;
+    const auto tissueBlocks =
+        static_cast<std::uint32_t>((tissueTriangles.size() + threadCount - 1) / threadCount);
+    const auto toolBlocks =
+        static_cast<std::uint32_t>((toolTriangles.size() + threadCount - 1) / threadCount);
+
+    cudaEvent_t stageStart {};
+    cudaEvent_t stageEnd {};
+    err = cudaEventCreate(&stageStart);
+    if (err == cudaSuccess)
+    {
+        err = cudaEventCreate(&stageEnd);
+    }
+    cudaEvent_t totalStart {};
+    cudaEvent_t totalEnd {};
+    if (err == cudaSuccess && !config.detailedProfiling)
+    {
+        err = cudaEventCreate(&totalStart);
+    }
+    if (err == cudaSuccess && !config.detailedProfiling)
+    {
+        err = cudaEventCreate(&totalEnd);
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t denseGridLaunchCount = 0;
+    auto destroyStageEvents = [&]() {
+        cudaEventDestroy(stageStart);
+        cudaEventDestroy(stageEnd);
+        if (!config.detailedProfiling)
+        {
+            cudaEventDestroy(totalStart);
+            cudaEventDestroy(totalEnd);
+        }
+    };
+
+    if (!config.detailedProfiling)
+    {
+        err = cudaEventRecord(totalStart);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+    }
+
+    double resetGridMs = 0.0;
+    err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, resetGridMs, [&]() {
+        ScopedNvtxRange range("reset grid/counters", config.detailedProfiling);
+        const std::uint32_t resetItems = cellCount;
+        const std::uint32_t resetBlocks = (resetItems + threadCount - 1u) / threadCount;
+        resetDenseGridKernel<<<resetBlocks, threadCount>>>(
+            deviceGrid,
+            cellCount,
+            devicePairHashKeys,
+            static_cast<std::uint32_t>(pairHashCount64),
+            false,
+            deviceActiveCellCount,
+            deviceRawCandidateCount,
+            deviceCandidateCount,
+            deviceContactCount,
+            deviceOverflowCount,
+            deviceDenseGridStats,
+            readFullDenseGridCounters);
+        return cudaGetLastError();
+    });
+    denseGridLaunchCount += 1;
+    if (executionStats != nullptr)
+    {
+        executionStats->denseGridClearMilliseconds += resetGridMs;
+    }
+    if (err == cudaSuccess && config.useGpuHashDedupe)
+    {
+        double hashClearMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, hashClearMs, [&]() {
+            ScopedNvtxRange range("clear pair hash", config.detailedProfiling);
+            return cudaMemset(
+                devicePairHashKeys,
+                0xff,
+                static_cast<std::size_t>(pairHashCount64) * sizeof(std::uint64_t));
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridCounterClearMilliseconds += hashClearMs;
+            executionStats->cudaMemsetCount += 1;
+        }
+    }
+    const bool useFusedAabbInsert = !config.canonicalPairEmission || config.useGpuHashDedupe;
+    if (useFusedAabbInsert)
+    {
+        if (err == cudaSuccess && config.batchTriangleInsert)
+        {
+            double insertMs = 0.0;
+            const auto combinedBlocks = static_cast<std::uint32_t>(
+                ((tissueTriangles.size() + toolTriangles.size()) + threadCount - 1) / threadCount);
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertMs, [&]() {
+                ScopedNvtxRange range("fused AABB/insert tissue+tool", config.detailedProfiling);
+                insertPackedTrianglePairKernel<<<combinedBlocks, threadCount>>>(
+                    deviceTissueTriangles,
+                    static_cast<std::uint32_t>(tissueTriangles.size()),
+                    deviceToolTriangles,
+                    static_cast<std::uint32_t>(toolTriangles.size()),
+                    deviceConfig,
+                    deviceGrid,
+                    deviceCellTissueIds,
+                    deviceCellToolIds,
+                    deviceOverflowCount,
+                    activeDeviceDenseGridStats);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridInsertTissueMilliseconds += insertMs;
+            }
+        }
+        if (err == cudaSuccess && !config.batchTriangleInsert)
+        {
+            double insertTissueMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertTissueMs, [&]() {
+                ScopedNvtxRange range("fused AABB/insert tissue", config.detailedProfiling);
+                insertPackedTrianglesKernel<<<tissueBlocks, threadCount>>>(
+                    deviceTissueTriangles,
+                    static_cast<std::uint32_t>(tissueTriangles.size()),
+                    true,
+                    deviceConfig,
+                    deviceGrid,
+                    deviceCellTissueIds,
+                    deviceOverflowCount,
+                    activeDeviceDenseGridStats);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridInsertTissueMilliseconds += insertTissueMs;
+            }
+        }
+        if (err == cudaSuccess && !config.batchTriangleInsert)
+        {
+            double insertToolMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertToolMs, [&]() {
+                ScopedNvtxRange range("fused AABB/insert tool", config.detailedProfiling);
+                insertPackedTrianglesKernel<<<toolBlocks, threadCount>>>(
+                    deviceToolTriangles,
+                    static_cast<std::uint32_t>(toolTriangles.size()),
+                    false,
+                    deviceConfig,
+                    deviceGrid,
+                    deviceCellToolIds,
+                    deviceOverflowCount,
+                    activeDeviceDenseGridStats);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridInsertToolMilliseconds += insertToolMs;
+            }
+        }
+    }
+    else
+    {
+        if (err == cudaSuccess)
+        {
+            double tissueAabbMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, tissueAabbMs, [&]() {
+                ScopedNvtxRange range("AABB tissue", config.detailedProfiling);
+                triangleAabbKernel<<<tissueBlocks, threadCount>>>(
+                    deviceTissueTriangles,
+                    static_cast<std::uint32_t>(tissueTriangles.size()),
+                    config.contactDistance,
+                    deviceTissueAabbs);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridTissueAabbMilliseconds += tissueAabbMs;
+            }
+        }
+        if (err == cudaSuccess)
+        {
+            double toolAabbMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, toolAabbMs, [&]() {
+                ScopedNvtxRange range("AABB tool", config.detailedProfiling);
+                triangleAabbKernel<<<toolBlocks, threadCount>>>(
+                    deviceToolTriangles,
+                    static_cast<std::uint32_t>(toolTriangles.size()),
+                    config.contactDistance,
+                    deviceToolAabbs);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridToolAabbMilliseconds += toolAabbMs;
+            }
+        }
+        if (err == cudaSuccess)
+        {
+            double insertTissueMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertTissueMs, [&]() {
+                ScopedNvtxRange range("insert tissue", config.detailedProfiling);
+                insertTissueTrianglesKernel<<<tissueBlocks, threadCount>>>(
+                    deviceTissueAabbs,
+                    static_cast<std::uint32_t>(tissueTriangles.size()),
+                    deviceConfig,
+                    deviceGrid,
+                    deviceCellTissueIds,
+                    deviceOverflowCount,
+                    activeDeviceDenseGridStats);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridInsertTissueMilliseconds += insertTissueMs;
+            }
+        }
+        if (err == cudaSuccess)
+        {
+            double insertToolMs = 0.0;
+            err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertToolMs, [&]() {
+                ScopedNvtxRange range("insert tool", config.detailedProfiling);
+                insertToolTrianglesKernel<<<toolBlocks, threadCount>>>(
+                    deviceToolAabbs,
+                    static_cast<std::uint32_t>(toolTriangles.size()),
+                    deviceConfig,
+                    deviceGrid,
+                    deviceCellToolIds,
+                    deviceOverflowCount,
+                    activeDeviceDenseGridStats);
+                return cudaGetLastError();
+            });
+            denseGridLaunchCount += 1;
+            if (executionStats != nullptr)
+            {
+                executionStats->denseGridInsertToolMilliseconds += insertToolMs;
+            }
+        }
+    }
+    if (err == cudaSuccess && config.compactActiveCells)
+    {
+        double compactActiveCellsMs = 0.0;
+        const std::uint32_t compactBlocks = (cellCount + threadCount - 1u) / threadCount;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, compactActiveCellsMs, [&]() {
+            ScopedNvtxRange range("compact active cells", config.detailedProfiling);
+            compactActiveDenseGridCellsKernel<<<compactBlocks, threadCount>>>(
+                deviceGrid,
+                cellCount,
+                deviceConfig,
+                deviceActiveCellIds,
+                deviceActiveCellCount,
+                activeDeviceDenseGridStats);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridGeneratePairsMilliseconds += compactActiveCellsMs;
+        }
+    }
+    if (err == cudaSuccess)
+    {
+        double generatePairsMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, generatePairsMs, [&]() {
+            ScopedNvtxRange range("generate pairs", config.detailedProfiling);
+            if (config.useGpuHashDedupe)
+            {
+                if (config.compactActiveCells)
+                {
+                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
+                    generateActiveDenseGridUniqueCandidatePairsKernel<<<activeBlocks, threadCount>>>(
+                        deviceGrid,
+                        deviceActiveCellIds,
+                        deviceActiveCellCount,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        devicePairHashKeys,
+                        deviceRawCandidateCount,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+                else
+                {
+                    generateDenseGridUniqueCandidatePairsKernel<<<cellCount, threadCount>>>(
+                        deviceGrid,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        devicePairHashKeys,
+                        deviceRawCandidateCount,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+            }
+            else
+            {
+                if (config.compactActiveCells)
+                {
+                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
+                    generateActiveDenseGridCandidatePairsKernel<<<activeBlocks, threadCount>>>(
+                        deviceGrid,
+                        deviceActiveCellIds,
+                        deviceActiveCellCount,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceTissueAabbs,
+                        deviceToolAabbs,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        deviceCandidateCount,
+                        deviceOverflowCount);
+                }
+                else
+                {
+                    generateDenseGridCandidatePairsKernel<<<cellCount, threadCount>>>(
+                        deviceGrid,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceTissueAabbs,
+                        deviceToolAabbs,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+            }
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridGeneratePairsMilliseconds += generatePairsMs;
+        }
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        destroyStageEvents();
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t rawCandidateCount = 0;
+    std::uint32_t exactCandidateCount = 0;
+    std::uint32_t overflowCount = 0;
+    DeviceDenseGridStats hostDenseGridStats {};
+    const auto candidateReadbackStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange range("D2H candidate counters", config.detailedProfiling);
+        if (readFullDenseGridCounters)
+        {
+            err = cudaMemcpy(
+                &rawCandidateCount,
+                config.useGpuHashDedupe ? deviceRawCandidateCount : deviceCandidateCount,
+                sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess && config.useGpuHashDedupe)
+            {
+                err = cudaMemcpy(&exactCandidateCount, deviceCandidateCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (err == cudaSuccess && executionStats != nullptr)
+            {
+                err = cudaMemcpy(&hostDenseGridStats, deviceDenseGridStats, sizeof(DeviceDenseGridStats), cudaMemcpyDeviceToHost);
+            }
+        }
+        else if (readCandidateCounters)
+        {
+            err = cudaMemcpy(&exactCandidateCount, deviceCandidateCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (!config.useGpuHashDedupe)
+            {
+                rawCandidateCount = exactCandidateCount;
+            }
+        }
+    }
+    if (executionStats != nullptr)
+    {
+        if (readCandidateCounters)
+        {
+            executionStats->denseGridCandidateReadbackMilliseconds += elapsedMillisecondsSince(candidateReadbackStart);
+        }
+        const auto candidateReadbackBytes = readFullDenseGridCounters
+            ? static_cast<std::uint64_t>((config.useGpuHashDedupe ? 3u : 2u) * sizeof(std::uint32_t) + sizeof(DeviceDenseGridStats))
+            : (readCandidateCounters ? static_cast<std::uint64_t>(2u * sizeof(std::uint32_t)) : 0u);
+        executionStats->deviceToHostBytes += candidateReadbackBytes;
+        executionStats->activeMixedCellCount = hostDenseGridStats.activeMixedCellCount;
+        executionStats->tissueInsertCount = hostDenseGridStats.tissueInsertCount;
+        executionStats->toolInsertCount = hostDenseGridStats.toolInsertCount;
+        executionStats->maxTissueCellOccupancy = hostDenseGridStats.maxTissueCellOccupancy;
+        executionStats->maxToolCellOccupancy = hostDenseGridStats.maxToolCellOccupancy;
+        executionStats->hashDedupeProbeOverflowCount = hostDenseGridStats.hashDedupeProbeOverflowCount;
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        destroyStageEvents();
+        freeAll();
+        return false;
+    }
+
+    const std::uint32_t usedCandidateCount = std::min(rawCandidateCount, config.maxCandidatePairs);
+    if (executionStats != nullptr &&
+        config.validateDedupeOnHost &&
+        !config.useGpuHashDedupe &&
+        usedCandidateCount > 0)
+    {
+        std::vector<std::uint64_t> hostCandidatePairs(usedCandidateCount);
+        const auto validationStart = std::chrono::steady_clock::now();
+        err = cudaMemcpy(
+            hostCandidatePairs.data(),
+            deviceCandidatePairs,
+            static_cast<std::size_t>(usedCandidateCount) * sizeof(std::uint64_t),
+            cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+
+        std::sort(hostCandidatePairs.begin(), hostCandidatePairs.end());
+        const auto hostUniqueEnd = std::unique(hostCandidatePairs.begin(), hostCandidatePairs.end());
+        executionStats->hostValidatedUniqueCandidateCount =
+            static_cast<std::uint32_t>(hostUniqueEnd - hostCandidatePairs.begin());
+        executionStats->denseGridCandidateReadbackMilliseconds += elapsedMillisecondsSince(validationStart);
+        executionStats->deviceToHostBytes +=
+            static_cast<std::uint64_t>(usedCandidateCount) * sizeof(std::uint64_t);
+    }
+    if (!config.useGpuHashDedupe)
+    {
+        exactCandidateCount = usedCandidateCount;
+    }
+    else
+    {
+        exactCandidateCount = std::min(exactCandidateCount, config.maxCandidatePairs);
+    }
+    if (!config.useGpuHashDedupe && config.deduplicatePairs && usedCandidateCount > 1)
+    {
+        double sortUniqueMs = 0.0;
+        const auto sortUniqueHostStart = std::chrono::steady_clock::now();
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, sortUniqueMs, [&]() {
+            ScopedNvtxRange range("sort unique", config.detailedProfiling);
+            thrust::device_ptr<std::uint64_t> begin(deviceCandidatePairs);
+            thrust::device_ptr<std::uint64_t> end = begin + usedCandidateCount;
+            thrust::sort(begin, end);
+            cudaError_t thrustErr = cudaDeviceSynchronize();
+            if (thrustErr != cudaSuccess)
+            {
+                return thrustErr;
+            }
+            const auto uniqueEnd = thrust::unique(begin, end);
+            thrustErr = cudaDeviceSynchronize();
+            if (thrustErr != cudaSuccess)
+            {
+                return thrustErr;
+            }
+            exactCandidateCount = static_cast<std::uint32_t>(uniqueEnd - begin);
+            return cudaGetLastError();
+        });
+        const double sortUniqueHostMs = elapsedMillisecondsSince(sortUniqueHostStart);
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridSortUniqueMilliseconds += sortUniqueMs;
+            executionStats->denseGridSortUniqueHostMilliseconds += sortUniqueHostMs;
+        }
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+    }
+
+    if (err == cudaSuccess && computeDeviceContacts && exactCandidateCount > 0)
+    {
+        double exactContactMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, exactContactMs, [&]() {
+            ScopedNvtxRange range("exact contacts", config.detailedProfiling);
+            const auto contactBlocks = static_cast<std::uint32_t>((exactCandidateCount + threadCount - 1) / threadCount);
+            exactDenseGridContactKernel<<<contactBlocks, threadCount>>>(
+                deviceTissueTriangles,
+                deviceToolTriangles,
+                deviceCandidatePairs,
+                exactCandidateCount,
+                deviceContacts,
+                config.maxCandidatePairs,
+                deviceContactCount,
+                deviceOverflowCount);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridExactContactMilliseconds += exactContactMs;
+        }
+    }
+
+    if (!config.detailedProfiling && err == cudaSuccess)
+    {
+        err = cudaEventRecord(totalEnd);
+        if (err == cudaSuccess)
+        {
+            err = cudaEventSynchronize(totalEnd);
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        if (config.detailedProfiling)
+        {
+            executionStats->gpuKernelMilliseconds +=
+                executionStats->denseGridClearMilliseconds +
+                executionStats->denseGridCounterClearMilliseconds +
+                executionStats->denseGridTissueAabbMilliseconds +
+                executionStats->denseGridToolAabbMilliseconds +
+                executionStats->denseGridInsertTissueMilliseconds +
+                executionStats->denseGridInsertToolMilliseconds +
+                executionStats->denseGridGeneratePairsMilliseconds +
+                executionStats->denseGridSortUniqueMilliseconds +
+                executionStats->denseGridExactContactMilliseconds;
+        }
+        else if (err == cudaSuccess)
+        {
+            float elapsedMs = 0.0f;
+            const cudaError_t eventErr = cudaEventElapsedTime(&elapsedMs, totalStart, totalEnd);
+            if (eventErr == cudaSuccess)
+            {
+                executionStats->gpuKernelMilliseconds += static_cast<double>(elapsedMs);
+            }
+        }
+        executionStats->kernelLaunchCount += denseGridLaunchCount;
+        executionStats->rawCandidateCount = rawCandidateCount;
+        executionStats->uniqueCandidateCount = exactCandidateCount;
+        executionStats->outputPairCount = exactCandidateCount > 0 ? 1u : 0u;
+        executionStats->outputCandidateCount = exactCandidateCount;
+    }
+    destroyStageEvents();
+
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t hostContactCount = 0;
+    const auto contactCountReadbackStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange range("D2H contact counters", config.detailedProfiling);
+        if (readFullDenseGridCounters)
+        {
+            err = cudaMemcpy(&hostContactCount, deviceContactCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+        }
+    }
+    if (executionStats != nullptr && readFullDenseGridCounters)
+    {
+        executionStats->denseGridContactCountReadbackMilliseconds += elapsedMillisecondsSince(contactCountReadbackStart);
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->overflowCount = overflowCount;
+        executionStats->outputContactCount = hostContactCount;
+        if (readFullDenseGridCounters)
+        {
+            executionStats->deviceToHostBytes += static_cast<std::uint64_t>(2 * sizeof(std::uint32_t));
+        }
+    }
+
+    if (overflowCount > 0 ||
+        (readFullDenseGridCounters && hostDenseGridStats.hashDedupeProbeOverflowCount > 0) ||
+        (!config.useGpuHashDedupe && rawCandidateCount > config.maxCandidatePairs) ||
+        (readFullDenseGridCounters && hostContactCount > config.maxCandidatePairs))
+    {
+        diagnostic = "Dense-grid bucket, candidate, or contact capacity overflowed.";
+        freeAll();
+        return false;
+    }
+
+    if (!config.copyContactsToHost)
+    {
+        diagnostic.clear();
+        return true;
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->deviceToHostBytes += static_cast<std::uint64_t>(hostContactCount * sizeof(DeviceExactContact));
+    }
+
+    std::vector<DeviceExactContact> hostContacts(hostContactCount);
+    if (hostContactCount > 0)
+    {
+        const auto contactDownloadStart = std::chrono::steady_clock::now();
+        {
+            ScopedNvtxRange range("D2H contacts", config.detailedProfiling);
+            err = cudaMemcpy(
+                hostContacts.data(),
+                deviceContacts,
+                hostContactCount * sizeof(DeviceExactContact),
+                cudaMemcpyDeviceToHost);
+        }
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridContactDownloadMilliseconds += elapsedMillisecondsSince(contactDownloadStart);
+        }
+    }
+    freeAll();
+
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+
+    contacts.reserve(hostContacts.size());
+    for (const auto& contact : hostContacts)
+    {
+        contacts.push_back(ExactContact {
+            contact.firstTriangleIndex,
+            contact.secondTriangleIndex,
+            TriangleVertex { contact.pointOnFirst.x, contact.pointOnFirst.y, contact.pointOnFirst.z },
+            TriangleVertex { contact.pointOnSecond.x, contact.pointOnSecond.y, contact.pointOnSecond.z },
+            TriangleVertex { contact.normal.x, contact.normal.y, contact.normal.z },
+            contact.signedDistance,
+        });
+    }
+
+    diagnostic.clear();
+    return true;
+}
+
+bool computeDenseGridIndexedTriangleContacts(
+    const TriangleIndexedSurface& tissueSurface,
+    const TriangleIndexedSurface& toolSurface,
+    const DenseGridConfig& config,
+    std::vector<ExactContact>& contacts,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    contacts.clear();
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+        executionStats->inputPrimitiveCount = tissueSurface.triangleCount + toolSurface.triangleCount;
+    }
+
+    const auto surfaceIsInvalid = [](const TriangleIndexedSurface& surface) {
+        return (surface.positions == nullptr && surface.devicePositions == nullptr) ||
+            surface.triangleIndices == nullptr ||
+            surface.vertexCount == 0 ||
+            surface.triangleCount == 0;
+    };
+    if (surfaceIsInvalid(tissueSurface) || surfaceIsInvalid(toolSurface))
+    {
+        diagnostic = "Invalid indexed triangle surface.";
+        return false;
+    }
+
+    if (config.canonicalPairEmission && !config.useGpuHashDedupe)
+    {
+        diagnostic = "Indexed dense-grid input does not support canonical pair emission without GPU hash dedupe.";
+        return false;
+    }
+
+    if (config.gridResolutionX == 0 || config.gridResolutionY == 0 || config.gridResolutionZ == 0 ||
+        config.maxTissueTrianglesPerCell == 0 || config.maxToolTrianglesPerCell == 0 ||
+        config.maxCandidatePairs == 0 ||
+        config.gridMaxX <= config.gridMinX ||
+        config.gridMaxY <= config.gridMinY ||
+        config.gridMaxZ <= config.gridMinZ)
+    {
+        diagnostic = "Invalid dense-grid configuration.";
+        return false;
+    }
+
+    const std::uint64_t cellCount64 =
+        static_cast<std::uint64_t>(config.gridResolutionX) *
+        static_cast<std::uint64_t>(config.gridResolutionY) *
+        static_cast<std::uint64_t>(config.gridResolutionZ);
+    if (cellCount64 == 0 || cellCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid cell count exceeds uint32_t indexing capacity.";
+        return false;
+    }
+    const auto cellCount = static_cast<std::uint32_t>(cellCount64);
+
+    const std::uint64_t tissueBucketCount =
+        cellCount64 * static_cast<std::uint64_t>(config.maxTissueTrianglesPerCell);
+    const std::uint64_t toolBucketCount =
+        cellCount64 * static_cast<std::uint64_t>(config.maxToolTrianglesPerCell);
+    const std::uint64_t pairHashCount64 = config.useGpuHashDedupe
+        ? static_cast<std::uint64_t>(nextPowerOfTwo(static_cast<std::size_t>(config.maxCandidatePairs) * 2u))
+        : 1ull;
+    if (tissueBucketCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)) ||
+        toolBucketCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)))
+    {
+        diagnostic = "Dense-grid bucket allocation request is too large.";
+        return false;
+    }
+    if (pairHashCount64 == 0 ||
+        pairHashCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid hash dedupe table request exceeds uint32_t indexing capacity.";
+        return false;
+    }
+
+    auto& workspace = denseGridWorkspace();
+    std::uint64_t newlyAllocatedBytes = 0;
+    const auto deviceAllocationStart = std::chrono::steady_clock::now();
+    cudaError_t err = workspace.ensure(
+        0,
+        0,
+        static_cast<std::size_t>(cellCount64),
+        static_cast<std::size_t>(tissueBucketCount),
+        static_cast<std::size_t>(toolBucketCount),
+        static_cast<std::size_t>(config.maxCandidatePairs),
+        static_cast<std::size_t>(pairHashCount64),
+        newlyAllocatedBytes);
+    if (err == cudaSuccess)
+    {
+        err = workspace.ensureIndexedInput(
+            tissueSurface.devicePositions == nullptr ? tissueSurface.vertexCount : 0u,
+            toolSurface.devicePositions == nullptr ? toolSurface.vertexCount : 0u,
+            static_cast<std::size_t>(tissueSurface.triangleCount) * 3u,
+            static_cast<std::size_t>(toolSurface.triangleCount) * 3u,
+            newlyAllocatedBytes);
+    }
+    const double deviceAllocationMs = elapsedMillisecondsSince(deviceAllocationStart);
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->gridCellCount = cellCount;
+        executionStats->deviceAllocationBytes += newlyAllocatedBytes;
+        executionStats->deviceAllocationMilliseconds += deviceAllocationMs;
+        executionStats->workspaceResizeCount += newlyAllocatedBytes > 0 ? 1u : 0u;
+    }
+
+    const BackendTriangleVertex* deviceTissuePositions =
+        tissueSurface.devicePositions == nullptr ? workspace.indexedTissuePositions : tissueSurface.devicePositions;
+    const BackendTriangleVertex* deviceToolPositions =
+        toolSurface.devicePositions == nullptr ? workspace.indexedToolPositions : toolSurface.devicePositions;
+    std::uint32_t* deviceTissueTriangleIndices = workspace.indexedTissueIndices;
+    std::uint32_t* deviceToolTriangleIndices = workspace.indexedToolIndices;
+    DeviceCellBucket* deviceGrid = workspace.grid;
+    std::uint32_t* deviceActiveCellIds = workspace.activeCellIds;
+    std::uint32_t* deviceCellTissueIds = workspace.cellTissueIds;
+    std::uint32_t* deviceCellToolIds = workspace.cellToolIds;
+    std::uint64_t* deviceCandidatePairs = workspace.candidatePairs;
+    unsigned long long* devicePairHashKeys = workspace.pairHashKeys;
+    DeviceExactContact* deviceContacts = workspace.contacts;
+    std::uint32_t* deviceRawCandidateCount = workspace.rawCandidateCount;
+    std::uint32_t* deviceCandidateCount = workspace.candidateCount;
+    std::uint32_t* deviceContactCount = workspace.contactCount;
+    std::uint32_t* deviceOverflowCount = workspace.overflowCount;
+    std::uint32_t* deviceActiveCellCount = workspace.activeCellCount;
+    DeviceDenseGridStats* deviceDenseGridStats = workspace.denseGridStats;
+    const bool readFullDenseGridCounters =
+        config.copyContactsToHost ||
+        config.readCountersWhenContactsStayOnDevice ||
+        config.detailedProfiling;
+    const bool computeDeviceContacts =
+        config.copyContactsToHost ||
+        config.computeDeviceContactsWhenContactsStayOnDevice;
+    const bool readCandidateCounters =
+        readFullDenseGridCounters ||
+        computeDeviceContacts;
+    DeviceDenseGridStats* activeDeviceDenseGridStats =
+        readFullDenseGridCounters ? deviceDenseGridStats : nullptr;
+    auto freeAll = []() {};
+
+    const std::size_t tissuePositionBytes =
+        static_cast<std::size_t>(tissueSurface.vertexCount) * sizeof(BackendTriangleVertex);
+    const std::size_t toolPositionBytes =
+        static_cast<std::size_t>(toolSurface.vertexCount) * sizeof(BackendTriangleVertex);
+    const std::size_t tissueIndexBytes =
+        static_cast<std::size_t>(tissueSurface.triangleCount) * 3u * sizeof(std::uint32_t);
+    const std::size_t toolIndexBytes =
+        static_cast<std::size_t>(toolSurface.triangleCount) * 3u * sizeof(std::uint32_t);
+    const bool uploadTissueTopology =
+        workspace.indexedTissueSurfaceId != tissueSurface.surfaceId ||
+        workspace.indexedTissueTopologyVersion != tissueSurface.topologyVersion;
+    const bool uploadToolTopology =
+        workspace.indexedToolSurfaceId != toolSurface.surfaceId ||
+        workspace.indexedToolTopologyVersion != toolSurface.topologyVersion;
+    constexpr std::size_t kPinnedIndexedStagingMinimumBytes = 1u << 20;
+    const std::size_t indexedUploadBytes =
+        (tissueSurface.devicePositions == nullptr ? tissuePositionBytes : 0u) +
+        (toolSurface.devicePositions == nullptr ? toolPositionBytes : 0u) +
+        (uploadTissueTopology ? tissueIndexBytes : 0u) +
+        (uploadToolTopology ? toolIndexBytes : 0u);
+    bool usingPinnedIndexedHostStaging = false;
+    if (config.usePinnedHostStaging && indexedUploadBytes >= kPinnedIndexedStagingMinimumBytes)
+    {
+        std::uint64_t newlyPinnedHostBytes = 0;
+        const cudaError_t pinnedErr = workspace.ensureIndexedPinnedHostStaging(
+            tissueSurface.devicePositions == nullptr ? tissueSurface.vertexCount : 0u,
+            toolSurface.devicePositions == nullptr ? toolSurface.vertexCount : 0u,
+            uploadTissueTopology ? static_cast<std::size_t>(tissueSurface.triangleCount) * 3u : 0u,
+            uploadToolTopology ? static_cast<std::size_t>(toolSurface.triangleCount) * 3u : 0u,
+            newlyPinnedHostBytes);
+        usingPinnedIndexedHostStaging = pinnedErr == cudaSuccess;
+    }
+
+    const auto hostToDeviceStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange h2dRange("H2D indexed surface upload", config.detailedProfiling);
+        if (tissueSurface.devicePositions == nullptr)
+        {
+            err = copyHostArrayToDeviceAsync(
+                workspace.indexedTissuePositions,
+                tissueSurface.positions,
+                workspace.pinnedIndexedTissuePositions,
+                static_cast<std::size_t>(tissueSurface.vertexCount),
+                usingPinnedIndexedHostStaging);
+        }
+        if (err == cudaSuccess && toolSurface.devicePositions == nullptr)
+        {
+            err = copyHostArrayToDeviceAsync(
+                workspace.indexedToolPositions,
+                toolSurface.positions,
+                workspace.pinnedIndexedToolPositions,
+                static_cast<std::size_t>(toolSurface.vertexCount),
+                usingPinnedIndexedHostStaging);
+        }
+        if (err == cudaSuccess && uploadTissueTopology)
+        {
+            err = copyHostArrayToDeviceAsync(
+                deviceTissueTriangleIndices,
+                tissueSurface.triangleIndices,
+                workspace.pinnedIndexedTissueIndices,
+                static_cast<std::size_t>(tissueSurface.triangleCount) * 3u,
+                usingPinnedIndexedHostStaging);
+        }
+        if (err == cudaSuccess && uploadToolTopology)
+        {
+            err = copyHostArrayToDeviceAsync(
+                deviceToolTriangleIndices,
+                toolSurface.triangleIndices,
+                workspace.pinnedIndexedToolIndices,
+                static_cast<std::size_t>(toolSurface.triangleCount) * 3u,
+                usingPinnedIndexedHostStaging);
+        }
+    }
+    if (err == cudaSuccess && uploadTissueTopology)
+    {
+        workspace.indexedTissueSurfaceId = tissueSurface.surfaceId;
+        workspace.indexedTissueTopologyVersion = tissueSurface.topologyVersion;
+    }
+    if (err == cudaSuccess && uploadToolTopology)
+    {
+        workspace.indexedToolSurfaceId = toolSurface.surfaceId;
+        workspace.indexedToolTopologyVersion = toolSurface.topologyVersion;
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->hostToDeviceMilliseconds += elapsedMillisecondsSince(hostToDeviceStart);
+        if (tissueSurface.devicePositions == nullptr)
+        {
+            executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(tissuePositionBytes);
+        }
+        if (toolSurface.devicePositions == nullptr)
+        {
+            executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(toolPositionBytes);
+        }
+        if (uploadTissueTopology)
+        {
+            executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(tissueIndexBytes);
+        }
+        if (uploadToolTopology)
+        {
+            executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(toolIndexBytes);
+        }
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    const DeviceDenseGridConfig deviceConfig {
+        make_float3(config.gridMinX, config.gridMinY, config.gridMinZ),
+        make_float3(config.gridMaxX, config.gridMaxY, config.gridMaxZ),
+        make_float3(
+            static_cast<float>(config.gridResolutionX) / (config.gridMaxX - config.gridMinX),
+            static_cast<float>(config.gridResolutionY) / (config.gridMaxY - config.gridMinY),
+            static_cast<float>(config.gridResolutionZ) / (config.gridMaxZ - config.gridMinZ)),
+        config.gridResolutionX,
+        config.gridResolutionY,
+        config.gridResolutionZ,
+        config.contactDistance,
+        config.maxTissueTrianglesPerCell,
+        config.maxToolTrianglesPerCell,
+        config.maxCandidatePairs,
+        static_cast<std::uint32_t>(pairHashCount64),
+        config.useGpuHashDedupe,
+        config.canonicalPairEmission
+    };
+
+    constexpr std::uint32_t threadCount = 256;
+    const auto tissueBlocks =
+        static_cast<std::uint32_t>((tissueSurface.triangleCount + threadCount - 1) / threadCount);
+    const auto toolBlocks =
+        static_cast<std::uint32_t>((toolSurface.triangleCount + threadCount - 1) / threadCount);
+
+    cudaEvent_t stageStart {};
+    cudaEvent_t stageEnd {};
+    err = cudaEventCreate(&stageStart);
+    if (err == cudaSuccess)
+    {
+        err = cudaEventCreate(&stageEnd);
+    }
+    cudaEvent_t totalStart {};
+    cudaEvent_t totalEnd {};
+    if (err == cudaSuccess && !config.detailedProfiling)
+    {
+        err = cudaEventCreate(&totalStart);
+    }
+    if (err == cudaSuccess && !config.detailedProfiling)
+    {
+        err = cudaEventCreate(&totalEnd);
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t denseGridLaunchCount = 0;
+    auto destroyStageEvents = [&]() {
+        cudaEventDestroy(stageStart);
+        cudaEventDestroy(stageEnd);
+        if (!config.detailedProfiling)
+        {
+            cudaEventDestroy(totalStart);
+            cudaEventDestroy(totalEnd);
+        }
+    };
+
+    if (!config.detailedProfiling)
+    {
+        err = cudaEventRecord(totalStart);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+    }
+
+    double resetGridMs = 0.0;
+    err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, resetGridMs, [&]() {
+        ScopedNvtxRange range("reset indexed grid/counters", config.detailedProfiling);
+        const std::uint32_t resetItems = cellCount;
+        const std::uint32_t resetBlocks = (resetItems + threadCount - 1u) / threadCount;
+        resetDenseGridKernel<<<resetBlocks, threadCount>>>(
+            deviceGrid,
+            cellCount,
+            devicePairHashKeys,
+            static_cast<std::uint32_t>(pairHashCount64),
+            false,
+            deviceActiveCellCount,
+            deviceRawCandidateCount,
+            deviceCandidateCount,
+            deviceContactCount,
+            deviceOverflowCount,
+            deviceDenseGridStats,
+            readFullDenseGridCounters);
+        return cudaGetLastError();
+    });
+    denseGridLaunchCount += 1;
+    if (executionStats != nullptr)
+    {
+        executionStats->denseGridClearMilliseconds += resetGridMs;
+    }
+    if (err == cudaSuccess && config.useGpuHashDedupe)
+    {
+        double hashClearMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, hashClearMs, [&]() {
+            ScopedNvtxRange range("clear indexed pair hash", config.detailedProfiling);
+            return cudaMemset(
+                devicePairHashKeys,
+                0xff,
+                static_cast<std::size_t>(pairHashCount64) * sizeof(std::uint64_t));
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridCounterClearMilliseconds += hashClearMs;
+            executionStats->cudaMemsetCount += 1;
+        }
+    }
+
+    if (err == cudaSuccess && config.batchTriangleInsert)
+    {
+        double insertMs = 0.0;
+        const auto combinedBlocks = static_cast<std::uint32_t>(
+            ((tissueSurface.triangleCount + toolSurface.triangleCount) + threadCount - 1) / threadCount);
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertMs, [&]() {
+            ScopedNvtxRange range("indexed AABB/insert tissue+tool", config.detailedProfiling);
+            insertIndexedTrianglePairKernel<<<combinedBlocks, threadCount>>>(
+                deviceTissuePositions,
+                deviceTissueTriangleIndices,
+                tissueSurface.triangleCount,
+                deviceToolPositions,
+                deviceToolTriangleIndices,
+                toolSurface.triangleCount,
+                deviceConfig,
+                deviceGrid,
+                deviceCellTissueIds,
+                deviceCellToolIds,
+                deviceOverflowCount,
+                activeDeviceDenseGridStats);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridInsertTissueMilliseconds += insertMs;
+        }
+    }
+    if (err == cudaSuccess && !config.batchTriangleInsert)
+    {
+        double insertTissueMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertTissueMs, [&]() {
+            ScopedNvtxRange range("indexed AABB/insert tissue", config.detailedProfiling);
+            insertIndexedTrianglesKernel<<<tissueBlocks, threadCount>>>(
+                deviceTissuePositions,
+                deviceTissueTriangleIndices,
+                tissueSurface.triangleCount,
+                true,
+                deviceConfig,
+                deviceGrid,
+                deviceCellTissueIds,
+                deviceOverflowCount,
+                activeDeviceDenseGridStats);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridInsertTissueMilliseconds += insertTissueMs;
+        }
+    }
+    if (err == cudaSuccess && !config.batchTriangleInsert)
+    {
+        double insertToolMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, insertToolMs, [&]() {
+            ScopedNvtxRange range("indexed AABB/insert tool", config.detailedProfiling);
+            insertIndexedTrianglesKernel<<<toolBlocks, threadCount>>>(
+                deviceToolPositions,
+                deviceToolTriangleIndices,
+                toolSurface.triangleCount,
+                false,
+                deviceConfig,
+                deviceGrid,
+                deviceCellToolIds,
+                deviceOverflowCount,
+                activeDeviceDenseGridStats);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridInsertToolMilliseconds += insertToolMs;
+        }
+    }
+    if (err == cudaSuccess && config.compactActiveCells)
+    {
+        double compactActiveCellsMs = 0.0;
+        const std::uint32_t compactBlocks = (cellCount + threadCount - 1u) / threadCount;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, compactActiveCellsMs, [&]() {
+            ScopedNvtxRange range("indexed compact active cells", config.detailedProfiling);
+            compactActiveDenseGridCellsKernel<<<compactBlocks, threadCount>>>(
+                deviceGrid,
+                cellCount,
+                deviceConfig,
+                deviceActiveCellIds,
+                deviceActiveCellCount,
+                activeDeviceDenseGridStats);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridGeneratePairsMilliseconds += compactActiveCellsMs;
+        }
+    }
+    if (err == cudaSuccess)
+    {
+        double generatePairsMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, generatePairsMs, [&]() {
+            ScopedNvtxRange range("indexed generate pairs", config.detailedProfiling);
+            if (config.useGpuHashDedupe)
+            {
+                if (config.compactActiveCells)
+                {
+                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
+                    generateActiveDenseGridUniqueCandidatePairsKernel<<<activeBlocks, threadCount>>>(
+                        deviceGrid,
+                        deviceActiveCellIds,
+                        deviceActiveCellCount,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        devicePairHashKeys,
+                        deviceRawCandidateCount,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+                else
+                {
+                    generateDenseGridUniqueCandidatePairsKernel<<<cellCount, threadCount>>>(
+                        deviceGrid,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        devicePairHashKeys,
+                        deviceRawCandidateCount,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+            }
+            else
+            {
+                if (config.compactActiveCells)
+                {
+                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
+                    generateActiveDenseGridCandidatePairsKernel<<<activeBlocks, threadCount>>>(
+                        deviceGrid,
+                        deviceActiveCellIds,
+                        deviceActiveCellCount,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        nullptr,
+                        nullptr,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        deviceCandidateCount,
+                        deviceOverflowCount);
+                }
+                else
+                {
+                    generateDenseGridCandidatePairsKernel<<<cellCount, threadCount>>>(
+                        deviceGrid,
+                        deviceCellTissueIds,
+                        deviceCellToolIds,
+                        nullptr,
+                        nullptr,
+                        deviceConfig,
+                        deviceCandidatePairs,
+                        deviceCandidateCount,
+                        deviceOverflowCount,
+                        activeDeviceDenseGridStats);
+                }
+            }
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridGeneratePairsMilliseconds += generatePairsMs;
+        }
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        destroyStageEvents();
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t rawCandidateCount = 0;
+    std::uint32_t exactCandidateCount = 0;
+    std::uint32_t overflowCount = 0;
+    DeviceDenseGridStats hostDenseGridStats {};
+    const auto candidateReadbackStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange range("D2H indexed candidate counters", config.detailedProfiling);
+        if (readFullDenseGridCounters)
+        {
+            err = cudaMemcpy(
+                &rawCandidateCount,
+                config.useGpuHashDedupe ? deviceRawCandidateCount : deviceCandidateCount,
+                sizeof(std::uint32_t),
+                cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess && config.useGpuHashDedupe)
+            {
+                err = cudaMemcpy(&exactCandidateCount, deviceCandidateCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (err == cudaSuccess && executionStats != nullptr)
+            {
+                err = cudaMemcpy(&hostDenseGridStats, deviceDenseGridStats, sizeof(DeviceDenseGridStats), cudaMemcpyDeviceToHost);
+            }
+        }
+        else if (readCandidateCounters)
+        {
+            err = cudaMemcpy(&exactCandidateCount, deviceCandidateCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+            if (!config.useGpuHashDedupe)
+            {
+                rawCandidateCount = exactCandidateCount;
+            }
+        }
+    }
+    if (executionStats != nullptr)
+    {
+        if (readCandidateCounters)
+        {
+            executionStats->denseGridCandidateReadbackMilliseconds += elapsedMillisecondsSince(candidateReadbackStart);
+        }
+        const auto candidateReadbackBytes = readFullDenseGridCounters
+            ? static_cast<std::uint64_t>((config.useGpuHashDedupe ? 3u : 2u) * sizeof(std::uint32_t) + sizeof(DeviceDenseGridStats))
+            : (readCandidateCounters ? static_cast<std::uint64_t>(2u * sizeof(std::uint32_t)) : 0u);
+        executionStats->deviceToHostBytes += candidateReadbackBytes;
+        executionStats->activeMixedCellCount = hostDenseGridStats.activeMixedCellCount;
+        executionStats->tissueInsertCount = hostDenseGridStats.tissueInsertCount;
+        executionStats->toolInsertCount = hostDenseGridStats.toolInsertCount;
+        executionStats->maxTissueCellOccupancy = hostDenseGridStats.maxTissueCellOccupancy;
+        executionStats->maxToolCellOccupancy = hostDenseGridStats.maxToolCellOccupancy;
+        executionStats->hashDedupeProbeOverflowCount = hostDenseGridStats.hashDedupeProbeOverflowCount;
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        destroyStageEvents();
+        freeAll();
+        return false;
+    }
+
+    const std::uint32_t usedCandidateCount = std::min(rawCandidateCount, config.maxCandidatePairs);
+    if (executionStats != nullptr &&
+        config.validateDedupeOnHost &&
+        !config.useGpuHashDedupe &&
+        usedCandidateCount > 0)
+    {
+        std::vector<std::uint64_t> hostCandidatePairs(usedCandidateCount);
+        const auto validationStart = std::chrono::steady_clock::now();
+        err = cudaMemcpy(
+            hostCandidatePairs.data(),
+            deviceCandidatePairs,
+            static_cast<std::size_t>(usedCandidateCount) * sizeof(std::uint64_t),
+            cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+
+        std::sort(hostCandidatePairs.begin(), hostCandidatePairs.end());
+        const auto hostUniqueEnd = std::unique(hostCandidatePairs.begin(), hostCandidatePairs.end());
+        executionStats->hostValidatedUniqueCandidateCount =
+            static_cast<std::uint32_t>(hostUniqueEnd - hostCandidatePairs.begin());
+        executionStats->denseGridCandidateReadbackMilliseconds += elapsedMillisecondsSince(validationStart);
+        executionStats->deviceToHostBytes +=
+            static_cast<std::uint64_t>(usedCandidateCount) * sizeof(std::uint64_t);
+    }
+    if (!config.useGpuHashDedupe)
+    {
+        exactCandidateCount = usedCandidateCount;
+    }
+    else
+    {
+        exactCandidateCount = std::min(exactCandidateCount, config.maxCandidatePairs);
+    }
+    if (!config.useGpuHashDedupe && config.deduplicatePairs && usedCandidateCount > 1)
+    {
+        double sortUniqueMs = 0.0;
+        const auto sortUniqueHostStart = std::chrono::steady_clock::now();
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, sortUniqueMs, [&]() {
+            ScopedNvtxRange range("indexed sort unique", config.detailedProfiling);
+            thrust::device_ptr<std::uint64_t> begin(deviceCandidatePairs);
+            thrust::device_ptr<std::uint64_t> end = begin + usedCandidateCount;
+            thrust::sort(begin, end);
+            cudaError_t thrustErr = cudaDeviceSynchronize();
+            if (thrustErr != cudaSuccess)
+            {
+                return thrustErr;
+            }
+            const auto uniqueEnd = thrust::unique(begin, end);
+            thrustErr = cudaDeviceSynchronize();
+            if (thrustErr != cudaSuccess)
+            {
+                return thrustErr;
+            }
+            exactCandidateCount = static_cast<std::uint32_t>(uniqueEnd - begin);
+            return cudaGetLastError();
+        });
+        const double sortUniqueHostMs = elapsedMillisecondsSince(sortUniqueHostStart);
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridSortUniqueMilliseconds += sortUniqueMs;
+            executionStats->denseGridSortUniqueHostMilliseconds += sortUniqueHostMs;
+        }
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            destroyStageEvents();
+            freeAll();
+            return false;
+        }
+    }
+
+    if (err == cudaSuccess && computeDeviceContacts && exactCandidateCount > 0)
+    {
+        double exactContactMs = 0.0;
+        err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, exactContactMs, [&]() {
+            ScopedNvtxRange range("indexed exact contacts", config.detailedProfiling);
+            const auto contactBlocks = static_cast<std::uint32_t>((exactCandidateCount + threadCount - 1) / threadCount);
+            exactDenseGridIndexedContactKernel<<<contactBlocks, threadCount>>>(
+                deviceTissuePositions,
+                deviceTissueTriangleIndices,
+                deviceToolPositions,
+                deviceToolTriangleIndices,
+                deviceCandidatePairs,
+                exactCandidateCount,
+                deviceContacts,
+                config.maxCandidatePairs,
+                deviceContactCount,
+                deviceOverflowCount);
+            return cudaGetLastError();
+        });
+        denseGridLaunchCount += 1;
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridExactContactMilliseconds += exactContactMs;
+        }
+    }
+
+    if (!config.detailedProfiling && err == cudaSuccess)
+    {
+        err = cudaEventRecord(totalEnd);
+        if (err == cudaSuccess)
+        {
+            err = cudaEventSynchronize(totalEnd);
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        if (config.detailedProfiling)
+        {
+            executionStats->gpuKernelMilliseconds +=
+                executionStats->denseGridClearMilliseconds +
+                executionStats->denseGridCounterClearMilliseconds +
+                executionStats->denseGridTissueAabbMilliseconds +
+                executionStats->denseGridToolAabbMilliseconds +
+                executionStats->denseGridInsertTissueMilliseconds +
+                executionStats->denseGridInsertToolMilliseconds +
+                executionStats->denseGridGeneratePairsMilliseconds +
+                executionStats->denseGridSortUniqueMilliseconds +
+                executionStats->denseGridExactContactMilliseconds;
+        }
+        else if (err == cudaSuccess)
+        {
+            float elapsedMs = 0.0f;
+            const cudaError_t eventErr = cudaEventElapsedTime(&elapsedMs, totalStart, totalEnd);
+            if (eventErr == cudaSuccess)
+            {
+                executionStats->gpuKernelMilliseconds += static_cast<double>(elapsedMs);
+            }
+        }
+        executionStats->kernelLaunchCount += denseGridLaunchCount;
+        executionStats->rawCandidateCount = rawCandidateCount;
+        executionStats->uniqueCandidateCount = exactCandidateCount;
+        executionStats->outputPairCount = exactCandidateCount > 0 ? 1u : 0u;
+        executionStats->outputCandidateCount = exactCandidateCount;
+    }
+    destroyStageEvents();
+
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    std::uint32_t hostContactCount = 0;
+    const auto contactCountReadbackStart = std::chrono::steady_clock::now();
+    {
+        ScopedNvtxRange range("D2H indexed contact counters", config.detailedProfiling);
+        if (readFullDenseGridCounters)
+        {
+            err = cudaMemcpy(&hostContactCount, deviceContactCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            if (err == cudaSuccess)
+            {
+                err = cudaMemcpy(&overflowCount, deviceOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+            }
+        }
+    }
+    if (executionStats != nullptr && readFullDenseGridCounters)
+    {
+        executionStats->denseGridContactCountReadbackMilliseconds += elapsedMillisecondsSince(contactCountReadbackStart);
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        freeAll();
+        return false;
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->overflowCount = overflowCount;
+        executionStats->outputContactCount = hostContactCount;
+        if (readFullDenseGridCounters)
+        {
+            executionStats->deviceToHostBytes += static_cast<std::uint64_t>(2 * sizeof(std::uint32_t));
+        }
+    }
+
+    if (overflowCount > 0 ||
+        (readFullDenseGridCounters && hostDenseGridStats.hashDedupeProbeOverflowCount > 0) ||
+        (!config.useGpuHashDedupe && rawCandidateCount > config.maxCandidatePairs) ||
+        (readFullDenseGridCounters && hostContactCount > config.maxCandidatePairs))
+    {
+        diagnostic = "Dense-grid bucket, candidate, or contact capacity overflowed.";
+        freeAll();
+        return false;
+    }
+
+    if (!config.copyContactsToHost)
+    {
+        diagnostic.clear();
+        return true;
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->deviceToHostBytes += static_cast<std::uint64_t>(hostContactCount * sizeof(DeviceExactContact));
+    }
+
+    std::vector<DeviceExactContact> hostContacts(hostContactCount);
+    if (hostContactCount > 0)
+    {
+        const auto contactDownloadStart = std::chrono::steady_clock::now();
+        {
+            ScopedNvtxRange range("D2H indexed contacts", config.detailedProfiling);
+            err = cudaMemcpy(
+                hostContacts.data(),
+                deviceContacts,
+                hostContactCount * sizeof(DeviceExactContact),
+                cudaMemcpyDeviceToHost);
+        }
+        if (executionStats != nullptr)
+        {
+            executionStats->denseGridContactDownloadMilliseconds += elapsedMillisecondsSince(contactDownloadStart);
+        }
+    }
+    freeAll();
+
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+
+    contacts.reserve(hostContacts.size());
+    for (const auto& contact : hostContacts)
+    {
+        contacts.push_back(ExactContact {
+            contact.firstTriangleIndex,
+            contact.secondTriangleIndex,
+            TriangleVertex { contact.pointOnFirst.x, contact.pointOnFirst.y, contact.pointOnFirst.z },
+            TriangleVertex { contact.pointOnSecond.x, contact.pointOnSecond.y, contact.pointOnSecond.z },
+            TriangleVertex { contact.normal.x, contact.normal.y, contact.normal.z },
+            contact.signedDistance,
+        });
+    }
+
+    diagnostic.clear();
+    return true;
+}
+
+// ============================================================================
+// computeFeatureBasedProximityContacts
+// ----------------------------------------------------------------------------
+// Strategy:
+//   1. Run the existing indexed dense-grid path with a tweaked config that
+//      forces broad-cull-only behavior. This leaves the unique candidate-pair
+//      list on the device in workspace.candidatePairs / workspace.candidateCount
+//      and skips the SAT-style exact-contact kernel. We pay one D2H readback
+//      of the candidate count via readCountersWhenContactsStayOnDevice=true so
+//      that we can pick a sensible grid for the FBP kernel below.
+//   2. Allocate / reuse a device buffer for ProximityContacts and reset the
+//      proximity counters.
+//   3. Launch featureBasedProximityKernel over the candidate pairs.
+//   4. Optionally read back the proximity contact count and copy contacts to
+//      host according to the FeatureBasedProximityConfig flags.
+// ============================================================================
+bool computeFeatureBasedProximityContacts(
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    const DenseGridConfig& gridConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    contacts.clear();
+    if (proximityStats != nullptr)
+    {
+        *proximityStats = FeatureBasedProximityStats {};
+    }
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+        executionStats->inputPrimitiveCount = firstSurface.triangleCount + secondSurface.triangleCount;
+    }
+
+    // Step 1: broad cull. Force the existing path into a clean
+    // "candidates-only" mode so it does the dense-grid work but skips the
+    // SAT-style exact-contact kernel. We deliberately leave counter readback
+    // OFF — the FBP kernel reads *candidatePairCount from device memory on
+    // first thread of each block (L2-cached after first warp), and over-launch
+    // covers any unknown pair count with cheap per-thread early-exit.
+    DenseGridConfig broadConfig = gridConfig;
+    broadConfig.copyContactsToHost = false;
+    broadConfig.computeDeviceContactsWhenContactsStayOnDevice = false;
+    broadConfig.readCountersWhenContactsStayOnDevice = proximityConfig.readContactCounter;
+    broadConfig.detailedProfiling = false;
+
+    std::vector<ExactContact> ignoredExactContacts;
+    BackendExecutionStats broadStats;
+    std::string broadDiagnostic;
+    const bool broadOk = computeDenseGridIndexedTriangleContacts(
+        firstSurface,
+        secondSurface,
+        broadConfig,
+        ignoredExactContacts,
+        broadDiagnostic,
+        &broadStats);
+    if (!broadOk)
+    {
+        diagnostic = std::string("Feature-based proximity broad cull failed: ") + broadDiagnostic;
+        return false;
+    }
+    if (executionStats != nullptr)
+    {
+        // Forward the broad-cull stats so the wrapper sees the full picture.
+        executionStats->gpuKernelMilliseconds += broadStats.gpuKernelMilliseconds;
+        executionStats->hostPreparationMilliseconds += broadStats.hostPreparationMilliseconds;
+        executionStats->hostToDeviceMilliseconds += broadStats.hostToDeviceMilliseconds;
+        executionStats->deviceAllocationMilliseconds += broadStats.deviceAllocationMilliseconds;
+        executionStats->denseGridClearMilliseconds += broadStats.denseGridClearMilliseconds;
+        executionStats->denseGridInsertTissueMilliseconds += broadStats.denseGridInsertTissueMilliseconds;
+        executionStats->denseGridInsertToolMilliseconds += broadStats.denseGridInsertToolMilliseconds;
+        executionStats->denseGridGeneratePairsMilliseconds += broadStats.denseGridGeneratePairsMilliseconds;
+        executionStats->hostToDeviceBytes += broadStats.hostToDeviceBytes;
+        executionStats->deviceToHostBytes += broadStats.deviceToHostBytes;
+        executionStats->deviceAllocationBytes += broadStats.deviceAllocationBytes;
+        executionStats->kernelLaunchCount += broadStats.kernelLaunchCount;
+        executionStats->cudaMemsetCount += broadStats.cudaMemsetCount;
+        executionStats->workspaceResizeCount += broadStats.workspaceResizeCount;
+        executionStats->rawCandidateCount += broadStats.rawCandidateCount;
+        executionStats->uniqueCandidateCount += broadStats.uniqueCandidateCount;
+        executionStats->gridCellCount = broadStats.gridCellCount;
+        executionStats->overflowCount += broadStats.overflowCount;
+    }
+    if (proximityStats != nullptr)
+    {
+        proximityStats->candidatePairCount = broadStats.uniqueCandidateCount;
+    }
+
+    // Step 2: allocate proximity output and counters
+    auto& workspace = denseGridWorkspace();
+    std::uint64_t newlyAllocatedBytes = 0;
+    const auto allocStart = std::chrono::steady_clock::now();
+    cudaError_t err = workspace.ensureProximityStorage(
+        proximityConfig.maxContacts,
+        sizeof(DeviceProximityContact),
+        newlyAllocatedBytes);
+    const double allocMs = elapsedMillisecondsSince(allocStart);
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("Proximity storage alloc failed: ") + cudaGetErrorString(err);
+        return false;
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->deviceAllocationBytes += newlyAllocatedBytes;
+        executionStats->deviceAllocationMilliseconds += allocMs;
+        if (newlyAllocatedBytes > 0) executionStats->workspaceResizeCount += 1;
+    }
+
+    auto* deviceProximityContacts = reinterpret_cast<DeviceProximityContact*>(workspace.proximityContacts);
+
+    // Step 3: reset counters + launch FBP kernel.
+    // We only take CUDA events when we actually need fbpMs (i.e. readContactCounter).
+    // In the production detection-only path, the kernel runs fully async and
+    // the next frame's stage_start cuts in before any sync happens here.
+    const bool needFbpTiming = proximityConfig.readContactCounter;
+    if (needFbpTiming)
+    {
+        err = workspace.ensureFbpEvents();
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("FBP event create failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+        cudaEventRecord(workspace.fbpStartEvent);
+    }
+
+    resetProximityCountersKernel<<<1, 1>>>(
+        workspace.proximityContactCount,
+        workspace.proximityOverflowCount,
+        workspace.proximityVfCount,
+        workspace.proximityFvCount,
+        workspace.proximityEeCount);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    const BackendTriangleVertex* deviceFirstPositions =
+        firstSurface.devicePositions == nullptr ? workspace.indexedTissuePositions : firstSurface.devicePositions;
+    const BackendTriangleVertex* deviceSecondPositions =
+        secondSurface.devicePositions == nullptr ? workspace.indexedToolPositions : secondSurface.devicePositions;
+
+    // Over-launch with a sensible cap. The kernel does `if (tid >= *count) return`
+    // so empty threads exit in ~1 instruction. Cap at 65536 threads = 256 blocks
+    // to avoid wasting time launching 7813 empty blocks when maxCandidatePairs is huge.
+    // For surgical-scene workloads candidate counts rarely exceed ~10k so 256 blocks
+    // = 65 536 threads is a comfortable upper bound and runs as one scheduler wave
+    // on the 16 SMs of a GTX 1650 Ti.
+    constexpr std::uint32_t threadCount = 256;
+    constexpr std::uint32_t kFbpMaxBlocks = 256;  // 65 536 threads upper cap
+    const std::uint32_t fbpUpperPairs = std::min(gridConfig.maxCandidatePairs, kFbpMaxBlocks * threadCount);
+    const std::uint32_t fbpBlocks =
+        std::max(1u, (fbpUpperPairs + threadCount - 1u) / threadCount);
+
+    featureBasedProximityKernel<<<fbpBlocks, threadCount>>>(
+        deviceFirstPositions,
+        workspace.indexedTissueIndices,
+        deviceSecondPositions,
+        workspace.indexedToolIndices,
+        workspace.candidatePairs,
+        workspace.candidateCount,
+        deviceProximityContacts,
+        workspace.proximityContactCount,
+        workspace.proximityOverflowCount,
+        workspace.proximityVfCount,
+        workspace.proximityFvCount,
+        workspace.proximityEeCount,
+        proximityConfig.maxContacts,
+        proximityConfig.contactDistance,
+        proximityConfig.computeBarycentrics);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+
+    float fbpMs = 0.0f;
+    if (needFbpTiming)
+    {
+        cudaEventRecord(workspace.fbpEndEvent);
+        cudaEventSynchronize(workspace.fbpEndEvent);
+        cudaEventElapsedTime(&fbpMs, workspace.fbpStartEvent, workspace.fbpEndEvent);
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->gpuKernelMilliseconds += fbpMs;
+        executionStats->featureBasedProximityKernelMilliseconds += fbpMs;
+    }
+
+    // Step 4: optional batched readback.
+    // Old path was 5 separate synchronous cudaMemcpy calls (~250 us total on
+    // the GTX 1650 Ti). New path issues 5 async copies into a pinned host
+    // buffer + one single cudaDeviceSynchronize, which collapses to ~50 us.
+    std::uint32_t hostContactCount = 0;
+    std::uint32_t hostOverflowCount = 0;
+    std::uint32_t hostVf = 0, hostFv = 0, hostEe = 0;
+    if (proximityConfig.readContactCounter || !proximityConfig.keepContactsOnDevice)
+    {
+        std::uint32_t* dst = workspace.proximityCountersHostPinned;
+        cudaMemcpyAsync(dst + 0, workspace.proximityContactCount,  sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 1, workspace.proximityOverflowCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 2, workspace.proximityVfCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 3, workspace.proximityFvCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 4, workspace.proximityEeCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        hostContactCount  = dst[0];
+        hostOverflowCount = dst[1];
+        hostVf            = dst[2];
+        hostFv            = dst[3];
+        hostEe            = dst[4];
+        if (executionStats != nullptr)
+        {
+            executionStats->deviceToHostBytes += 5u * sizeof(std::uint32_t);
+        }
+        if (proximityStats != nullptr)
+        {
+            proximityStats->emittedContactCount = hostContactCount;
+            proximityStats->vfContactCount = hostVf;
+            proximityStats->fvContactCount = hostFv;
+            proximityStats->eeContactCount = hostEe;
+        }
+        if (executionStats != nullptr)
+        {
+            executionStats->vfContactCount += hostVf;
+            executionStats->fvContactCount += hostFv;
+            executionStats->eeContactCount += hostEe;
+        }
+    }
+
+    if (!proximityConfig.keepContactsOnDevice && hostContactCount > 0)
+    {
+        const std::uint32_t copyCount = std::min(hostContactCount, proximityConfig.maxContacts);
+        std::vector<DeviceProximityContact> hostBuffer(copyCount);
+        cudaMemcpy(hostBuffer.data(), deviceProximityContacts,
+            copyCount * sizeof(DeviceProximityContact), cudaMemcpyDeviceToHost);
+        if (executionStats != nullptr)
+        {
+            executionStats->deviceToHostBytes += static_cast<std::uint64_t>(copyCount) * sizeof(DeviceProximityContact);
+        }
+        contacts.reserve(copyCount);
+        for (const auto& c : hostBuffer)
+        {
+            ProximityContact out {};
+            out.firstPrimitiveIndex = c.firstPrimitiveIndex;
+            out.secondPrimitiveIndex = c.secondPrimitiveIndex;
+            out.featureKind = static_cast<ProximityFeatureKind>(c.featureKind);
+            out.firstFeatureLocalIndex = c.firstFeatureLocalIndex;
+            out.secondFeatureLocalIndex = c.secondFeatureLocalIndex;
+            out.reserved = 0;
+            out.firstBarycentrics[0] = c.firstBary[0];
+            out.firstBarycentrics[1] = c.firstBary[1];
+            out.firstBarycentrics[2] = c.firstBary[2];
+            out.secondBarycentrics[0] = c.secondBary[0];
+            out.secondBarycentrics[1] = c.secondBary[1];
+            out.secondBarycentrics[2] = c.secondBary[2];
+            out.pointOnFirst  = TriangleVertex { c.pointOnFirst.x,  c.pointOnFirst.y,  c.pointOnFirst.z };
+            out.pointOnSecond = TriangleVertex { c.pointOnSecond.x, c.pointOnSecond.y, c.pointOnSecond.z };
+            out.normal        = TriangleVertex { c.normal.x,        c.normal.y,        c.normal.z };
+            out.signedDistance = c.signedDistance;
+            contacts.push_back(out);
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->outputContactCount = hostContactCount;
+        if (hostOverflowCount > 0) executionStats->overflowCount += hostOverflowCount;
+    }
+
+    diagnostic.clear();
+    return true;
+}
+
+// ============================================================================
+// computeFeatureBasedVertexTriangleContacts
+// ----------------------------------------------------------------------------
+// Vertex-triangle feature-based proximity. Inserts the triangle mesh into the
+// tissue side of the dense grid (using the existing insertIndexedTrianglesKernel)
+// and the vertex cloud into the tool side (using the new insertIndexedPointsKernel),
+// then runs the existing candidate-pair generator to produce (triangleId, vertexId)
+// pairs and finally featureBasedVertexTriangleProximityKernel for the narrow pass.
+//
+// Self-collision is supported: pass the same vertex set + triangle surface and
+// set `selfCollisionExclusion = true` in the proximityConfig (encoded by re-
+// purposing `emitOnePerPair == false`). When enabled, the narrow kernel skips
+// pairs where the candidate vertex is one of the triangle's own corner vertices.
+// ============================================================================
+bool computeFeatureBasedVertexTriangleContacts(
+    const PointCloudSurface& pointCloud,
+    const TriangleIndexedSurface& triangleSurface,
+    const DenseGridConfig& gridConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    contacts.clear();
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+        executionStats->inputPrimitiveCount = triangleSurface.triangleCount + pointCloud.pointCount;
+    }
+    if (proximityStats != nullptr)
+    {
+        *proximityStats = FeatureBasedProximityStats {};
+    }
+
+    if ((pointCloud.positions == nullptr && pointCloud.devicePositions == nullptr) ||
+        pointCloud.pointCount == 0 ||
+        (triangleSurface.positions == nullptr && triangleSurface.devicePositions == nullptr) ||
+        triangleSurface.triangleIndices == nullptr ||
+        triangleSurface.triangleCount == 0)
+    {
+        diagnostic = "Vertex-triangle proximity: invalid point cloud or triangle surface.";
+        return false;
+    }
+
+    if (gridConfig.gridResolutionX == 0 || gridConfig.gridResolutionY == 0 || gridConfig.gridResolutionZ == 0 ||
+        gridConfig.maxTissueTrianglesPerCell == 0 || gridConfig.maxToolTrianglesPerCell == 0 ||
+        gridConfig.maxCandidatePairs == 0 ||
+        gridConfig.gridMaxX <= gridConfig.gridMinX ||
+        gridConfig.gridMaxY <= gridConfig.gridMinY ||
+        gridConfig.gridMaxZ <= gridConfig.gridMinZ)
+    {
+        diagnostic = "Invalid dense-grid configuration.";
+        return false;
+    }
+
+    // The self-collision exclusion is gated by detecting same-surface input:
+    // if pointCloud.surfaceId == triangleSurface.surfaceId we are testing a
+    // mesh against itself and must skip own-corner vertices.
+    const bool selfCollision = (pointCloud.surfaceId != 0 &&
+                                pointCloud.surfaceId == triangleSurface.surfaceId);
+
+    const std::uint64_t cellCount64 =
+        static_cast<std::uint64_t>(gridConfig.gridResolutionX) *
+        static_cast<std::uint64_t>(gridConfig.gridResolutionY) *
+        static_cast<std::uint64_t>(gridConfig.gridResolutionZ);
+    if (cellCount64 == 0 || cellCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid cell count exceeds uint32_t indexing capacity.";
+        return false;
+    }
+    const auto cellCount = static_cast<std::uint32_t>(cellCount64);
+
+    const std::uint64_t tissueBucketCount = cellCount64 * static_cast<std::uint64_t>(gridConfig.maxTissueTrianglesPerCell);
+    const std::uint64_t toolBucketCount   = cellCount64 * static_cast<std::uint64_t>(gridConfig.maxToolTrianglesPerCell);
+    const std::uint64_t pairHashCount64   = gridConfig.useGpuHashDedupe
+        ? static_cast<std::uint64_t>(nextPowerOfTwo(static_cast<std::size_t>(gridConfig.maxCandidatePairs) * 2u))
+        : 1ull;
+    if (pairHashCount64 == 0 || pairHashCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+    {
+        diagnostic = "Dense-grid hash dedupe table size out of range.";
+        return false;
+    }
+
+    auto& workspace = denseGridWorkspace();
+    std::uint64_t newlyAllocatedBytes = 0;
+    const auto allocStart = std::chrono::steady_clock::now();
+    cudaError_t err = workspace.ensure(
+        0,
+        0,
+        static_cast<std::size_t>(cellCount64),
+        static_cast<std::size_t>(tissueBucketCount),
+        static_cast<std::size_t>(toolBucketCount),
+        static_cast<std::size_t>(gridConfig.maxCandidatePairs),
+        static_cast<std::size_t>(pairHashCount64),
+        newlyAllocatedBytes);
+    if (err == cudaSuccess)
+    {
+        err = workspace.ensureIndexedInput(
+            triangleSurface.devicePositions == nullptr ? triangleSurface.vertexCount : 0u,
+            pointCloud.devicePositions == nullptr ? pointCloud.pointCount : 0u,
+            static_cast<std::size_t>(triangleSurface.triangleCount) * 3u,
+            0u,
+            newlyAllocatedBytes);
+    }
+    if (err == cudaSuccess)
+    {
+        err = workspace.ensureProximityStorage(
+            proximityConfig.maxContacts,
+            sizeof(DeviceProximityContact),
+            newlyAllocatedBytes);
+    }
+    const double allocMs = elapsedMillisecondsSince(allocStart);
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("Vertex-triangle workspace alloc failed: ") + cudaGetErrorString(err);
+        return false;
+    }
+    if (executionStats != nullptr)
+    {
+        executionStats->gridCellCount = cellCount;
+        executionStats->deviceAllocationBytes += newlyAllocatedBytes;
+        executionStats->deviceAllocationMilliseconds += allocMs;
+        if (newlyAllocatedBytes > 0) executionStats->workspaceResizeCount += 1;
+    }
+
+    // Upload triangle positions and indices (if host-side input).
+    const std::size_t triPosBytes = static_cast<std::size_t>(triangleSurface.vertexCount) * sizeof(BackendTriangleVertex);
+    const std::size_t triIdxBytes = static_cast<std::size_t>(triangleSurface.triangleCount) * 3u * sizeof(std::uint32_t);
+    const std::size_t pointPosBytes = static_cast<std::size_t>(pointCloud.pointCount) * sizeof(BackendTriangleVertex);
+    const bool uploadTriangleTopology =
+        workspace.indexedTissueSurfaceId != triangleSurface.surfaceId ||
+        workspace.indexedTissueTopologyVersion != triangleSurface.topologyVersion;
+
+    const auto h2dStart = std::chrono::steady_clock::now();
+    if (triangleSurface.devicePositions == nullptr)
+    {
+        err = copyHostArrayToDeviceAsync(
+            workspace.indexedTissuePositions,
+            triangleSurface.positions,
+            workspace.pinnedIndexedTissuePositions,
+            static_cast<std::size_t>(triangleSurface.vertexCount),
+            false);
+        if (executionStats != nullptr) executionStats->hostToDeviceBytes += triPosBytes;
+    }
+    if (err == cudaSuccess && uploadTriangleTopology)
+    {
+        err = copyHostArrayToDeviceAsync(
+            workspace.indexedTissueIndices,
+            triangleSurface.triangleIndices,
+            workspace.pinnedIndexedTissueIndices,
+            static_cast<std::size_t>(triangleSurface.triangleCount) * 3u,
+            false);
+        if (executionStats != nullptr) executionStats->hostToDeviceBytes += triIdxBytes;
+    }
+    if (err == cudaSuccess && pointCloud.devicePositions == nullptr)
+    {
+        err = copyHostArrayToDeviceAsync(
+            workspace.indexedToolPositions,
+            pointCloud.positions,
+            workspace.pinnedIndexedToolPositions,
+            static_cast<std::size_t>(pointCloud.pointCount),
+            false);
+        if (executionStats != nullptr) executionStats->hostToDeviceBytes += pointPosBytes;
+    }
+    if (err == cudaSuccess && uploadTriangleTopology)
+    {
+        workspace.indexedTissueSurfaceId = triangleSurface.surfaceId;
+        workspace.indexedTissueTopologyVersion = triangleSurface.topologyVersion;
+    }
+    if (executionStats != nullptr) executionStats->hostToDeviceMilliseconds += elapsedMillisecondsSince(h2dStart);
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+
+    const BackendTriangleVertex* deviceTrianglePositions =
+        triangleSurface.devicePositions == nullptr ? workspace.indexedTissuePositions : triangleSurface.devicePositions;
+    const BackendTriangleVertex* devicePointPositions =
+        pointCloud.devicePositions == nullptr ? workspace.indexedToolPositions : pointCloud.devicePositions;
+
+    const DeviceDenseGridConfig deviceConfig {
+        make_float3(gridConfig.gridMinX, gridConfig.gridMinY, gridConfig.gridMinZ),
+        make_float3(gridConfig.gridMaxX, gridConfig.gridMaxY, gridConfig.gridMaxZ),
+        make_float3(
+            static_cast<float>(gridConfig.gridResolutionX) / (gridConfig.gridMaxX - gridConfig.gridMinX),
+            static_cast<float>(gridConfig.gridResolutionY) / (gridConfig.gridMaxY - gridConfig.gridMinY),
+            static_cast<float>(gridConfig.gridResolutionZ) / (gridConfig.gridMaxZ - gridConfig.gridMinZ)),
+        gridConfig.gridResolutionX,
+        gridConfig.gridResolutionY,
+        gridConfig.gridResolutionZ,
+        gridConfig.contactDistance,
+        gridConfig.maxTissueTrianglesPerCell,
+        gridConfig.maxToolTrianglesPerCell,
+        gridConfig.maxCandidatePairs,
+        static_cast<std::uint32_t>(pairHashCount64),
+        gridConfig.useGpuHashDedupe,
+        false
+    };
+
+    constexpr std::uint32_t threadCount = 256;
+    const std::uint32_t resetBlocks = (cellCount + threadCount - 1u) / threadCount;
+    const std::uint32_t triBlocks   = (triangleSurface.triangleCount + threadCount - 1u) / threadCount;
+    const std::uint32_t pointBlocks = (pointCloud.pointCount + threadCount - 1u) / threadCount;
+
+    // 1) Reset grid + counters
+    resetDenseGridKernel<<<resetBlocks, threadCount>>>(
+        workspace.grid,
+        cellCount,
+        workspace.pairHashKeys,
+        static_cast<std::uint32_t>(pairHashCount64),
+        false,
+        workspace.activeCellCount,
+        workspace.rawCandidateCount,
+        workspace.candidateCount,
+        workspace.contactCount,
+        workspace.overflowCount,
+        workspace.denseGridStats,
+        false);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    // 2) Clear pair hash via cudaMemset (matches existing dense-grid path)
+    if (gridConfig.useGpuHashDedupe)
+    {
+        cudaMemsetAsync(workspace.pairHashKeys, 0xff, pairHashCount64 * sizeof(unsigned long long));
+        if (executionStats != nullptr) executionStats->cudaMemsetCount += 1;
+    }
+
+    // 3) Insert triangles into tissue buckets
+    insertIndexedTrianglesKernel<<<triBlocks, threadCount>>>(
+        deviceTrianglePositions,
+        workspace.indexedTissueIndices,
+        triangleSurface.triangleCount,
+        true,  // insertTissue
+        deviceConfig,
+        workspace.grid,
+        workspace.cellTissueIds,
+        workspace.overflowCount,
+        nullptr);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    // 4) Insert points into tool buckets
+    insertIndexedPointsKernel<<<pointBlocks, threadCount>>>(
+        devicePointPositions,
+        pointCloud.pointCount,
+        deviceConfig,
+        workspace.grid,
+        workspace.cellToolIds,
+        workspace.overflowCount,
+        nullptr);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    // 5) Generate candidate pairs
+    generateDenseGridUniqueCandidatePairsKernel<<<cellCount, threadCount>>>(
+        workspace.grid,
+        workspace.cellTissueIds,
+        workspace.cellToolIds,
+        deviceConfig,
+        workspace.candidatePairs,
+        workspace.pairHashKeys,
+        workspace.rawCandidateCount,
+        workspace.candidateCount,
+        workspace.overflowCount,
+        nullptr);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    // 6) Reset proximity counters
+    auto* deviceProximityContacts = reinterpret_cast<DeviceProximityContact*>(workspace.proximityContacts);
+    resetProximityCountersKernel<<<1, 1>>>(
+        workspace.proximityContactCount,
+        workspace.proximityOverflowCount,
+        workspace.proximityVfCount,
+        workspace.proximityFvCount,
+        workspace.proximityEeCount);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    // 7) Narrow phase: feature-based vertex-triangle proximity
+    constexpr std::uint32_t kFbpMaxBlocks = 256;
+    const std::uint32_t fbpUpperPairs = std::min(gridConfig.maxCandidatePairs, kFbpMaxBlocks * threadCount);
+    const std::uint32_t fbpBlocks = std::max(1u, (fbpUpperPairs + threadCount - 1u) / threadCount);
+    featureBasedVertexTriangleProximityKernel<<<fbpBlocks, threadCount>>>(
+        deviceTrianglePositions,
+        workspace.indexedTissueIndices,
+        devicePointPositions,
+        workspace.candidatePairs,
+        workspace.candidateCount,
+        deviceProximityContacts,
+        workspace.proximityContactCount,
+        workspace.proximityOverflowCount,
+        workspace.proximityVfCount,
+        proximityConfig.maxContacts,
+        proximityConfig.contactDistance,
+        proximityConfig.computeBarycentrics,
+        selfCollision ? 1u : 0u);
+    if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        diagnostic = cudaGetErrorString(err);
+        return false;
+    }
+
+    // 8) Optional readback (batched via pinned host buffer)
+    std::uint32_t hostContactCount = 0;
+    std::uint32_t hostVf = 0, hostFv = 0, hostEe = 0;
+    if (proximityConfig.readContactCounter || !proximityConfig.keepContactsOnDevice)
+    {
+        std::uint32_t* dst = workspace.proximityCountersHostPinned;
+        cudaMemcpyAsync(dst + 0, workspace.proximityContactCount,  sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 2, workspace.proximityVfCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 3, workspace.proximityFvCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(dst + 4, workspace.proximityEeCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        hostContactCount = dst[0];
+        hostVf = dst[2];
+        hostFv = dst[3];
+        hostEe = dst[4];
+        if (executionStats != nullptr)
+        {
+            executionStats->deviceToHostBytes += 4u * sizeof(std::uint32_t);
+            executionStats->vfContactCount += hostVf;
+            executionStats->fvContactCount += hostFv;
+            executionStats->eeContactCount += hostEe;
+        }
+        if (proximityStats != nullptr)
+        {
+            proximityStats->emittedContactCount = hostContactCount;
+            proximityStats->vfContactCount = hostVf;
+            proximityStats->fvContactCount = hostFv;
+            proximityStats->eeContactCount = hostEe;
+        }
+    }
+
+    if (!proximityConfig.keepContactsOnDevice && hostContactCount > 0)
+    {
+        const std::uint32_t copyCount = std::min(hostContactCount, proximityConfig.maxContacts);
+        std::vector<DeviceProximityContact> hostBuffer(copyCount);
+        cudaMemcpy(hostBuffer.data(), deviceProximityContacts,
+            copyCount * sizeof(DeviceProximityContact), cudaMemcpyDeviceToHost);
+        if (executionStats != nullptr)
+        {
+            executionStats->deviceToHostBytes += static_cast<std::uint64_t>(copyCount) * sizeof(DeviceProximityContact);
+        }
+        contacts.reserve(copyCount);
+        for (const auto& c : hostBuffer)
+        {
+            ProximityContact out {};
+            out.firstPrimitiveIndex = c.firstPrimitiveIndex;
+            out.secondPrimitiveIndex = c.secondPrimitiveIndex;
+            out.featureKind = static_cast<ProximityFeatureKind>(c.featureKind);
+            out.firstFeatureLocalIndex = c.firstFeatureLocalIndex;
+            out.secondFeatureLocalIndex = c.secondFeatureLocalIndex;
+            out.firstBarycentrics[0] = c.firstBary[0];
+            out.firstBarycentrics[1] = c.firstBary[1];
+            out.firstBarycentrics[2] = c.firstBary[2];
+            out.secondBarycentrics[0] = c.secondBary[0];
+            out.secondBarycentrics[1] = c.secondBary[1];
+            out.secondBarycentrics[2] = c.secondBary[2];
+            out.pointOnFirst  = TriangleVertex { c.pointOnFirst.x,  c.pointOnFirst.y,  c.pointOnFirst.z };
+            out.pointOnSecond = TriangleVertex { c.pointOnSecond.x, c.pointOnSecond.y, c.pointOnSecond.z };
+            out.normal        = TriangleVertex { c.normal.x,        c.normal.y,        c.normal.z };
+            out.signedDistance = c.signedDistance;
+            contacts.push_back(out);
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        executionStats->outputContactCount = hostContactCount;
     }
 
     diagnostic.clear();

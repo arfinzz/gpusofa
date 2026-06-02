@@ -32,7 +32,8 @@ void accumulateStage(
     std::uint64_t& cpuFallbackCount,
     std::uint64_t& inputPrimitiveTotal,
     std::uint64_t& outputPairTotal,
-    std::uint64_t& outputCandidateTotal)
+    std::uint64_t& outputCandidateTotal,
+    std::uint64_t* outputContactTotal = nullptr)
 {
     wallTotal += stage.wallMilliseconds;
     kernelTotal += stage.gpuKernelMilliseconds;
@@ -42,6 +43,10 @@ void accumulateStage(
     inputPrimitiveTotal += stage.inputPrimitiveCount;
     outputPairTotal += stage.outputPairCount;
     outputCandidateTotal += stage.outputCandidateCount;
+    if (outputContactTotal != nullptr)
+    {
+        *outputContactTotal += stage.outputContactCount;
+    }
 
     if (stage.gpuUsed)
     {
@@ -95,7 +100,8 @@ StepSnapshot finishStep()
         state.aggregate.narrowCpuFallbackCount,
         state.aggregate.narrowInputPrimitiveCount,
         state.aggregate.narrowOutputPairCount,
-        state.aggregate.narrowOutputCandidateCount);
+        state.aggregate.narrowOutputCandidateCount,
+        &state.aggregate.narrowOutputContactCount);
 
     state.currentStep = StepSnapshot {};
     return finishedStep;

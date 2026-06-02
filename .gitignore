@@ -3,3 +3,7 @@ __pycache__/
 
 SofaGpuCollision/build-mingw/
 SofaGpuCollision/build-wsl/
+SofaGpuCollision/build-wsl*/
+
+output/*
+!output/README.md

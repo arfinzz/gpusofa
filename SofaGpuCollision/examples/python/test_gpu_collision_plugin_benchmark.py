@@ -11,7 +11,7 @@ from deterministic_blade_controller import (
 )
 
 USE_KINEMATIC_PATH = True
-BENCHMARK_LOG_DIR = os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(workspace_dir, "benchmark_logs"))
+BENCHMARK_LOG_DIR = os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(workspace_dir, "output", "benchmark_logs"))
 
 
 def generate_tissue_mesh(nx=21, ny=3, nz=21,

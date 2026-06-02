@@ -1,0 +1,1518 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPU Collision Detection Report: Surgical Dense Grid Path</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #5f6b7a;
+      --line: #d6dde5;
+      --soft: #eef3f7;
+      --code: #f7f8fa;
+      --cpu: #a7372a;
+      --gpu: #126d72;
+      --grid: #7b5c00;
+      --ok: #206a3d;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.55;
+    }
+
+    body { padding: 28px; }
+
+    .page {
+      max-width: 1160px;
+      margin: 0 auto;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      padding: 38px 44px 54px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.15;
+      margin: 0 0 12px;
+    }
+
+    h1 { font-size: 34px; }
+    h2 {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 2px solid var(--line);
+      font-size: 24px;
+    }
+    h3 {
+      margin-top: 24px;
+      font-size: 18px;
+      color: var(--gpu);
+    }
+
+    p, li, td, th { font-size: 14px; }
+    .lede {
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 18px 0 26px;
+    }
+
+    .chip {
+      border: 1px solid var(--line);
+      background: var(--soft);
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .grid3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+
+    .card h3 { margin-top: 0; }
+    .note {
+      border-left: 4px solid var(--gpu);
+      background: #eef7f8;
+      padding: 12px 14px;
+      margin: 14px 0;
+    }
+
+    .warn {
+      border-left: 4px solid var(--cpu);
+      background: #fff3f1;
+      padding: 12px 14px;
+      margin: 14px 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th { background: #edf2f6; }
+
+    pre {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      overflow: auto;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    code {
+      font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+      font-size: 0.95em;
+    }
+
+    .figure {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 12px;
+      margin: 16px 0 8px;
+    }
+
+    .caption {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+
+    .small { color: var(--muted); font-size: 12px; }
+    .cpu { color: var(--cpu); font-weight: 700; }
+    .gpu { color: var(--gpu); font-weight: 700; }
+    .ok { color: var(--ok); font-weight: 700; }
+
+    @media (max-width: 820px) {
+      body { padding: 12px; }
+      .page { padding: 24px 18px 36px; }
+      .grid2, .grid3 { grid-template-columns: 1fr; }
+    }
+
+    @media print {
+      body { padding: 0; background: #fff; }
+      .page { max-width: none; border: 0; padding: 16mm; }
+      h2 { page-break-after: avoid; }
+      .figure, .card, table, pre { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1>GPU Collision Detection Report: Current Surgical Dense-Grid Path</h1>
+    <p class="lede">
+      Updated report for the current SOFA v25.12 + SofaGpuCollision implementation after removing
+      the redundant object-level GPU AABB broad-phase work and moving primitive candidate generation
+      into a GPU dense-grid path inside the narrow phase.
+    </p>
+    <div class="meta">
+      <span class="chip">Workspace: C:\Users\arfin\Desktop\GPU SOFA</span>
+      <span class="chip">Environment: WSL2 wsl-gpu-proj</span>
+      <span class="chip">SOFA: v25.12</span>
+      <span class="chip">GPU: NVIDIA GeForce GTX 1650 Ti</span>
+      <span class="chip">Mode: detection benchmark, no response</span>
+      <span class="chip">Report date: 2026-05-07</span>
+    </div>
+
+    <h2>1. Executive Summary</h2>
+    <div class="grid2">
+      <div>
+        <p>
+          The broad phase has not been deleted from SOFA's pipeline, because <code>CollisionPipeline</code>
+          still requires a broad-phase component to produce object-level collision model pairs.
+          What changed is more important: the old GPU root-AABB culling kernel is disabled by default
+          for the surgical two-object case.
+        </p>
+        <p>
+          For the target scene shape, one tissue object and one blade/tool object, the broad phase now
+          acts as a small compatibility pass that emits the valid tissue/tool object pair. The actual
+          broad filtering that matters for collision detection is now the GPU dense 3D grid inside
+          <code>GpuCollisionNarrowPhase</code>.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Current Truth</h3>
+        <ul>
+          <li><span class="ok">Object-level GPU AABB culling:</span> disabled by default with <code>useObjectAabbCulling=false</code>.</li>
+          <li><span class="ok">SOFA broad phase:</span> still present, emits tissue/tool model pair.</li>
+          <li><span class="ok">Primitive candidate generation:</span> GPU dense grid.</li>
+          <li><span class="ok">Duplicate pair removal:</span> enabled with sort + unique.</li>
+          <li><span class="ok">Detection-only D2H:</span> counters only, 16 bytes per step in verified benchmark.</li>
+          <li><span class="cpu">Remaining bottleneck:</span> CPU-staged triangle upload, 512480 bytes per step.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>2. Full Current Workflow</h2>
+    <div class="figure">
+      <svg viewBox="0 0 1100 430" width="100%" role="img" aria-label="Full current collision workflow">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="20" y="36" width="168" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="104" y="61" text-anchor="middle" font-size="14" font-weight="700">CPU scene setup</text>
+        <text x="104" y="80" text-anchor="middle" font-size="12">SOFA nodes, topology, models</text>
+
+        <rect x="235" y="36" width="190" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="330" y="61" text-anchor="middle" font-size="14" font-weight="700">SOFA broad contract</text>
+        <text x="330" y="80" text-anchor="middle" font-size="12">emit tissue/tool pair only</text>
+
+        <rect x="474" y="36" width="192" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="570" y="61" text-anchor="middle" font-size="14" font-weight="700">CPU triangle extraction</text>
+        <text x="570" y="80" text-anchor="middle" font-size="12">pack DeviceTriangle arrays</text>
+
+        <rect x="714" y="36" width="172" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="800" y="61" text-anchor="middle" font-size="14" font-weight="700">H2D upload</text>
+        <text x="800" y="80" text-anchor="middle" font-size="12">512480 bytes/step</text>
+
+        <rect x="70" y="160" width="170" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="155" y="184" text-anchor="middle" font-size="14" font-weight="700">GPU grid clear</text>
+        <text x="155" y="203" text-anchor="middle" font-size="12">32768 cells</text>
+
+        <rect x="285" y="160" width="170" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="370" y="184" text-anchor="middle" font-size="14" font-weight="700">Triangle AABBs</text>
+        <text x="370" y="203" text-anchor="middle" font-size="12">1 thread per triangle</text>
+
+        <rect x="500" y="160" width="170" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="585" y="184" text-anchor="middle" font-size="14" font-weight="700">Insert to grid</text>
+        <text x="585" y="203" text-anchor="middle" font-size="12">tissue ids and blade ids</text>
+
+        <rect x="715" y="160" width="185" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="807" y="184" text-anchor="middle" font-size="14" font-weight="700">Generate candidates</text>
+        <text x="807" y="203" text-anchor="middle" font-size="12">1 block per cell</text>
+
+        <rect x="165" y="285" width="170" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="250" y="309" text-anchor="middle" font-size="14" font-weight="700">Sort + unique</text>
+        <text x="250" y="328" text-anchor="middle" font-size="12">2304 raw to 624 unique</text>
+
+        <rect x="380" y="285" width="190" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="475" y="309" text-anchor="middle" font-size="14" font-weight="700">Exact contact kernel</text>
+        <text x="475" y="328" text-anchor="middle" font-size="12">1 thread per unique pair</text>
+
+        <rect x="620" y="285" width="185" height="60" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="712" y="309" text-anchor="middle" font-size="14" font-weight="700">GPU contact buffer</text>
+        <text x="712" y="328" text-anchor="middle" font-size="12">104 contacts observed</text>
+
+        <rect x="850" y="285" width="190" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="945" y="309" text-anchor="middle" font-size="14" font-weight="700">D2H counters only</text>
+        <text x="945" y="328" text-anchor="middle" font-size="12">16 bytes, no contact copy</text>
+
+        <line x1="188" y1="66" x2="235" y2="66" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="425" y1="66" x2="474" y2="66" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="666" y1="66" x2="714" y2="66" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="800" y1="96" x2="800" y2="130" stroke="#a7372a" stroke-width="2"></line>
+        <line x1="800" y1="130" x2="155" y2="130" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="155" y1="130" x2="155" y2="160" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="240" y1="190" x2="285" y2="190" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="455" y1="190" x2="500" y2="190" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="670" y1="190" x2="715" y2="190" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="807" y1="220" x2="807" y2="250" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="807" y1="250" x2="250" y2="250" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="250" y1="250" x2="250" y2="285" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="335" y1="315" x2="380" y2="315" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="570" y1="315" x2="620" y2="315" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"></line>
+        <line x1="805" y1="315" x2="850" y2="315" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow)"></line>
+
+        <text x="755" y="116" font-size="12" fill="#a7372a" font-weight="700">CPU to GPU</text>
+        <text x="822" y="302" font-size="12" fill="#a7372a" font-weight="700">GPU to CPU</text>
+      </svg>
+      <div class="caption">
+        Figure 1. Current end-to-end workflow. The SOFA broad phase is now a compatibility pair emitter;
+        dense-grid candidate generation, deduplication, and exact contacts happen on the GPU.
+      </div>
+    </div>
+
+    <h2>3. Broad Phase: What Was Removed and What Remains</h2>
+    <p>
+      The earlier report described a GPU root-AABB broad phase. That code still exists for general scenes,
+      but it is no longer the default for the surgical two-object path. The current constructor default is:
+    </p>
+    <pre><code>d_useObjectAabbCulling = false</code></pre>
+    <p>
+      With that setting, <code>GpuCollisionBroadPhase</code> loops over the registered collision models,
+      applies SOFA's intersector compatibility checks, and emits the valid model pairs. For one tissue
+      and one blade this becomes exactly one object pair.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Broad-phase item</th>
+          <th>Current behavior</th>
+          <th>Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Object-level GPU AABB culling</td>
+          <td>Disabled by default</td>
+          <td>One tissue and one blade means object-level culling adds latency but does not reject anything useful.</td>
+        </tr>
+        <tr>
+          <td>SOFA broad-phase component</td>
+          <td>Still required</td>
+          <td><code>CollisionPipeline</code> expects a broad phase to feed the narrow phase.</td>
+        </tr>
+        <tr>
+          <td>Broad output</td>
+          <td>Usually one pair: tissue model vs blade model</td>
+          <td>The actual primitive filtering is now done in the dense grid.</td>
+        </tr>
+        <tr>
+          <td>Measured broad GPU kernel</td>
+          <td><code>0.000000 ms</code></td>
+          <td>No broad CUDA kernel is launched in the default surgical path.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      <strong>Precise wording:</strong> broad phase is not totally removed from SOFA. The redundant
+      object-level GPU broad-phase collision detection has been bypassed by default. The real broad
+      filtering is now primitive-level dense-grid candidate generation inside the narrow phase.
+    </div>
+
+    <h2>4. Dense Grid Concept</h2>
+    <p>
+      The scene is divided into one shared 3D grid. There are not two separate grids. Each cell stores
+      two lists: tissue triangle ids and tool triangle ids. If a tissue triangle and a tool triangle
+      land in the same cell, they become a candidate pair.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 1040 430" width="100%" role="img" aria-label="Dense grid cell mapping">
+        <defs>
+          <pattern id="cellGrid" width="60" height="60" patternUnits="userSpaceOnUse">
+            <path d="M60 0 L0 0 0 60" fill="none" stroke="#d6dde5" stroke-width="1"></path>
+          </pattern>
+          <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="24" y="36" width="420" height="300" fill="url(#cellGrid)" stroke="#7b5c00" stroke-width="2"></rect>
+        <polygon points="92,250 300,110 370,285" fill="rgba(18,109,114,0.22)" stroke="#126d72" stroke-width="3"></polygon>
+        <polygon points="150,210 330,184 326,220 145,246" fill="rgba(167,55,42,0.28)" stroke="#a7372a" stroke-width="3"></polygon>
+        <text x="120" y="95" font-size="13" fill="#126d72" font-weight="700">tissue triangle overlaps cells</text>
+        <text x="172" y="270" font-size="13" fill="#a7372a" font-weight="700">blade triangle overlaps cells</text>
+
+        <rect x="524" y="52" width="190" height="88" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="619" y="78" text-anchor="middle" font-size="14" font-weight="700">CellBucket[cellId]</text>
+        <text x="619" y="101" text-anchor="middle" font-size="12">tissueCount</text>
+        <text x="619" y="121" text-anchor="middle" font-size="12">toolCount</text>
+
+        <rect x="785" y="52" width="220" height="88" rx="8" fill="#f7f8fa" stroke="#d6dde5"></rect>
+        <text x="895" y="78" text-anchor="middle" font-size="14" font-weight="700">Flat cell lists</text>
+        <text x="895" y="101" text-anchor="middle" font-size="12">cellTissueIds[cellId * maxT + i]</text>
+        <text x="895" y="121" text-anchor="middle" font-size="12">cellToolIds[cellId * maxB + j]</text>
+
+        <rect x="524" y="205" width="220" height="100" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="634" y="231" text-anchor="middle" font-size="14" font-weight="700">Per-cell candidate rule</text>
+        <text x="634" y="257" text-anchor="middle" font-size="12">x tissue triangles</text>
+        <text x="634" y="277" text-anchor="middle" font-size="12">y blade triangles</text>
+        <text x="634" y="297" text-anchor="middle" font-size="12">emit x * y pairs</text>
+
+        <rect x="804" y="205" width="160" height="100" rx="8" fill="#eef7f8" stroke="#d6dde5"></rect>
+        <text x="884" y="231" text-anchor="middle" font-size="14" font-weight="700">Candidate pair</text>
+        <text x="884" y="258" text-anchor="middle" font-size="12">uint64</text>
+        <text x="884" y="278" text-anchor="middle" font-size="12">(tissueId &lt;&lt; 32)</text>
+        <text x="884" y="298" text-anchor="middle" font-size="12">| toolId</text>
+
+        <line x1="444" y1="120" x2="524" y2="96" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow2)"></line>
+        <line x1="714" y1="96" x2="785" y2="96" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow2)"></line>
+        <line x1="634" y1="140" x2="634" y2="205" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow2)"></line>
+        <line x1="744" y1="255" x2="804" y2="255" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow2)"></line>
+      </svg>
+      <div class="caption">
+        Figure 2. One global 3D grid. Every cell stores two triangle-id lists: tissue ids and tool ids.
+        A triangle can overlap multiple cells, which is why duplicate candidate pairs must be removed.
+      </div>
+    </div>
+
+    <h3>4.1 Grid Data Structures</h3>
+    <pre><code>struct DeviceCellBucket
+{
+    uint32_t tissueCount;
+    uint32_t toolCount;
+};
+
+DeviceCellBucket* grid;
+uint32_t* cellTissueIds;  // cellId * maxTissueTrianglesPerCell + localIndex
+uint32_t* cellToolIds;    // cellId * maxToolTrianglesPerCell + localIndex
+uint64_t* candidatePairs; // high 32 bits = tissue triangle id, low 32 bits = tool triangle id</code></pre>
+
+    <h3>4.2 Current Benchmark Grid Parameters</h3>
+    <table>
+      <tbody>
+        <tr><th>Parameter</th><th>Value</th></tr>
+        <tr><td>Grid min</td><td><code>[-4.5, -0.5, -4.5]</code></td></tr>
+        <tr><td>Grid max</td><td><code>[4.5, 0.5, 4.5]</code></td></tr>
+        <tr><td>Grid resolution</td><td><code>64 x 8 x 64 = 32768 cells</code></td></tr>
+        <tr><td>Contact distance</td><td><code>0.03</code></td></tr>
+        <tr><td>Max tissue ids per cell</td><td><code>128</code></td></tr>
+        <tr><td>Max tool ids per cell</td><td><code>64</code></td></tr>
+        <tr><td>Max candidate pairs</td><td><code>2000000</code></td></tr>
+      </tbody>
+    </table>
+
+    <h2>5. GPU Kernel Implementation Details</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Order</th>
+          <th>Kernel / operation</th>
+          <th>Launch shape</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Where data lives</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><code>clearDenseGridKernel</code></td>
+          <td><code>ceil(numCells / 256)</code> blocks, 256 threads</td>
+          <td>grid buffer</td>
+          <td>zeroed <code>tissueCount</code> and <code>toolCount</code></td>
+          <td>GPU global memory</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><code>triangleAabbKernel</code> for tissue</td>
+          <td>1 thread per tissue triangle</td>
+          <td><code>DeviceTriangle[]</code></td>
+          <td><code>DeviceAabb[]</code></td>
+          <td>GPU global memory</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><code>triangleAabbKernel</code> for blade/tool</td>
+          <td>1 thread per tool triangle</td>
+          <td><code>DeviceTriangle[]</code></td>
+          <td><code>DeviceAabb[]</code></td>
+          <td>GPU global memory</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><code>insertTissueTrianglesKernel</code></td>
+          <td>1 thread per tissue triangle</td>
+          <td>tissue AABBs, grid config</td>
+          <td>cell tissue id lists</td>
+          <td>GPU global memory with atomic counters</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><code>insertToolTrianglesKernel</code></td>
+          <td>1 thread per tool triangle</td>
+          <td>tool AABBs, grid config</td>
+          <td>cell tool id lists</td>
+          <td>GPU global memory with atomic counters</td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td><code>generateDenseGridCandidatePairsKernel</code></td>
+          <td>1 block per cell, 256 threads per block</td>
+          <td>cell tissue ids, cell tool ids</td>
+          <td>raw encoded candidate pairs</td>
+          <td>GPU global memory with atomic output counter</td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td><code>thrust::sort</code> + <code>thrust::unique</code></td>
+          <td>Thrust device operations</td>
+          <td>raw candidate pair array</td>
+          <td>unique candidate pair prefix</td>
+          <td>GPU memory</td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td><code>exactDenseGridContactKernel</code></td>
+          <td>1 thread per unique candidate pair</td>
+          <td>unique pairs, tissue triangles, tool triangles</td>
+          <td><code>DeviceExactContact[]</code> and contact counter</td>
+          <td>GPU global memory</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5.1 Candidate Generation Per Cell</h3>
+    <pre><code>// One CUDA block owns one cell.
+cellId = blockIdx.x
+x = min(grid[cellId].tissueCount, maxTissueTrianglesPerCell)
+y = min(grid[cellId].toolCount, maxToolTrianglesPerCell)
+totalPairs = x * y
+
+for localPair = threadIdx.x; localPair &lt; totalPairs; localPair += blockDim.x:
+    tissueLocal = localPair / y
+    toolLocal   = localPair % y
+    tissueId = cellTissueIds[cellId * maxTissuePerCell + tissueLocal]
+    toolId   = cellToolIds[cellId * maxToolPerCell + toolLocal]
+    candidatePairs[atomicAdd(candidateCount, 1)] = encode(tissueId, toolId)</code></pre>
+
+    <h3>5.2 Duplicate Removal</h3>
+    <p>
+      Duplicate removal is necessary because a triangle AABB can overlap multiple grid cells. The same
+      tissue/tool triangle pair can therefore be emitted by more than one cell. The current implementation
+      deduplicates with:
+    </p>
+    <pre><code>thrust::sort(candidatePairs, candidatePairs + usedCandidateCount)
+uniqueEnd = thrust::unique(candidatePairs, candidatePairs + usedCandidateCount)
+exactCandidateCount = uniqueEnd - candidatePairs</code></pre>
+    <p>
+      In the verified one tissue / one blade benchmark:
+    </p>
+    <ul>
+      <li>raw candidate pairs: <code>2304</code></li>
+      <li>unique candidate pairs after dedup: <code>624</code></li>
+      <li>exact contacts emitted: <code>104</code></li>
+    </ul>
+
+    <h3>5.3 Exact Contact Kernel</h3>
+    <p>
+      The exact kernel runs one thread per unique candidate pair. Each thread decodes one
+      <code>uint64_t</code> pair, loads one tissue triangle and one tool triangle, and runs the existing
+      triangle-triangle Separating Axis Theorem test. Intersecting pairs write one compact
+      <code>DeviceExactContact</code> record with an atomic contact counter.
+    </p>
+
+    <h2>6. Narrow-Phase Call Graph</h2>
+    <p>
+      The narrow phase is not just one CUDA kernel. It is a SOFA callback layer, a CPU staging layer,
+      a persistent CUDA workspace layer, and then a sequence of GPU kernels/device operations. The
+      current surgical path is selected when both collision models can be interpreted as
+      <code>CudaTriangleCollisionModel</code> and <code>useDenseGrid=true</code>.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 1120 520" width="100%" role="img" aria-label="Narrow phase call graph">
+        <defs>
+          <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="34" y="35" width="230" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="149" y="60" text-anchor="middle" font-size="14" font-weight="700">SOFA CollisionPipeline</text>
+        <text x="149" y="79" text-anchor="middle" font-size="12">drives narrow phase callbacks</text>
+
+        <rect x="316" y="35" width="230" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="431" y="60" text-anchor="middle" font-size="14" font-weight="700">beginNarrowPhase()</text>
+        <text x="431" y="79" text-anchor="middle" font-size="12">clear m_pendingPairs</text>
+
+        <rect x="598" y="35" width="230" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="713" y="60" text-anchor="middle" font-size="14" font-weight="700">addCollisionPair()</text>
+        <text x="713" y="79" text-anchor="middle" font-size="12">store tissue/tool pair</text>
+
+        <rect x="316" y="145" width="230" height="60" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="431" y="170" text-anchor="middle" font-size="14" font-weight="700">endNarrowPhase()</text>
+        <text x="431" y="189" text-anchor="middle" font-size="12">main decision point</text>
+
+        <rect x="34" y="255" width="230" height="70" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="149" y="280" text-anchor="middle" font-size="14" font-weight="700">tryExtractCudaTriangles()</text>
+        <text x="149" y="299" text-anchor="middle" font-size="12">read getX() and getTriangles()</text>
+        <text x="149" y="317" text-anchor="middle" font-size="12">pack TrianglePrimitive vectors</text>
+
+        <rect x="316" y="255" width="230" height="70" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="431" y="280" text-anchor="middle" font-size="14" font-weight="700">DenseGridConfig</text>
+        <text x="431" y="299" text-anchor="middle" font-size="12">grid bounds, capacities</text>
+        <text x="431" y="317" text-anchor="middle" font-size="12">dedup, copy mode</text>
+
+        <rect x="598" y="255" width="250" height="70" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="723" y="280" text-anchor="middle" font-size="14" font-weight="700">computeDenseGridTriangleContacts()</text>
+        <text x="723" y="299" text-anchor="middle" font-size="12">CUDA workspace and kernels</text>
+        <text x="723" y="317" text-anchor="middle" font-size="12">returns contacts or counters</text>
+
+        <rect x="890" y="255" width="205" height="70" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="992" y="280" text-anchor="middle" font-size="14" font-weight="700">Fallback if rejected</text>
+        <text x="992" y="299" text-anchor="middle" font-size="12">computeExactTriangleContacts()</text>
+        <text x="992" y="317" text-anchor="middle" font-size="12">or legacy BVH path</text>
+
+        <rect x="316" y="390" width="230" height="70" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="431" y="415" text-anchor="middle" font-size="14" font-weight="700">publishCudaTriangleContacts()</text>
+        <text x="431" y="434" text-anchor="middle" font-size="12">only when contacts copied</text>
+        <text x="431" y="452" text-anchor="middle" font-size="12">build SOFA DetectionOutput</text>
+
+        <rect x="598" y="390" width="250" height="70" rx="8" fill="#f7f8fa" stroke="#d6dde5"></rect>
+        <text x="723" y="415" text-anchor="middle" font-size="14" font-weight="700">accumulateBackendStats()</text>
+        <text x="723" y="434" text-anchor="middle" font-size="12">H2D, D2H, kernels, candidates</text>
+        <text x="723" y="452" text-anchor="middle" font-size="12">profiling::recordNarrowPhase()</text>
+
+        <line x1="264" y1="65" x2="316" y2="65" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="546" y1="65" x2="598" y2="65" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="713" y1="95" x2="713" y2="120" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="713" y1="120" x2="431" y2="120" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="431" y1="120" x2="431" y2="145" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="431" y1="205" x2="431" y2="230" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="431" y1="230" x2="149" y2="230" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="149" y1="230" x2="149" y2="255" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="264" y1="290" x2="316" y2="290" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="546" y1="290" x2="598" y2="290" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="848" y1="290" x2="890" y2="290" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="723" y1="325" x2="723" y2="390" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+        <line x1="598" y1="425" x2="546" y2="425" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow5)"></line>
+      </svg>
+      <div class="caption">
+        Figure 3. Narrow-phase call graph. The GPU dense-grid path is entered from
+        <code>GpuCollisionNarrowPhase::endNarrowPhase()</code> after CPU extraction verifies both models
+        are CUDA triangle collision models.
+      </div>
+    </div>
+
+    <h3>6.1 Exact Function Order in the Current Path</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Order</th>
+          <th>Function / callback</th>
+          <th>CPU or GPU</th>
+          <th>What it does</th>
+          <th>Important data</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><code>GpuCollisionNarrowPhase::beginNarrowPhase()</code></td>
+          <td>CPU</td>
+          <td>Clears <code>m_pendingPairs</code>, then calls base SOFA narrow-phase begin.</td>
+          <td>empty pending pair vector</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><code>GpuCollisionNarrowPhase::addCollisionPair(cmPair)</code></td>
+          <td>CPU</td>
+          <td>Stores the tissue/tool pair instead of immediately handing it to SOFA BVH.</td>
+          <td><code>std::vector&lt;CollisionModelPair&gt; m_pendingPairs</code></td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><code>GpuCollisionNarrowPhase::endNarrowPhase()</code></td>
+          <td>CPU</td>
+          <td>Starts timing, iterates pending pairs, decides dense-grid GPU path vs fallback.</td>
+          <td><code>profiling::StageSnapshot</code></td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><code>tryExtractCudaTriangles(pair.first)</code> and <code>tryExtractCudaTriangles(pair.second)</code></td>
+          <td>CPU staging</td>
+          <td>Dynamic-casts model to <code>CudaTriangleCollisionModel</code>, reads <code>getX()</code> and <code>getTriangles()</code>, packs <code>TrianglePrimitive</code> records.</td>
+          <td><code>std::vector&lt;TrianglePrimitive&gt;</code></td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td>Build <code>backend::DenseGridConfig</code></td>
+          <td>CPU</td>
+          <td>Copies SOFA component Data values into a plain backend config.</td>
+          <td>grid min/max/resolution, capacities, <code>deduplicatePairs</code>, <code>copyContactsToHost</code></td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td><code>backend::computeDenseGridTriangleContacts(...)</code></td>
+          <td>CPU wrapper + GPU work</td>
+          <td>Runs allocation/reuse, H2D upload, dense-grid kernels, dedup, exact contact kernel, and D2H counters/contact data depending on mode.</td>
+          <td><code>DenseGridWorkspace</code>, candidate pairs, contact buffer</td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td><code>accumulateBackendStats(stageSnapshot, backendStats)</code></td>
+          <td>CPU</td>
+          <td>Records GPU used, transfer bytes, kernel time, candidate/contact counts, allocation bytes.</td>
+          <td><code>BackendExecutionStats</code> to <code>StageSnapshot</code></td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td><code>publishCudaTriangleContacts(...)</code></td>
+          <td>CPU, only when contacts exist on host</td>
+          <td>Creates SOFA <code>DetectionOutput</code> records from copied contacts. Skipped in detection-only no-copy mode because contact vector is empty.</td>
+          <td><code>TDetectionOutputVector&lt;CudaTriangleModel, CudaTriangleModel&gt;</code></td>
+        </tr>
+        <tr>
+          <td>9</td>
+          <td><code>profiling::recordNarrowPhase(stageSnapshot)</code></td>
+          <td>CPU</td>
+          <td>Publishes per-step profiling for the benchmark controller.</td>
+          <td>CSV and summary fields</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>7. Dense-Grid Backend Lifecycle</h2>
+    <p>
+      <code>computeDenseGridTriangleContacts()</code> is the main backend routine. It is a CPU function
+      that orchestrates device memory, CUDA kernels, device synchronization, Thrust deduplication, and
+      optional host contact publication.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 1120 560" width="100%" role="img" aria-label="Dense grid backend lifecycle">
+        <defs>
+          <marker id="arrow6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="40" y="35" width="210" height="58" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="145" y="58" text-anchor="middle" font-size="14" font-weight="700">Validate inputs</text>
+        <text x="145" y="77" text-anchor="middle" font-size="12">grid, capacities, nonempty</text>
+
+        <rect x="310" y="35" width="210" height="58" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="415" y="58" text-anchor="middle" font-size="14" font-weight="700">Pack host triangles</text>
+        <text x="415" y="77" text-anchor="middle" font-size="12">TrianglePrimitive -> DeviceTriangle</text>
+
+        <rect x="580" y="35" width="210" height="58" rx="8" fill="#fff3f1" stroke="#d6dde5"></rect>
+        <text x="685" y="58" text-anchor="middle" font-size="14" font-weight="700">workspace.ensure()</text>
+        <text x="685" y="77" text-anchor="middle" font-size="12">grow persistent buffers</text>
+
+        <rect x="850" y="35" width="210" height="58" rx="8" fill="#fff3f1" stroke="#a7372a"></rect>
+        <text x="955" y="58" text-anchor="middle" font-size="14" font-weight="700">cudaMemcpy H2D</text>
+        <text x="955" y="77" text-anchor="middle" font-size="12">tissue + tool triangles</text>
+
+        <rect x="55" y="150" width="190" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="150" y="173" text-anchor="middle" font-size="14" font-weight="700">Clear grid</text>
+        <text x="150" y="192" text-anchor="middle" font-size="12">kernel + counter memset</text>
+
+        <rect x="295" y="150" width="190" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="390" y="173" text-anchor="middle" font-size="14" font-weight="700">AABB kernels</text>
+        <text x="390" y="192" text-anchor="middle" font-size="12">tissue and tool</text>
+
+        <rect x="535" y="150" width="190" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="630" y="173" text-anchor="middle" font-size="14" font-weight="700">Insert kernels</text>
+        <text x="630" y="192" text-anchor="middle" font-size="12">cell id lists</text>
+
+        <rect x="775" y="150" width="210" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="880" y="173" text-anchor="middle" font-size="14" font-weight="700">Candidate kernel</text>
+        <text x="880" y="192" text-anchor="middle" font-size="12">raw pair buffer</text>
+
+        <rect x="90" y="270" width="210" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="195" y="293" text-anchor="middle" font-size="14" font-weight="700">cudaDeviceSynchronize</text>
+        <text x="195" y="312" text-anchor="middle" font-size="12">finish insertion/candidate work</text>
+
+        <rect x="360" y="270" width="210" height="58" rx="8" fill="#fff3f1" stroke="#a7372a"></rect>
+        <text x="465" y="293" text-anchor="middle" font-size="14" font-weight="700">D2H raw counts</text>
+        <text x="465" y="312" text-anchor="middle" font-size="12">candidate + overflow</text>
+
+        <rect x="630" y="270" width="210" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="735" y="293" text-anchor="middle" font-size="14" font-weight="700">sort + unique</text>
+        <text x="735" y="312" text-anchor="middle" font-size="12">Thrust on device</text>
+
+        <rect x="90" y="390" width="210" height="58" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="195" y="413" text-anchor="middle" font-size="14" font-weight="700">Exact contact kernel</text>
+        <text x="195" y="432" text-anchor="middle" font-size="12">candidate -> contact</text>
+
+        <rect x="360" y="390" width="210" height="58" rx="8" fill="#fff3f1" stroke="#a7372a"></rect>
+        <text x="465" y="413" text-anchor="middle" font-size="14" font-weight="700">D2H final counters</text>
+        <text x="465" y="432" text-anchor="middle" font-size="12">contact + overflow</text>
+
+        <rect x="630" y="390" width="210" height="58" rx="8" fill="#fff3f1" stroke="#a7372a"></rect>
+        <text x="735" y="413" text-anchor="middle" font-size="14" font-weight="700">Optional contacts D2H</text>
+        <text x="735" y="432" text-anchor="middle" font-size="12">skipped when no-copy</text>
+
+        <rect x="890" y="390" width="190" height="58" rx="8" fill="#f7f8fa" stroke="#d6dde5"></rect>
+        <text x="985" y="413" text-anchor="middle" font-size="14" font-weight="700">Return result</text>
+        <text x="985" y="432" text-anchor="middle" font-size="12">diagnostic + stats</text>
+
+        <line x1="250" y1="64" x2="310" y2="64" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="520" y1="64" x2="580" y2="64" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="790" y1="64" x2="850" y2="64" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="955" y1="93" x2="955" y2="122" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="955" y1="122" x2="150" y2="122" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="150" y1="122" x2="150" y2="150" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="245" y1="179" x2="295" y2="179" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="485" y1="179" x2="535" y2="179" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="725" y1="179" x2="775" y2="179" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="880" y1="208" x2="880" y2="240" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="880" y1="240" x2="195" y2="240" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="195" y1="240" x2="195" y2="270" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="300" y1="299" x2="360" y2="299" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="570" y1="299" x2="630" y2="299" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="735" y1="328" x2="735" y2="360" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="735" y1="360" x2="195" y2="360" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="195" y1="360" x2="195" y2="390" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="300" y1="419" x2="360" y2="419" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="570" y1="419" x2="630" y2="419" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow6)"></line>
+        <line x1="840" y1="419" x2="890" y2="419" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow6)"></line>
+      </svg>
+      <div class="caption">
+        Figure 4. Backend lifecycle inside <code>computeDenseGridTriangleContacts()</code>.
+        Red boxes/lines are CPU-side or transfer boundaries. Green boxes are GPU kernels or device operations.
+      </div>
+    </div>
+
+    <h3>7.1 Every CUDA Operation in the Dense-Grid Path</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Order</th>
+          <th>Operation</th>
+          <th>Purpose</th>
+          <th>Transfer/accounting</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td><code>workspace.ensure(...)</code></td><td>Allocates or reuses all dense-grid device buffers.</td><td>Counts new allocation bytes only when capacity grows.</td></tr>
+        <tr><td>2</td><td><code>cudaMemcpy(deviceTissueTriangles, hostTissueTriangles, tissueTriangleBytes, H2D)</code></td><td>Uploads packed tissue triangles.</td><td>Part of <code>avg_host_to_device_bytes</code>.</td></tr>
+        <tr><td>3</td><td><code>cudaMemcpy(deviceToolTriangles, hostToolTriangles, toolTriangleBytes, H2D)</code></td><td>Uploads packed blade/tool triangles.</td><td>Part of <code>avg_host_to_device_bytes</code>.</td></tr>
+        <tr><td>4</td><td><code>cudaEventCreate</code> / <code>cudaEventRecord(kernelStart)</code></td><td>Starts GPU kernel timing range.</td><td>No counted transfer.</td></tr>
+        <tr><td>5</td><td><code>clearDenseGridKernel&lt;&lt;&lt;cellBlocks, 256&gt;&gt;&gt;</code></td><td>Zeros per-cell tissue/tool counters.</td><td>GPU global memory writes.</td></tr>
+        <tr><td>6</td><td><code>cudaMemset(deviceCandidateCount, 0, 4)</code></td><td>Resets raw candidate counter.</td><td>Device-side memset.</td></tr>
+        <tr><td>7</td><td><code>cudaMemset(deviceContactCount, 0, 4)</code></td><td>Resets exact contact counter.</td><td>Device-side memset.</td></tr>
+        <tr><td>8</td><td><code>cudaMemset(deviceOverflowCount, 0, 4)</code></td><td>Resets overflow counter.</td><td>Device-side memset.</td></tr>
+        <tr><td>9</td><td><code>triangleAabbKernel</code> for tissue</td><td>Computes inflated triangle AABBs.</td><td>GPU reads triangles, writes AABBs.</td></tr>
+        <tr><td>10</td><td><code>triangleAabbKernel</code> for tool</td><td>Computes inflated blade/tool AABBs.</td><td>GPU reads triangles, writes AABBs.</td></tr>
+        <tr><td>11</td><td><code>insertTissueTrianglesKernel</code></td><td>Maps each tissue triangle AABB to all overlapped cells.</td><td>Atomic cell bucket writes.</td></tr>
+        <tr><td>12</td><td><code>insertToolTrianglesKernel</code></td><td>Maps each tool triangle AABB to all overlapped cells.</td><td>Atomic cell bucket writes.</td></tr>
+        <tr><td>13</td><td><code>generateDenseGridCandidatePairsKernel</code></td><td>For each cell, emits tissue x tool encoded pairs.</td><td>Atomic append to <code>candidatePairs</code>.</td></tr>
+        <tr><td>14</td><td><code>cudaDeviceSynchronize()</code></td><td>Waits before reading raw candidate and overflow counters.</td><td>Synchronization point.</td></tr>
+        <tr><td>15</td><td><code>cudaMemcpy(&amp;rawCandidateCount, deviceCandidateCount, 4, D2H)</code></td><td>Copies raw candidate count.</td><td>Counter D2H.</td></tr>
+        <tr><td>16</td><td><code>cudaMemcpy(&amp;overflowCount, deviceOverflowCount, 4, D2H)</code></td><td>Copies overflow count after insertion/candidate generation.</td><td>Counter D2H.</td></tr>
+        <tr><td>17</td><td><code>thrust::sort</code> and <code>thrust::unique</code></td><td>Deduplicates candidate pairs on the device.</td><td>GPU device operation.</td></tr>
+        <tr><td>18</td><td><code>cudaDeviceSynchronize()</code></td><td>Waits for Thrust dedup completion.</td><td>Synchronization point.</td></tr>
+        <tr><td>19</td><td><code>exactDenseGridContactKernel&lt;&lt;&lt;contactBlocks, 256&gt;&gt;&gt;</code></td><td>Runs exact triangle-triangle tests for unique candidates.</td><td>GPU contact buffer writes.</td></tr>
+        <tr><td>20</td><td><code>cudaDeviceSynchronize()</code></td><td>Waits for exact contact kernel.</td><td>Synchronization point.</td></tr>
+        <tr><td>21</td><td><code>cudaEventRecord(kernelEnd)</code> / <code>cudaEventElapsedTime</code></td><td>Records total dense-grid GPU time.</td><td>Benchmark metric.</td></tr>
+        <tr><td>22</td><td><code>cudaMemcpy(&amp;hostContactCount, deviceContactCount, 4, D2H)</code></td><td>Copies exact contact count.</td><td>Counter D2H.</td></tr>
+        <tr><td>23</td><td><code>cudaMemcpy(&amp;overflowCount, deviceOverflowCount, 4, D2H)</code></td><td>Copies final overflow count.</td><td>Counter D2H.</td></tr>
+        <tr><td>24</td><td><code>if (!copyContactsToHost) return true</code></td><td>Detection-only mode exits here, leaving contact records on GPU.</td><td>Final measured D2H is 16 bytes.</td></tr>
+        <tr><td>25</td><td><code>cudaMemcpy(hostContacts, deviceContacts, hostContactCount * sizeof(DeviceExactContact), D2H)</code></td><td>Only in SOFA response compatibility mode.</td><td>Full contact-list copy.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>8. Exact Contact Kernel Creation and Execution</h2>
+    <p>
+      The exact contact kernel is not launched over all tissue triangles times all tool triangles in
+      the dense-grid path. It is launched only after candidate generation and deduplication. Therefore,
+      <code>exactCandidateCount</code> determines the CUDA grid size.
+    </p>
+    <pre><code>const auto contactBlocks =
+    static_cast&lt;uint32_t&gt;((exactCandidateCount + threadCount - 1) / threadCount);
+
+exactDenseGridContactKernel&lt;&lt;&lt;contactBlocks, 256&gt;&gt;&gt;(
+    deviceTissueTriangles,
+    deviceToolTriangles,
+    deviceCandidatePairs,
+    exactCandidateCount,
+    deviceContacts,
+    config.maxCandidatePairs,
+    deviceContactCount,
+    deviceOverflowCount);</code></pre>
+
+    <div class="figure">
+      <svg viewBox="0 0 1120 420" width="100%" role="img" aria-label="Exact contact kernel thread mapping">
+        <defs>
+          <marker id="arrow7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="36" y="46" width="250" height="300" rx="8" fill="#f7f8fa" stroke="#d6dde5"></rect>
+        <text x="161" y="75" text-anchor="middle" font-size="15" font-weight="700">unique candidatePairs[]</text>
+        <text x="161" y="106" text-anchor="middle" font-size="12">index 0: tissue 812, tool 4</text>
+        <text x="161" y="132" text-anchor="middle" font-size="12">index 1: tissue 813, tool 4</text>
+        <text x="161" y="158" text-anchor="middle" font-size="12">index 2: tissue 972, tool 5</text>
+        <text x="161" y="184" text-anchor="middle" font-size="12">...</text>
+        <text x="161" y="216" text-anchor="middle" font-size="12">index 623: tissue id, tool id</text>
+        <text x="161" y="270" text-anchor="middle" font-size="12" fill="#126d72" font-weight="700">verified count: 624</text>
+
+        <rect x="375" y="46" width="300" height="300" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="525" y="75" text-anchor="middle" font-size="15" font-weight="700">exactDenseGridContactKernel</text>
+        <text x="525" y="108" text-anchor="middle" font-size="12">candidateIndex = blockIdx.x * 256 + threadIdx.x</text>
+        <text x="525" y="138" text-anchor="middle" font-size="12">decode pair: high 32 bits tissue, low 32 bits tool</text>
+        <text x="525" y="168" text-anchor="middle" font-size="12">load DeviceTriangle tissueTriangles[tissueId]</text>
+        <text x="525" y="198" text-anchor="middle" font-size="12">load DeviceTriangle toolTriangles[toolId]</text>
+        <text x="525" y="228" text-anchor="middle" font-size="12">call exactTriangleIntersection()</text>
+        <text x="525" y="258" text-anchor="middle" font-size="12">if intersecting: atomicAdd(contactCount, 1)</text>
+        <text x="525" y="288" text-anchor="middle" font-size="12">write DeviceExactContact</text>
+
+        <rect x="764" y="46" width="300" height="300" rx="8" fill="#f7f8fa" stroke="#d6dde5"></rect>
+        <text x="914" y="75" text-anchor="middle" font-size="15" font-weight="700">contacts[] on GPU</text>
+        <text x="914" y="113" text-anchor="middle" font-size="12">firstTriangleIndex</text>
+        <text x="914" y="139" text-anchor="middle" font-size="12">secondTriangleIndex</text>
+        <text x="914" y="165" text-anchor="middle" font-size="12">pointOnFirst</text>
+        <text x="914" y="191" text-anchor="middle" font-size="12">pointOnSecond</text>
+        <text x="914" y="217" text-anchor="middle" font-size="12">normal</text>
+        <text x="914" y="243" text-anchor="middle" font-size="12">signedDistance</text>
+        <text x="914" y="285" text-anchor="middle" font-size="12" fill="#126d72" font-weight="700">verified count: 104</text>
+
+        <line x1="286" y1="196" x2="375" y2="196" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow7)"></line>
+        <line x1="675" y1="196" x2="764" y2="196" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow7)"></line>
+      </svg>
+      <div class="caption">
+        Figure 5. Exact contact kernel mapping. One CUDA thread owns one unique candidate pair. Only
+        intersecting pairs append a <code>DeviceExactContact</code> using an atomic counter.
+      </div>
+    </div>
+
+    <h3>8.1 Exact Kernel Per-Thread Logic</h3>
+    <pre><code>candidateIndex = blockIdx.x * blockDim.x + threadIdx.x
+if candidateIndex &gt;= candidateCount:
+    return
+
+candidatePair = candidatePairs[candidateIndex]
+tissueTriangleId = candidatePair &gt;&gt; 32
+toolTriangleId = candidatePair &amp; 0xffffffff
+
+DeviceExactContact exactContact
+if exactTriangleIntersection(tissueTriangles[tissueTriangleId],
+                             toolTriangles[toolTriangleId],
+                             exactContact):
+    outputIndex = atomicAdd(contactCount, 1)
+    if outputIndex &lt; maxContactCount:
+        contacts[outputIndex] = exactContact
+    else:
+        atomicAdd(overflowCount, 1)</code></pre>
+
+    <h2>9. Exact Triangle Intersection Details</h2>
+    <p>
+      <code>exactTriangleIntersection()</code> is the device function called by the exact contact kernel.
+      It uses a triangle-triangle Separating Axis Theorem style test. The function returns false as soon
+      as it finds a separating axis. If no separating axis is found, it builds a compact contact record.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 1120 470" width="100%" role="img" aria-label="Exact triangle SAT flow">
+        <defs>
+          <marker id="arrow8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="45" y="40" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="155" y="65" text-anchor="middle" font-size="14" font-weight="700">Load two triangles</text>
+        <text x="155" y="84" text-anchor="middle" font-size="12">p0, p1, p2 for each</text>
+
+        <rect x="330" y="40" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="440" y="65" text-anchor="middle" font-size="14" font-weight="700">Build edges</text>
+        <text x="440" y="84" text-anchor="middle" font-size="12">3 edges per triangle</text>
+
+        <rect x="615" y="40" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="725" y="65" text-anchor="middle" font-size="14" font-weight="700">Build axes</text>
+        <text x="725" y="84" text-anchor="middle" font-size="12">2 normals + 9 edge crosses</text>
+
+        <rect x="330" y="170" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="440" y="195" text-anchor="middle" font-size="14" font-weight="700">Project triangles</text>
+        <text x="440" y="214" text-anchor="middle" font-size="12">min/max interval on axis</text>
+
+        <rect x="615" y="170" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="725" y="195" text-anchor="middle" font-size="14" font-weight="700">Overlap test</text>
+        <text x="725" y="214" text-anchor="middle" font-size="12">separated means no contact</text>
+
+        <rect x="890" y="170" width="190" height="62" rx="8" fill="#fff3f1" stroke="#a7372a"></rect>
+        <text x="985" y="195" text-anchor="middle" font-size="14" font-weight="700">Early return false</text>
+        <text x="985" y="214" text-anchor="middle" font-size="12">if any axis separates</text>
+
+        <rect x="330" y="310" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="440" y="335" text-anchor="middle" font-size="14" font-weight="700">Best overlap axis</text>
+        <text x="440" y="354" text-anchor="middle" font-size="12">minimum penetration axis</text>
+
+        <rect x="615" y="310" width="220" height="62" rx="8" fill="#eef7f8" stroke="#126d72"></rect>
+        <text x="725" y="335" text-anchor="middle" font-size="14" font-weight="700">Build contact record</text>
+        <text x="725" y="354" text-anchor="middle" font-size="12">centroid midpoint, normal, distance</text>
+
+        <line x1="265" y1="71" x2="330" y2="71" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="550" y1="71" x2="615" y2="71" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="725" y1="102" x2="725" y2="132" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="725" y1="132" x2="440" y2="132" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="440" y1="132" x2="440" y2="170" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="550" y1="201" x2="615" y2="201" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="835" y1="201" x2="890" y2="201" stroke="#a7372a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="725" y1="232" x2="725" y2="270" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="725" y1="270" x2="440" y2="270" stroke="#5f6b7a" stroke-width="2"></line>
+        <line x1="440" y1="270" x2="440" y2="310" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+        <line x1="550" y1="341" x2="615" y2="341" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow8)"></line>
+      </svg>
+      <div class="caption">
+        Figure 6. Exact triangle intersection flow. The function tests triangle normals and edge-cross
+        axes. If all projections overlap, it creates a contact record from centroids and the best overlap axis.
+      </div>
+    </div>
+
+    <h3>9.1 Axes Tested</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Axis source</th>
+          <th>Count</th>
+          <th>Code path</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>First triangle normal</td>
+          <td>1</td>
+          <td><code>testSeparatingAxis(first, second, firstNormal, ...)</code></td>
+          <td>Separates triangles by plane normal of first triangle.</td>
+        </tr>
+        <tr>
+          <td>Second triangle normal</td>
+          <td>1</td>
+          <td><code>testSeparatingAxis(first, second, secondNormal, ...)</code></td>
+          <td>Separates triangles by plane normal of second triangle.</td>
+        </tr>
+        <tr>
+          <td>Edge cross products</td>
+          <td>9</td>
+          <td><code>cross3(firstEdges[i], secondEdges[j])</code></td>
+          <td>Separates by pairwise edge axes.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>9.2 Contact Record Contents</h3>
+    <pre><code>outContact.firstTriangleIndex  = first.triangleIndex
+outContact.secondTriangleIndex = second.triangleIndex
+outContact.pointOnFirst        = midpoint(firstCentroid, secondCentroid)
+outContact.pointOnSecond       = midpoint(firstCentroid, secondCentroid)
+outContact.normal              = bestAxis, oriented from first to second
+outContact.signedDistance      = -bestOverlap</code></pre>
+
+    <h3>9.3 Important Accuracy Note</h3>
+    <p>
+      This exact contact implementation is suitable as a current GPU detection milestone and benchmark target,
+      but it is not a full IPC-style robust contact solver. It uses a compact SAT-style overlap/contact
+      approximation. For surgical-grade fast tools, the next realism steps are swept tests, edge-edge and
+      point-triangle CCD, persistent manifolds, and then a GPU response solver.
+    </p>
+
+    <h2>10. CPU/GPU Transfer Map</h2>
+    <div class="figure">
+      <svg viewBox="0 0 1040 360" width="100%" role="img" aria-label="CPU GPU transfer map">
+        <defs>
+          <marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect x="54" y="45" width="360" height="250" rx="10" fill="#fff3f1" stroke="#a7372a" stroke-width="2"></rect>
+        <text x="234" y="78" text-anchor="middle" font-size="18" font-weight="700" fill="#a7372a">CPU / SOFA side</text>
+        <text x="234" y="116" text-anchor="middle" font-size="13">SOFA model pair emission</text>
+        <text x="234" y="144" text-anchor="middle" font-size="13">Cuda triangle extraction through SOFA accessors</text>
+        <text x="234" y="172" text-anchor="middle" font-size="13">Host DeviceTriangle packing</text>
+        <text x="234" y="214" text-anchor="middle" font-size="13">Optional DetectionOutput publication</text>
+
+        <rect x="626" y="45" width="360" height="250" rx="10" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="806" y="78" text-anchor="middle" font-size="18" font-weight="700" fill="#126d72">GPU / CUDA side</text>
+        <text x="806" y="116" text-anchor="middle" font-size="13">persistent dense-grid workspace</text>
+        <text x="806" y="144" text-anchor="middle" font-size="13">AABBs, grid buckets, candidate pairs</text>
+        <text x="806" y="172" text-anchor="middle" font-size="13">sort + unique on device</text>
+        <text x="806" y="200" text-anchor="middle" font-size="13">exact contact buffer on device</text>
+
+        <line x1="414" y1="142" x2="626" y2="142" stroke="#a7372a" stroke-width="3" marker-end="url(#arrow3)"></line>
+        <text x="520" y="128" text-anchor="middle" font-size="13" fill="#a7372a" font-weight="700">H2D: 512480 bytes/step</text>
+        <text x="520" y="164" text-anchor="middle" font-size="12" fill="#a7372a">flat tissue + blade triangle arrays</text>
+
+        <line x1="626" y1="236" x2="414" y2="236" stroke="#126d72" stroke-width="3" marker-end="url(#arrow3)"></line>
+        <text x="520" y="222" text-anchor="middle" font-size="13" fill="#126d72" font-weight="700">D2H: 16 bytes/step</text>
+        <text x="520" y="258" text-anchor="middle" font-size="12" fill="#126d72">counters only in detection-only mode</text>
+      </svg>
+      <div class="caption">
+        Figure 7. Current transfer boundary. The D2H side is now reduced to four counters for detection-only
+        benchmarks. The remaining large transfer is H2D triangle staging.
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Transfer</th>
+          <th>Direction</th>
+          <th>Payload</th>
+          <th>Verified value</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Broad phase</td>
+          <td>None for default surgical path</td>
+          <td>No root-AABB upload/download</td>
+          <td><code>avg_broad_kernel_ms = 0.000000</code></td>
+          <td>Removed as redundant latency</td>
+        </tr>
+        <tr>
+          <td>Narrow H2D</td>
+          <td>CPU to GPU</td>
+          <td><code>DeviceTriangle[]</code> for tissue and blade</td>
+          <td><code>512480 bytes/step</code></td>
+          <td>Still the main bottleneck</td>
+        </tr>
+        <tr>
+          <td>Narrow D2H, detection-only</td>
+          <td>GPU to CPU</td>
+          <td>raw count, overflow count, contact count, overflow count recheck</td>
+          <td><code>16 bytes/step</code></td>
+          <td>Full contact list copy avoided</td>
+        </tr>
+        <tr>
+          <td>Narrow D2H, SOFA response mode</td>
+          <td>GPU to CPU</td>
+          <td>counter payload plus <code>hostContactCount * sizeof(DeviceExactContact)</code></td>
+          <td>Disabled in verified benchmark</td>
+          <td>Required only when CPU SOFA response consumes contacts</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>11. Detection-Only Mode vs SOFA Response Mode</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Detection-Only Benchmark Mode</h3>
+        <pre><code>copyContactsToHost = false</code></pre>
+        <ul>
+          <li>GPU computes exact contacts.</li>
+          <li>Full <code>DeviceExactContact[]</code> stays on GPU.</li>
+          <li>CPU receives only counters for profiling and validation.</li>
+          <li>No SOFA <code>DetectionOutput</code> is published.</li>
+          <li>Correct for benchmarking detection and GPU residency.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>SOFA Compatibility Response Mode</h3>
+        <pre><code>copyContactsToHost = true</code></pre>
+        <ul>
+          <li>GPU computes exact contacts.</li>
+          <li>Contacts copy back to CPU.</li>
+          <li><code>GpuCollisionNarrowPhase</code> publishes SOFA detection outputs.</li>
+          <li>Required if using CPU/SOFA collision response.</li>
+          <li>Less GPU-resident, but compatible with existing SOFA response.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="warn">
+      <strong>Important:</strong> the verified benchmark disables collision response. SOFA prints a ContactManager
+      warning because response is intentionally absent. That warning is expected for this detection-only report.
+    </div>
+
+    <h2>12. Verified Benchmark Result</h2>
+    <p>
+      The final clean benchmark used unique labels so older CSV rows were not mixed into the result:
+      <code>_verified_planb_20260507</code>. It ran 120 SOFA iterations with 10 warmup steps and 110 measured steps.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Metric</th>
+          <th>CPU scene</th>
+          <th>GPU dense-grid scene</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Scene</td>
+          <td><code>test_cpu_one_tissue_one_blade_benchmark.py</code></td>
+          <td><code>test_gpu_one_tissue_one_blade_dense_grid_benchmark.py</code></td>
+        </tr>
+        <tr>
+          <td>Measured steps</td>
+          <td><code>110</code></td>
+          <td><code>110</code></td>
+        </tr>
+        <tr>
+          <td>Average step time</td>
+          <td><code>0.002071158 s</code></td>
+          <td><code>0.004351679 s</code></td>
+        </tr>
+        <tr>
+          <td>Average FPS</td>
+          <td><code>482.821613</code></td>
+          <td><code>229.796369</code></td>
+        </tr>
+        <tr>
+          <td>Average broad kernel time</td>
+          <td>not instrumented by plugin</td>
+          <td><code>0.000000000 ms</code></td>
+        </tr>
+        <tr>
+          <td>Average narrow kernel time</td>
+          <td>not instrumented by plugin</td>
+          <td><code>1.631790249 ms</code></td>
+        </tr>
+        <tr>
+          <td>Average H2D</td>
+          <td>not applicable</td>
+          <td><code>512480 bytes/step</code></td>
+        </tr>
+        <tr>
+          <td>Average D2H</td>
+          <td>not applicable</td>
+          <td><code>16 bytes/step</code></td>
+        </tr>
+        <tr>
+          <td>Average device allocation after warmup</td>
+          <td>not applicable</td>
+          <td><code>0 bytes/step</code></td>
+        </tr>
+        <tr>
+          <td>Candidate counts</td>
+          <td>not exported by CPU scene</td>
+          <td><code>2304 raw, 624 unique, 104 contacts</code></td>
+        </tr>
+        <tr>
+          <td>Overflow count</td>
+          <td>not applicable</td>
+          <td><code>0</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>12.1 Why CPU Is Still Faster Here</h3>
+    <p>
+      The implementation is good for the direction we want, but this benchmark does not yet measure
+      the final GPU-resident architecture. It measures a transitional integration path: SOFA still
+      owns the collision model at the CPU boundary, the plugin packs triangle records on the host,
+      uploads all triangle records every step, launches several small kernels and device operations,
+      synchronizes to read counters, and then returns to SOFA. For a small one-blade workload,
+      that fixed overhead is larger than the actual triangle-triangle work.
+    </p>
+    <p>
+      The CPU path is not doing something conceptually better. It is simply mature, local, and cheap
+      for this size: the data is already in host memory, <code>ParallelBVHNarrowPhase</code> is optimized,
+      and the scene has only one tissue surface and one blade. The GPU path will start winning when
+      the expensive parts stay resident on device and when the benchmark has enough contact work to
+      amortize launch, synchronization, deduplication, and upload overhead.
+    </p>
+
+    <div class="figure">
+      <svg viewBox="0 0 1120 430" role="img" aria-label="Why the current GPU benchmark is slower than CPU">
+        <defs>
+          <marker id="arrow9" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#2b2f36" />
+          </marker>
+        </defs>
+
+        <rect x="32" y="36" width="474" height="348" rx="10" fill="#f7fbff" stroke="#8bb8df" />
+        <text x="269" y="68" text-anchor="middle" font-size="18" font-weight="700">Current GPU Benchmark</text>
+
+        <rect x="68" y="104" width="176" height="58" rx="8" fill="#fff" stroke="#9cb3c7" />
+        <text x="156" y="129" text-anchor="middle" font-size="14" font-weight="700">CPU extraction</text>
+        <text x="156" y="148" text-anchor="middle" font-size="12">SOFA model to host vectors</text>
+
+        <rect x="294" y="104" width="176" height="58" rx="8" fill="#fff" stroke="#9cb3c7" />
+        <text x="382" y="129" text-anchor="middle" font-size="14" font-weight="700">H2D upload</text>
+        <text x="382" y="148" text-anchor="middle" font-size="12">512480 bytes per step</text>
+
+        <rect x="68" y="204" width="176" height="58" rx="8" fill="#fff" stroke="#9cb3c7" />
+        <text x="156" y="229" text-anchor="middle" font-size="14" font-weight="700">Dense grid work</text>
+        <text x="156" y="248" text-anchor="middle" font-size="12">32768 cells, many empty</text>
+
+        <rect x="294" y="204" width="176" height="58" rx="8" fill="#fff" stroke="#9cb3c7" />
+        <text x="382" y="229" text-anchor="middle" font-size="14" font-weight="700">Sort and unique</text>
+        <text x="382" y="248" text-anchor="middle" font-size="12">2304 raw to 624 unique</text>
+
+        <rect x="181" y="304" width="176" height="58" rx="8" fill="#fff" stroke="#9cb3c7" />
+        <text x="269" y="329" text-anchor="middle" font-size="14" font-weight="700">Exact contacts</text>
+        <text x="269" y="348" text-anchor="middle" font-size="12">104 contacts, counters D2H</text>
+
+        <line x1="244" y1="133" x2="294" y2="133" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="382" y1="162" x2="382" y2="204" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="294" y1="233" x2="244" y2="233" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="156" y1="262" x2="224" y2="304" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="382" y1="262" x2="314" y2="304" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+
+        <rect x="614" y="36" width="474" height="348" rx="10" fill="#f8fff8" stroke="#8ac090" />
+        <text x="851" y="68" text-anchor="middle" font-size="18" font-weight="700">Target GPU-Resident Path</text>
+
+        <rect x="650" y="104" width="176" height="58" rx="8" fill="#fff" stroke="#94bc98" />
+        <text x="738" y="129" text-anchor="middle" font-size="14" font-weight="700">Device state</text>
+        <text x="738" y="148" text-anchor="middle" font-size="12">no per-step triangle upload</text>
+
+        <rect x="876" y="104" width="176" height="58" rx="8" fill="#fff" stroke="#94bc98" />
+        <text x="964" y="129" text-anchor="middle" font-size="14" font-weight="700">Active cells only</text>
+        <text x="964" y="148" text-anchor="middle" font-size="12">skip empty grid blocks</text>
+
+        <rect x="650" y="224" width="176" height="58" rx="8" fill="#fff" stroke="#94bc98" />
+        <text x="738" y="249" text-anchor="middle" font-size="14" font-weight="700">Fused or graphed</text>
+        <text x="738" y="268" text-anchor="middle" font-size="12">less launch overhead</text>
+
+        <rect x="876" y="224" width="176" height="58" rx="8" fill="#fff" stroke="#94bc98" />
+        <text x="964" y="249" text-anchor="middle" font-size="14" font-weight="700">GPU response</text>
+        <text x="964" y="268" text-anchor="middle" font-size="12">no SOFA contact-list D2H</text>
+
+        <line x1="826" y1="133" x2="876" y2="133" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="964" y1="162" x2="964" y2="224" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+        <line x1="876" y1="253" x2="826" y2="253" stroke="#2b2f36" stroke-width="2" marker-end="url(#arrow9)" />
+
+        <text x="560" y="404" text-anchor="middle" font-size="13" fill="#58606c">
+          The current code is a correct GPU narrow-phase milestone; the missing speedup is mostly integration overhead.
+        </text>
+      </svg>
+      <p>
+        Figure 8. Performance anatomy. The benchmark still pays transitional CPU/GPU integration costs.
+        The target architecture removes those costs by keeping state, mappings, contacts, and response on GPU.
+      </p>
+    </div>
+
+    <h3>12.2 Bottleneck Diagnosis</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Bottleneck</th>
+          <th>Current evidence</th>
+          <th>Why it hurts this benchmark</th>
+          <th>Fix required for speedup</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Per-step H2D triangle upload</td>
+          <td><code>512480 bytes/step</code></td>
+          <td>The benchmark uploads the complete tissue and blade triangle records every step before any GPU work starts.</td>
+          <td>Keep positions, triangle topology, AABBs, and mapped collision geometry resident on GPU.</td>
+        </tr>
+        <tr>
+          <td>Dense grid launches over all cells</td>
+          <td><code>64 * 8 * 64 = 32768</code> cells</td>
+          <td>One block per cell is simple and parallel, but most cells are empty for one blade touching a local patch.</td>
+          <td>Compact active cells, or switch candidate generation to a sorted sparse hash list.</td>
+        </tr>
+        <tr>
+          <td>Duplicate removal cost</td>
+          <td><code>2304 raw</code> pairs become <code>624 unique</code> pairs</td>
+          <td>Sorting a few thousand pairs can cost more than simply testing them on CPU for this tiny case.</td>
+          <td>Use active-cell compaction plus canonical owner-cell rules, or keep dedup only for larger/contact-response runs.</td>
+        </tr>
+        <tr>
+          <td>Kernel launch and synchronization overhead</td>
+          <td>clear, AABB, insert, pair generation, sort/unique, exact contacts, counter copies</td>
+          <td>The useful exact work is small, so fixed GPU orchestration overhead dominates the step time.</td>
+          <td>Fuse kernels where practical and capture the stable step with CUDA graphs.</td>
+        </tr>
+        <tr>
+          <td>Only detection is GPU-resident</td>
+          <td><code>copyContactsToHost=false</code> leaves records on GPU, but SOFA still drives the frame</td>
+          <td>The benchmark proves low D2H for detection, not full GPU simulation throughput.</td>
+          <td>Move FEM state, mappings, solver, contact metadata, and final response onto the GPU path.</td>
+        </tr>
+        <tr>
+          <td>CPU baseline is strong for small scenes</td>
+          <td><code>ParallelBVHNarrowPhase</code> with host-resident data</td>
+          <td>For one blade and one modest tissue surface, CPU cache locality and mature SOFA code are hard to beat.</td>
+          <td>Benchmark larger/deeper contact scenes after removing residency and launch overhead.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      So the conclusion is not that the GPU implementation is bad. The conclusion is sharper:
+      the current dense-grid narrow phase is architecturally useful and correctness-friendly, but
+      the benchmark is too small and too CPU-integrated to expose a speedup. The next speed milestone
+      is not another triangle test; it is eliminating the per-step upload, avoiding empty-cell work,
+      reducing synchronization, and benchmarking after the collision geometry is genuinely device-owned.
+    </p>
+
+    <h2>13. Memory Residency and Allocation Behavior</h2>
+    <p>
+      The dense-grid backend uses a persistent <code>DenseGridWorkspace</code>. It grows buffers on demand
+      and then reuses them across frames. In the verified benchmark, the first GPU row allocated
+      <code>138247948</code> bytes because the workspace had to be created for the larger per-cell capacities.
+      After that, allocation was <code>0</code> bytes per step, and the measured post-warmup average was
+      <code>0</code>.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Buffer</th>
+          <th>Role</th>
+          <th>Lifetime</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>tissueTriangles</code>, <code>toolTriangles</code></td><td>hot triangle inputs</td><td>persistent, overwritten each step</td></tr>
+        <tr><td><code>tissueAabbs</code>, <code>toolAabbs</code></td><td>per-triangle inflated AABBs</td><td>persistent, recomputed each step</td></tr>
+        <tr><td><code>grid</code></td><td>per-cell tissue/tool counters</td><td>persistent, cleared each step</td></tr>
+        <tr><td><code>cellTissueIds</code>, <code>cellToolIds</code></td><td>flat bucket storage</td><td>persistent, rewritten each step</td></tr>
+        <tr><td><code>candidatePairs</code></td><td>raw and unique encoded pairs</td><td>persistent, sorted in place</td></tr>
+        <tr><td><code>contacts</code></td><td>exact contact records</td><td>persistent, remains device-side in detection-only mode</td></tr>
+        <tr><td><code>candidateCount</code>, <code>contactCount</code>, <code>overflowCount</code></td><td>device counters</td><td>persistent, reset each step</td></tr>
+      </tbody>
+    </table>
+
+    <h2>14. Mapping and Data Ownership</h2>
+    <p>
+      In the benchmark scenes, the collision surfaces are direct <code>CudaVec3f</code> triangle surfaces,
+      so there is no separate render mesh or simulation-to-collision mapping. In the broader surgical
+      architecture, the intended mapping is still:
+    </p>
+    <pre><code>simulation tet mesh on GPU
+    -&gt; GPU collision surface / collision tet mesh
+    -&gt; GPU render mesh
+    -&gt; GPU dense-grid detection
+    -&gt; GPU response later</code></pre>
+
+    <div class="figure">
+      <svg viewBox="0 0 1040 280" width="100%" role="img" aria-label="Future GPU mapping workflow">
+        <defs>
+          <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 Z" fill="#5f6b7a"></path>
+          </marker>
+        </defs>
+        <rect x="38" y="80" width="170" height="70" rx="8" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="123" y="108" text-anchor="middle" font-size="14" font-weight="700">GPU tissue state</text>
+        <text x="123" y="129" text-anchor="middle" font-size="12">positions, velocities</text>
+
+        <rect x="265" y="30" width="190" height="70" rx="8" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="360" y="58" text-anchor="middle" font-size="14" font-weight="700">Collision mapping</text>
+        <text x="360" y="79" text-anchor="middle" font-size="12">sim tet to collision mesh</text>
+
+        <rect x="265" y="150" width="190" height="70" rx="8" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="360" y="178" text-anchor="middle" font-size="14" font-weight="700">Render mapping</text>
+        <text x="360" y="199" text-anchor="middle" font-size="12">sim tet to visual mesh</text>
+
+        <rect x="515" y="30" width="190" height="70" rx="8" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="610" y="58" text-anchor="middle" font-size="14" font-weight="700">Dense-grid detection</text>
+        <text x="610" y="79" text-anchor="middle" font-size="12">device candidate pairs</text>
+
+        <rect x="770" y="30" width="190" height="70" rx="8" fill="#eef7f8" stroke="#126d72" stroke-width="2"></rect>
+        <text x="865" y="58" text-anchor="middle" font-size="14" font-weight="700">GPU response later</text>
+        <text x="865" y="79" text-anchor="middle" font-size="12">consume contact buffers</text>
+
+        <line x1="208" y1="115" x2="265" y2="65" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow4)"></line>
+        <line x1="208" y1="115" x2="265" y2="185" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow4)"></line>
+        <line x1="455" y1="65" x2="515" y2="65" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow4)"></line>
+        <line x1="705" y1="65" x2="770" y2="65" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow4)"></line>
+      </svg>
+      <div class="caption">
+        Figure 9. Intended GPU-resident mapping architecture. The current benchmark uses direct collision surfaces;
+        future tissue simulation should keep mapping outputs on the GPU before dense-grid detection.
+      </div>
+    </div>
+
+    <h2>15. Fallback and Correctness Guards</h2>
+    <ul>
+      <li>If dense-grid capacity overflows, the narrow phase rejects the grid result and can fall back for correctness.</li>
+      <li>If models are unsupported or not CUDA triangle models, the legacy SOFA/BVH path remains available.</li>
+      <li><code>allowCPUFallback=true</code> keeps the scene from failing hard during unsupported combinations.</li>
+      <li>Overflow count is exported and was verified as <code>0</code> in the final benchmark.</li>
+      <li>Dedup is enabled by default with <code>deduplicatePairs=true</code>.</li>
+    </ul>
+
+    <h2>16. Verification Checklist</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Check</th>
+          <th>Result</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Plugin build and install in WSL</td><td><span class="ok">Passed</span>. Built and installed <code>libSofaGpuCollision.so</code>.</td></tr>
+        <tr><td>Scene syntax check</td><td><span class="ok">Passed</span>. <code>python -m py_compile</code> passed for the new benchmark scenes.</td></tr>
+        <tr><td>Final CPU benchmark</td><td><span class="ok">Passed</span>. 120 iterations, 110 measured.</td></tr>
+        <tr><td>Final GPU benchmark</td><td><span class="ok">Passed</span>. 120 iterations, 110 measured.</td></tr>
+        <tr><td>Dense-grid fallback warning in final run</td><td><span class="ok">None observed</span>. The earlier capacity overflow was fixed by increasing per-cell and candidate capacities.</td></tr>
+        <tr><td>Broad-phase kernel removed from default path</td><td><span class="ok">Verified</span>. <code>avg_broad_kernel_ms = 0.000000000</code>.</td></tr>
+        <tr><td>Duplicate removal</td><td><span class="ok">Verified</span>. <code>2304</code> raw pairs reduced to <code>624</code> unique pairs.</td></tr>
+        <tr><td>No contact-list D2H in detection-only mode</td><td><span class="ok">Verified</span>. <code>avg_device_to_host_bytes = 16</code>.</td></tr>
+        <tr><td>Persistent allocation after warmup</td><td><span class="ok">Verified</span>. <code>avg_device_allocation_bytes = 0</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>17. Final Takeaways</h2>
+    <ul>
+      <li>The redundant object-level GPU AABB broad phase is no longer active for the surgical two-object path.</li>
+      <li>The SOFA broad phase remains only as a contract to emit the tissue/tool object pair.</li>
+      <li>The dense 3D grid inside narrow phase is now the real primitive-level broad filter.</li>
+      <li>Candidate duplicate removal is implemented and verified.</li>
+      <li>Detection-only GPU mode avoids full contact D2H transfer; only counters copy back.</li>
+      <li>The remaining major transfer is CPU-staged triangle H2D upload.</li>
+      <li>For small one-tool scenes, CPU can still be faster because the GPU path has staging, kernel launch, sort, and synchronization overhead.</li>
+      <li>The next performance milestone is direct device-buffer integration for SOFA CUDA collision geometry and later GPU response consumption of the contact buffer.</li>
+    </ul>
+
+    <p class="small">
+      Source cross-checks used for this report: <code>GpuCollisionBroadPhase.cpp</code>,
+      <code>GpuCollisionNarrowPhase.cpp</code>, <code>GpuCollisionBackend.cu</code>,
+      <code>test_gpu_one_tissue_one_blade_dense_grid_benchmark.py</code>, and verified benchmark summaries
+      under <code>/opt/sofa/benchmark_logs</code>.
+    </p>
+  </main>
+</body>
+</html>

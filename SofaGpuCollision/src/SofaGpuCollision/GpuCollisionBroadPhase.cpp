@@ -114,6 +114,7 @@ GpuCollisionBroadPhase::GpuCollisionBroadPhase()
     , d_allowCpuFallback(initData(&d_allowCpuFallback, true, "allowCPUFallback", "Use the SOFA CPU broad phase if GPU execution is unavailable."))
     , d_logBackendStatus(initData(&d_logBackendStatus, true, "logBackendStatus", "Log the selected broad phase backend during init."))
     , d_logBoxesOnce(initData(&d_logBoxesOnce, false, "logBoxesOnce", "Log the first-frame root AABBs collected for GPU broad phase."))
+    , d_useObjectAabbCulling(initData(&d_useObjectAabbCulling, false, "useObjectAabbCulling", "Use object-level GPU AABB culling before narrow phase. Disable this for one tissue/one tool surgical scenes."))
 {
 }
 
@@ -211,6 +212,47 @@ void GpuCollisionBroadPhase::endBroadPhase()
 
         this->cmPairs.emplace_back(cm1, cm2);
     };
+
+    if (!d_useObjectAabbCulling.getValue())
+    {
+        std::vector<CollisionModelEntry> entries;
+        entries.reserve(m_pendingModels.size());
+
+        for (auto* cm : m_pendingModels)
+        {
+            if (cm == nullptr || cm->empty())
+            {
+                continue;
+            }
+
+            CollisionModelEntry entry;
+            entry.firstCollisionModel = cm;
+            entry.lastCollisionModel = cm->getLast();
+            entries.push_back(entry);
+
+            if (doesSelfCollide(cm))
+            {
+                this->cmPairs.emplace_back(cm, cm);
+            }
+        }
+
+        for (std::size_t i = 0; i < entries.size(); ++i)
+        {
+            for (std::size_t j = 0; j < i; ++j)
+            {
+                const auto& a = entries[i];
+                const auto& b = entries[j];
+                appendPotentialPair(a.firstCollisionModel, a.lastCollisionModel, b.firstCollisionModel, b.lastCollisionModel);
+            }
+        }
+
+        stageSnapshot.inputPrimitiveCount = static_cast<std::uint32_t>(entries.size());
+        stageSnapshot.outputPairCount = static_cast<std::uint32_t>(this->cmPairs.size());
+        stageSnapshot.wallMilliseconds =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - phaseStart).count();
+        profiling::recordBroadPhase(stageSnapshot);
+        return;
+    }
 
     std::vector<CollisionModelEntry> entries;
     entries.reserve(m_pendingModels.size());

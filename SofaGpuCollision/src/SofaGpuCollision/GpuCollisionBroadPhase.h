@@ -31,6 +31,7 @@ private:
     DataBool d_allowCpuFallback;
     DataBool d_logBackendStatus;
     DataBool d_logBoxesOnce;
+    DataBool d_useObjectAabbCulling;
 
     std::vector<sofa::core::CollisionModel*> m_pendingModels;
     bool m_backendAvailable { false };
