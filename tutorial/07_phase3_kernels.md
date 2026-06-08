@@ -15,11 +15,15 @@ The 7 operations, in order:
 1. resetDenseGridKernel              clear the grid and counters
 2. cudaMemset(pairHashKeys, 0xff)    clear the dedupe hash table
 3. insertIndexedTrianglesKernel      insert tissue triangles into cells
-4. insertIndexedTrianglesKernel      insert blade triangles into cells
-5. generateDenseGridUniqueCandidatePairsKernel   find + dedupe candidate pairs
+4. insertIndexedTrianglesKernel      insert blade triangles + build active-cell list
+5. generateActiveDenseGridUniqueCandidatePairsKernel   find + dedupe pairs (over ~30 active cells)
 6. resetProximityCountersKernel      zero the contact counters
 7. featureBasedProximityKernel       the actual geometry math
 ```
+
+(Operation 5 is `generateActive...` when `useToolActiveCellGeneration` is on,
+which is the default. With it off, the same slot runs the all-cells
+`generateDenseGridUniqueCandidatePairsKernel` instead — see §7.4.)
 
 Let's take them one at a time.
 
@@ -134,46 +138,105 @@ the GPU, so the kernel spends its time starting up, not computing. This is a
 known small inefficiency for tiny meshes (see `guide/plan.md` §5.13), but it's
 not worth fixing because it's tiny in absolute terms.
 
----
+### The blade insert also builds the active-cell list (Phase 15)
 
-## 7.4 Kernel 5 — `generateDenseGridUniqueCandidatePairsKernel`
-
-**Job:** scan the cells, form candidate pairs, and deduplicate them. This is the
-**most expensive kernel** (~300 µs) because it touches all 32,768 cells.
-
-**Launch shape:** one block per cell (32,768 blocks), 256 threads each.
+The blade insert (kernel 4, `insertTissue=false`) does one extra thing when
+`useToolActiveCellGeneration` is on (the default). Right after a blade triangle
+claims a slot in a cell, it checks: *am I the first blade triangle in this cell,
+and does this cell already have tissue?* If so, it appends the cell's ID to an
+"active list":
 
 ```cpp
-generateDenseGridUniqueCandidatePairsKernel<<<32768, 256>>>(grid, cellTissueIds,
-    cellToolIds, config, candidatePairs, pairHashKeys, ...);
+const std::uint32_t localIndex = atomicAdd(&grid[cellId].toolCount, 1u);
+if (localIndex < bucketCapacity) {
+    cellIds[cellId * bucketCapacity + localIndex] = triangleId;
+    // NEW: register this as a mixed cell, exactly once
+    if (buildToolActiveList && !insertTissue && localIndex == 0u
+        && grid[cellId].tissueCount > 0u) {
+        const std::uint32_t a = atomicAdd(activeCellCount, 1u);
+        activeCellIds[a] = cellId;
+    }
+}
+```
+
+Two facts make this correct:
+- `localIndex == 0` means "first blade triangle in this cell," so each cell is
+  appended **at most once** (automatic dedup).
+- `grid[cellId].tissueCount > 0` is safe to read because the tissue insert
+  (kernel 3) fully finishes before the blade insert (kernel 4) starts — CUDA
+  runs the kernels in queue order. So this captures exactly the **mixed** cells.
+
+The list (~30 entries) is the input to kernel 5. Building it here costs ~30
+extra `atomicAdd`s piggybacked on a kernel that was already running and mostly
+idle — effectively free. This is the trick that lets kernel 5 skip the 32,738
+empty cells.
+
+---
+
+## 7.4 Kernel 5 — candidate generation (active-cell, by default)
+
+**Job:** for each mixed cell, form candidate pairs and deduplicate them.
+
+This kernel has two variants, and which one runs depends on
+`useToolActiveCellGeneration`:
+
+- **Default (flag on): `generateActiveDenseGridUniqueCandidatePairsKernel`** —
+  iterates only the ~30 cells in the active list. Launched with a small fixed
+  grid (1,024 blocks) that grid-strides over the list. **~8 µs.**
+- **Fallback (flag off): `generateDenseGridUniqueCandidatePairsKernel`** — one
+  block per cell, all 32,768 cells. Most blocks find an empty cell and exit, but
+  just *visiting* 32,768 cells costs **~300 µs**. This used to be the single
+  most expensive kernel in the whole pipeline.
+
+**Default launch shape:** a fixed 1,024 blocks, 256 threads each. The kernel
+reads the active-cell count *from GPU memory* and grid-strides over it, so the
+CPU never needs to know how many active cells there are (no readback, no sync —
+same idea as the over-launch in §7.6).
+
+```cpp
+generateActiveDenseGridUniqueCandidatePairsKernel<<<1024, 256>>>(grid,
+    activeCellIds, activeCellCount, cellTissueIds, cellToolIds, config,
+    candidatePairs, pairHashKeys, ...);
 ```
 
 **What each block does:**
 
 ```cpp
-const std::uint32_t cellId = blockIdx.x;       // this block owns one cell
-const auto bucket = grid[cellId];
-const std::uint32_t tissueCount = min(bucket.tissueCount, maxTissueTrianglesPerCell);
-const std::uint32_t toolCount   = min(bucket.toolCount,   maxToolTrianglesPerCell);
-const std::uint64_t totalPairs  = tissueCount * toolCount;
+const std::uint32_t activeCount = *activeCellCount;     // read from GPU memory
+// grid-stride: block b handles active cells b, b+1024, b+2048, ...
+for (uint32_t i = blockIdx.x; i < activeCount; i += gridDim.x) {
+    const std::uint32_t cellId = activeCellIds[i];      // a guaranteed-mixed cell
+    const auto bucket = grid[cellId];
+    const std::uint32_t tissueCount = min(bucket.tissueCount, maxTissueTrianglesPerCell);
+    const std::uint32_t toolCount   = min(bucket.toolCount,   maxToolTrianglesPerCell);
+    const std::uint64_t totalPairs  = tissueCount * toolCount;
 
-// each thread handles some of the pairs in this cell
-for (localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x) {
-    const std::uint32_t tissueLocal = localPair / toolCount;
-    const std::uint32_t toolLocal   = localPair % toolCount;
-    const std::uint32_t tissueTriangleId = cellTissueIds[cellId*128 + tissueLocal];
-    const std::uint32_t toolTriangleId   = cellToolIds  [cellId*64  + toolLocal];
+    for (localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x) {
+        const std::uint32_t tissueLocal = localPair / toolCount;
+        const std::uint32_t toolLocal   = localPair % toolCount;
+        const std::uint32_t tissueTriangleId = cellTissueIds[cellId*128 + tissueLocal];
+        const std::uint32_t toolTriangleId   = cellToolIds  [cellId*64  + toolLocal];
 
-    atomicAdd(rawCandidateCount, 1u);
-    insertUniqueCandidatePair(encodeCandidatePair(tissueTriangleId, toolTriangleId), ...);
+        atomicAdd(rawCandidateCount, 1u);
+        insertUniqueCandidatePair(encodeCandidatePair(tissueTriangleId, toolTriangleId), ...);
+    }
 }
 ```
 
-For a cell with no tissue or no tool triangles, `totalPairs = 0` and the block
-does nothing (it exits immediately). This is why most of the 32,768 blocks are
-idle — only the few "mixed" cells near the blade have work. That's also why SM
-throughput on this kernel is only ~26%: most blocks are empty. (It's still the
-slowest kernel because just *visiting* 32,768 cells takes time.)
+The all-cells fallback is identical *except* its outer line is
+`const cellId = blockIdx.x;` (each block owns one cell, no active list, all
+32,768 cells). The inner pairing + dedupe logic is the same in both.
+
+Because the active variant only ever visits cells that are guaranteed to be
+mixed, it produces **exactly the same candidate pairs** as the all-cells
+variant — it just skips the ~32,738 cells that could never contribute a pair.
+That's why the contact output is bit-identical between the two (verified by
+A/B; `guide/plan.md` §5.15).
+
+> **A correctness note from the field.** When this optimization was added, a
+> large-scene A/B (a subdivided blade producing 322,560 candidate pairs)
+> revealed a *separate* latent bug in kernel 7 — see §7.6. The active-cell
+> change was correct; it just exposed something else.
 
 ### Encoding a pair into one number
 
@@ -269,41 +332,55 @@ Trivial cost.
 contact if they're within `contactDistance`. This is the mathematical core; file
 08 explains the geometry. Here we cover the kernel structure.
 
-**Launch shape — the over-launch trick:**
+**Launch shape — over-launch + grid-stride:**
 
 ```cpp
-constexpr std::uint32_t kFbpMaxBlocks = 256;
-const std::uint32_t fbpUpperPairs = min(maxCandidatePairs, kFbpMaxBlocks * 256);  // 65,536
-const std::uint32_t fbpBlocks = max(1u, fbpUpperPairs / 256);   // 256 blocks
-featureBasedProximityKernel<<<256, 256>>>(...);   // 65,536 threads
+constexpr std::uint32_t kFbpMaxBlocks = 1024;
+const std::uint32_t fbpUpperPairs = min(maxCandidatePairs, kFbpMaxBlocks * 256);
+const std::uint32_t fbpBlocks = max(1u, fbpUpperPairs / 256);   // up to 1024 blocks
+featureBasedProximityKernel<<<1024, 256>>>(...);
 ```
 
-Here's the subtle part. We have only ~624 candidate pairs, but we launch
-**65,536 threads** (256 blocks × 256). Why so many? Because the CPU doesn't
-*know* how many pairs there are — that count (`candidateCount`) lives on the GPU.
-To find out, the CPU would have to copy it back (a synchronizing `cudaMemcpy`),
-which would stall the pipeline.
-
-Instead, we **over-launch** a fixed, generous number of threads and let each
-thread check whether it actually has work:
+Here's the subtle part. The CPU doesn't *know* how many candidate pairs there
+are — that count (`candidateCount`) lives on the GPU. To find out, the CPU would
+have to copy it back (a synchronizing `cudaMemcpy`), which would stall the
+pipeline. So instead of launching exactly the right number of threads, we launch
+a **fixed, generous grid** and let the kernel figure out the work count itself —
+on the GPU, with no readback:
 
 ```cpp
-const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-const std::uint32_t pairCount = *candidatePairCount;   // read from GPU memory
-if (tid >= pairCount) return;     // ← 99% of threads exit here, in 1 instruction
+const std::uint32_t pairCount = *candidatePairCount;            // read from GPU memory
+const std::uint32_t stride = gridDim.x * blockDim.x;            // total threads launched
+for (uint32_t idx = blockIdx.x*blockDim.x + threadIdx.x; idx < pairCount; idx += stride) {
+    const std::uint64_t pair = candidatePairs[idx];
+    ... process this pair ...
+}
 ```
 
-Thread 0 through 623 do real work; threads 624 through 65,535 immediately exit.
-The wasted threads cost almost nothing (one comparison each), and in exchange we
-**eliminate a synchronous readback**. This single design choice is what took the
-FBP path from 109 FPS (with the readback) to 775 FPS (without). The trade-off
-shows up in Nsight as low SM throughput (~5%) — most threads do nothing — but it
-buys a huge latency win.
+This is a **grid-stride loop**, and it does two jobs at once:
 
-**What each working thread does:**
+1. **No sync needed.** The CPU launches a fixed grid; the kernel reads
+   `pairCount` from GPU memory and only the threads with `idx < pairCount` do
+   work. The CPU never learns the count, so there's no readback and no stall.
+   This is what took the FBP path from 109 FPS (with the readback) to ~940 FPS
+   (without) — together with the active-cell generation of §7.4.
+
+2. **Correctness at any scale.** This is the important part, and it was a real
+   bug for a while. The grid is a fixed 1,024 blocks × 256 = 262,144 threads.
+   A small scene has 624 pairs (fewer than the threads), so each thread does at
+   most one pair. But a **large** scene can produce *more* pairs than threads —
+   the large-tissue benchmark has **322,560 pairs**. Without the `for` loop,
+   each thread would do exactly one pair and the kernel would silently process
+   only the first 262,144 and **drop the rest**. The grid-stride `for` makes
+   each thread loop back and pick up `idx + stride`, `idx + 2·stride`, … until
+   every pair is covered. (The earlier version had no loop — it just did
+   `if (tid >= pairCount) return; ... candidatePairs[tid]` — and dropped ~80% of
+   pairs on the large scene. That was Phase 17's fix; see `guide/plan.md` §5.17.)
+
+**What each loop iteration does:**
 
 ```cpp
-const std::uint64_t pair = candidatePairs[tid];
+const std::uint64_t pair = candidatePairs[idx];
 const std::uint32_t aIdx = pair >> 32;          // tissue triangle ID
 const std::uint32_t bIdx = pair & 0xffffffff;   // blade triangle ID
 
@@ -313,7 +390,7 @@ const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx
 // 6 vertex-face tests + 9 edge-edge tests (file 08), keep the closest
 // ... find bestDistSq, bestKind, bestPoints, bestBarycentrics ...
 
-if (bestDistSq > contactDistance * contactDistance) return;   // too far → no contact
+if (bestDistSq > contactDistance * contactDistance) continue;   // too far → next pair
 
 // emit a contact
 const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
@@ -321,34 +398,45 @@ contacts[outIdx] = { aIdx, bIdx, featureKind, barycentrics, points, normal, dist
 atomicAdd(/* the matching vf/fv/ee counter */, 1u);
 ```
 
-Each thread unpacks its pair back into the two triangle IDs, looks up both
+Each iteration unpacks the pair back into the two triangle IDs, looks up both
 triangles (again through the zero-copy position pointers), runs the closest-
 feature math, and — if the triangles are within 0.03 — writes a
 `DeviceProximityContact` to the output buffer. The `atomicAdd(contactCount, 1)`
-hands each emitting thread a unique output slot.
+hands each emitting thread a unique output slot. Note the `continue` (not
+`return`): a thread that finds "too far" moves on to its next strided pair
+rather than exiting.
 
 ---
 
 ## 7.7 The whole cascade, with timings
 
 Putting it together for the one-tissue/one-blade FBP run (validation mode,
-where the kernel time is actually measured):
+where the kernel time is actually measured), **with the default active-cell
+generation**:
 
 ```text
-Op                                       Threads      ~Time     What
-1. resetDenseGridKernel                  32,768       2.5 µs    clear grid
-2. cudaMemset (hash table)               —            ~1 µs     clear dedupe table
-3. insertIndexedTrianglesKernel (tissue) 12,800       28 µs     fill tissue buckets
-4. insertIndexedTrianglesKernel (blade)  12           30 µs     fill tool buckets (launch-bound)
-5. generateUniqueCandidatePairs          32,768 blks  300 µs    pairs + dedupe (the heavy one)
-6. resetProximityCountersKernel          1            ~0 µs     zero counters
-7. featureBasedProximityKernel           65,536       17 µs     the geometry math
+Op                                       Launch        ~Time     What
+1. resetDenseGridKernel                  32,768 thr    2.5 µs    clear grid
+2. cudaMemset (hash table)               —             ~1 µs     clear dedupe table
+3. insertIndexedTrianglesKernel (tissue) 12,800 thr    28 µs     fill tissue buckets
+4. insertIndexedTrianglesKernel (blade)  12 thr        30 µs     fill tool buckets + active list (launch-bound)
+5. generateActiveUniqueCandidatePairs    1,024 blks     8 µs     pairs + dedupe over ~30 active cells
+6. resetProximityCountersKernel          1 thr         ~0 µs     zero counters
+7. featureBasedProximityKernel           1,024 blks    17 µs     the geometry math
+                                                       ──────
+                                          total        ~87 µs
 ```
 
-The candidate-generation kernel (5) dominates because it visits every cell. The
-math kernel (7) is cheap because there are only 624 pairs. This is the opposite
-of what beginners expect — "the math must be the slow part" — but it isn't; the
-*spatial bookkeeping* is.
+Compare to the **old all-cells path** (flag off), where op 5 was a 32,768-block
+kernel taking **~300 µs** — about 80% of the whole frame. Phase 15 collapsed it
+to ~8 µs, and now no single kernel dominates: the tissue/blade inserts and the
+FBP math are the largest pieces, all in the tens of microseconds.
+
+Two beginner-surprising facts survive:
+- The *math* kernel (7) is cheap (17 µs) because there are only 624 pairs — the
+  geometry was never the bottleneck.
+- The *spatial bookkeeping* used to be the whole cost, and the fix wasn't a
+  faster algorithm — it was *not visiting cells that can't matter*.
 
 (In the production fast path with no readback, the CPU never waits for any of
 this. It fires all 7 operations and returns. The numbers above are from a
@@ -360,10 +448,13 @@ validation run that does sync, so the per-kernel times are observable.)
 
 ```text
 The backend launches 7 GPU operations, all non-blocking:
-  reset grid → clear hash → insert tissue → insert blade →
-  generate+dedupe pairs → reset counters → feature-based proximity math.
+  reset grid → clear hash → insert tissue → insert blade (+ build active list) →
+  generate+dedupe pairs (over ~30 active cells) → reset counters → FBP math.
 Atomics make the parallel inserts and dedupe safe.
-The over-launch trick lets the math kernel run without a sync to learn the pair count.
+The blade insert builds the mixed-cell list for free, so generation skips the
+  ~32,738 empty cells (Phase 15) — a 38× win on that kernel.
+The over-launch + grid-stride lets the math kernel run without a sync to learn
+  the pair count AND stay correct when there are more pairs than threads (Phase 17).
 Result: ~624 contacts' worth of geometry evaluated, contacts written to VRAM.
 ```
 

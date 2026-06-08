@@ -233,8 +233,9 @@ output-mode switches and the dense-grid configuration.
 | `detailedProfiling` | false | Per-stage CUDA event timings + NVTX ranges (adds syncs) |
 | `readCountersWhenContactsStayOnDevice` | false | D2H read counters in detection-only mode (for validation) |
 | `computeDeviceContactsWhenContactsStayOnDevice` | false | Run exact-contact kernel even when contacts stay device-side |
-| `compactActiveCells` | **false** | Experimental: compact mixed cells before candidate generation. Regressed on GTX 1650 Ti, stays disabled |
-| `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed on GTX 1650 Ti |
+| `compactActiveCells` | **false** | Experimental: compact mixed cells via a separate full-grid scan. Regressed on GTX 1650 Ti, superseded by `useToolActiveCellGeneration` |
+| `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed; mutually exclusive with `useToolActiveCellGeneration` |
+| `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |
 | `proximityComputeBarycentrics` | true | Populate ProximityContact barycentric weights |
@@ -547,21 +548,28 @@ insertIndexedPointsKernel                                  (Phase 12 NEW)
     The AABB is the (point ± contactDistance) cube. Writes to cellToolIds.
 
 generateDenseGridUniqueCandidatePairsKernel
-    One block per cell, threads stride over (tissueCount * toolCount) pair products.
+    One block per cell (ALL cells), threads stride over (tissueCount * toolCount) pair products.
     Each pair is encoded as uint64 = (tissueId << 32) | toolId. atomicCAS into pairHashKeys
     table; survivors atomicAdd into candidatePairs[] / candidateCount.
+    NOTE: superseded by the active-cell variant below when useToolActiveCellGeneration=true (default).
 
-featureBasedProximityKernel                                (Phase 11)
-    One thread per candidate pair. Loads both triangles via indexedTriangleAt.
-    Runs 6 VF tests (3 verts of A vs face B, 3 verts of B vs face A) and
-    9 EE tests (3 edges A × 3 edges B), tracking the closest feature pair.
-    If best distance ≤ contactDistance: atomicAdd into contactCount;
+generateActiveDenseGridUniqueCandidatePairsKernel          (Phase 15, DEFAULT)
+    Same per-cell pair logic, but iterates only the tool-built active-cell list
+    (device-reads *activeCellCount, grid-strides). Launched <<<1024, 256>>> instead of
+    <<<32768, 256>>>. ~38x faster than the all-cells variant on the one-tissue scene.
+
+featureBasedProximityKernel                                (Phase 11; grid-stride since §5.17)
+    GRID-STRIDES over all candidate pairs (for idx = tid; idx < pairCount; idx += stride).
+    Loads both triangles via indexedTriangleAt. Runs 6 VF + 9 EE tests, keeps the closest
+    feature pair. If best distance ≤ contactDistance: atomicAdd into contactCount;
     write DeviceProximityContact; atomicAdd into vfCount/fvCount/eeCount.
+    The grid-stride is REQUIRED for correctness — the launch grid is a fixed saturation
+    target (1024 blocks), and large scenes produce far more pairs than launched threads.
 
-featureBasedVertexTriangleProximityKernel                 (Phase 12 NEW)
-    One thread per (triangleId, vertexId) candidate pair. Loads the triangle and the vertex.
+featureBasedVertexTriangleProximityKernel                 (Phase 12; grid-stride since §5.17)
+    GRID-STRIDES over all (triangleId, vertexId) candidate pairs. Loads the triangle and vertex.
     If selfCollisionVertexExclusionStride != 0 and vertexId matches one of the triangle's
-    three corner indices: return early. Otherwise runs closestPointOnTriangleBary once,
+    three corner indices: skip (continue). Otherwise runs closestPointOnTriangleBary once,
     emits a VertexFace ProximityContact when distance ≤ contactDistance.
 
 resetProximityCountersKernel
@@ -918,3 +926,163 @@ Three follow-up items completed after the initial Phase 12 wiring:
   `featureBasedProximityKernel` is register-bound (68 regs/thread → ~50%
   occupancy cap) but cheap (~17 µs); future tuning options are documented
   but not urgent.
+
+---
+
+## 15. Generation + event optimizations (IMPLEMENTED 2026-05-25)
+
+Two optimizations target the measured bottleneck of the tri-tri FBP fast
+path. **Both are now implemented** (Phase 15 opt-in via
+`useToolActiveCellGeneration`; Phase 16 always on). Measured result:
+one-tissue fast path **221 → 943 FPS (4.3×)**, generation kernel
+**300 µs → 7.9 µs (38×)**, contact counts bit-identical. Full numbers in
+`guide/plan.md` §5.15-5.16 and `reports/gpu_collision_phase15_16_optimization_20260525.md`.
+This section documents the *mechanisms* as built.
+
+### 15.1  Where the time actually goes (the motivation)
+
+Per `reports/end_to_end_verification_20260525.md` §7, the tri-tri FBP path
+spends ~380 µs on the GPU, of which **~300 µs (≈80%) is
+`generateDenseGridUniqueCandidatePairsKernel`**, plus ~450 µs of CPU/sync
+overhead on top, of which **~80 µs is per-frame CUDA event churn** inside
+the broad-cull function.
+
+```text
+GPU kernel time (≈380 µs):
+  generateDenseGridUniqueCandidatePairsKernel   ~300 µs  ← 80%, the target
+  insertIndexedTrianglesKernel (blade)           ~30 µs  (launch-bound)
+  insertIndexedTrianglesKernel (tissue)          ~29 µs
+  featureBasedProximityKernel                    ~17 µs
+  resetDenseGridKernel + cudaMemset              ~5 µs
+
+CPU overhead (wall − kernel ≈ 450 µs):
+  cudaEventCreate/Destroy ×4 (broad cull)        ~80 µs  ← the target
+  7 kernel-launch API calls                      ~40 µs
+  C++ setup + extractors                         ~50-100 µs
+  SOFA dispatch + NVTX + mutex + stats           ~100+ µs
+  inter-kernel stream gaps                       ~150 µs
+```
+
+### 15.2  Planned: tool-active-cell candidate generation (§5.15)
+
+**Root cause.** `generateDenseGridUniqueCandidatePairsKernel` launches
+`<<<cellCount, 256>>>` = one block per cell for all 32 768 cells. The
+blade occupies ~30 cells, so ~99% of blocks read an empty bucket and exit.
+The 300 µs is block-scheduling overhead, not pair work (26% SM throughput).
+
+**Mechanism.** Build the **mixed-cell list during the tool insert** — no
+separate scan. In `insertTriangleAabbIntoGrid`, for a tool triangle, the
+first one to claim slot 0 in a cell that already has tissue appends the
+cell id:
+
+```cpp
+const uint32_t localIndex = atomicAdd(&grid[cellId].toolCount, 1u);
+if (buildToolActiveList && localIndex == 0u && grid[cellId].tissueCount > 0u)
+    activeCellIds[atomicAdd(activeCellCount, 1u)] = cellId;   // dedup'd, can't overflow
+```
+
+This works because (a) tissue insert runs before tool insert on the
+serialized stream so `tissueCount` is final, (b) `localIndex == 0`
+deduplicates, (c) `activeCellIds` is already sized to `cellCount`.
+
+Generation then reuses the **existing**
+`generateActiveDenseGridUniqueCandidatePairsKernel`, which device-reads
+`*activeCellCount` and grid-strides over the active list. Launch a fixed
+modest grid (`<<<256, 256>>>`) — no host readback — so the ~30 active cells
+run in the first ~30 blocks and the rest exit immediately. **128× fewer
+launched blocks.**
+
+**How this differs from `compactActiveDenseGridCellsKernel` (the regressed
+`compactActiveCells`).** That kernel scans **all 32 768 cells** in a
+separate pass to find mixed cells — the scan reads the whole 256 KB grid,
+costing what it saves. The new design **never scans all cells**; it builds
+the list as a side effect of the insert it already runs.
+
+**Ordering dependency.** Requires tissue-insert-before-tool-insert, so it
+is mutually exclusive with `batchTriangleInsert` (the fused-insert
+experiment). The backend must reject the combination.
+
+**New flag.** `useToolActiveCellGeneration` (`DenseGridConfig` + narrow-
+phase Data field + `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION`), distinct from
+`compactActiveCells`.
+
+Updated launch sequence when enabled:
+
+```text
+1. resetDenseGridKernel                       (also zeroes activeCellCount)
+2. cudaMemset(pairHashKeys, 0xff)
+3. insertIndexedTrianglesKernel (tissue)
+4. insertIndexedTrianglesKernel (tool, buildToolActiveList=true)  ← builds active list
+5. generateActiveDenseGridUniqueCandidatePairsKernel<<<256,256>>> ← ~30 cells, not 32 768
+6. resetProximityCountersKernel
+7. featureBasedProximityKernel
+```
+
+Same 7-launch count; launch #5 swaps the all-cells generator for the
+active-cell generator with a 128× smaller grid.
+
+### 15.3  Planned: workspace-cached broad-cull CUDA events (§5.16)
+
+**Root cause.** `computeDenseGridIndexedTriangleContacts` and
+`computeDenseGridTriangleContacts` each `cudaEventCreate` / `cudaEventDestroy`
+their `stageStart/stageEnd/totalStart/totalEnd` events **every frame**
+(~40-80 µs of driver churn).
+
+**Mechanism.** Mirror the Phase 5.14 FBP-event fix: add `broadStageStart`,
+`broadStageEnd`, `broadTotalStart`, `broadTotalEnd` + `broadEventsReady` +
+`ensureBroadEvents()` to `DenseGridWorkspace`, lazy-create once, reuse
+across frames, free in the workspace destructor. `cudaEventRecord`
+overwrites the timestamp each frame so reuse is safe.
+
+This extends the workspace's event ownership from just the FBP events to
+all timing events, completing the "no per-frame CUDA object creation"
+principle the workspace already follows for device buffers.
+
+### 15.4  Combined expectation
+
+| Metric | Current | After §5.15 | After §5.15 + §5.16 |
+|---|---:|---:|---:|
+| generation kernel | ~300 µs | < 30 µs | < 30 µs |
+| host sync | ~285 µs | ~285 µs | ~205 µs |
+| narrow wall | ~0.83 ms | ~0.5 ms | ~0.43 ms |
+| one-tissue FPS | ~672 | ~900 | ~1000 |
+
+**Measured 2026-05-25 (one-tissue/one-blade, fast path, same cool GPU
+back-to-back):**
+
+| Metric | Baseline (flag off) | Active (flag on) |
+|---|---:|---:|
+| generation kernel grid | 32 768 blocks | **1 024 blocks** |
+| generation kernel duration | ~300 µs | **7.9 µs** |
+| narrow kernel (all) | 3.83 ms | **0.35 ms** |
+| narrow wall | 4.00 ms | **0.56 ms** |
+| FPS | 221 | **943** |
+| contact count (validation) | 56 (all EE) | 56 (all EE) — identical |
+| overflow | 0 | 0 |
+
+### 15.5  Default flip + large-scene validation + grid-stride fix
+
+The large-tissue A/B (79 520 collision elements, subdivided blade) cleared
+the default flip and surfaced a separate correctness bug:
+
+- **Large-tissue A/B:** baseline 108 FPS / 4.63 ms, active 116 FPS / 4.09 ms
+  (1.08×). Contact output bit-identical (8018 contacts: 5397 VF / 880 FV /
+  1741 EE), unique_candidate_count 322 560 identical, overflow 0. Smaller
+  win than one-tissue because the subdivided blade touches many cells, so
+  the tool/tissue asymmetry is weaker and the FBP kernel itself dominates —
+  but still faster, never a regression.
+- **Default flipped to ON:** `DenseGridConfig.useToolActiveCellGeneration`,
+  the `GpuCollisionNarrowPhase` Data field, and the benchmark-scene env-flag
+  defaults are all now `true`. `compactActiveCells` is effectively superseded.
+- **Grid-stride correctness fix (§5.17 in plan.md):** the large-scene A/B
+  exposed a latent bug — `featureBasedProximityKernel` and
+  `featureBasedVertexTriangleProximityKernel` processed one pair per thread
+  with no grid-stride, so the fixed 65 536-thread over-launch silently
+  dropped ~80% of the 322 560 large-scene pairs. Both kernels now grid-stride
+  over all pairs; the launch grid is a pure saturation target (1024 blocks).
+  Large-scene contact count corrected from the buggy ~3700 to the true 8018.
+  Small scenes (< 65 536 pairs) were unaffected throughout.
+
+The Phase 15 win exceeded the target on small scenes; the event caching
+(Phase 16) is always on; the grid-stride fix makes FBP/v-t correct at any
+scale.

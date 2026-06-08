@@ -286,6 +286,7 @@ GpuCollisionNarrowPhase::GpuCollisionNarrowPhase()
     , d_computeDeviceContactsWhenContactsStayOnDevice(initData(&d_computeDeviceContactsWhenContactsStayOnDevice, false, "computeDeviceContactsWhenContactsStayOnDevice", "Compute exact contact records on the GPU when contacts are not copied to CPU. Disable for fastest detection-only candidate generation."))
     , d_compactActiveCells(initData(&d_compactActiveCells, false, "compactActiveCells", "Compact mixed dense-grid cells before candidate generation. Experimental; disabled by default because it regressed the current GTX 1650 Ti benchmark path."))
     , d_batchTriangleInsert(initData(&d_batchTriangleInsert, false, "batchTriangleInsert", "Insert tissue and tool triangles with one dense-grid launch when supported. Experimental; disabled by default because separate indexed inserts are faster for the current benchmark path."))
+    , d_useToolActiveCellGeneration(initData(&d_useToolActiveCellGeneration, true, "useToolActiveCellGeneration", "Phase 15 (DEFAULT ON since 2026-05-25): generate candidate pairs over tool-occupied (mixed) cells only. The active-cell list is built during the tool insert (no separate scan), then candidate generation launches a small fixed grid over that list instead of one block per grid cell. Measured 4.3x faster on one-tissue/one-blade and 1.08x on large-tissue, bit-identical contacts, never a regression. Mutually exclusive with batchTriangleInsert."))
     , d_useFeatureBasedProximity(initData(&d_useFeatureBasedProximity, false, "useFeatureBasedProximity", "Replace SAT-style exact triangle intersection with feature-based proximity (VF + EE) using Ericson closest-point math. Outputs barycentric weights for a CUDA constraint solver."))
     , d_useVertexTriangleProximity(initData(&d_useVertexTriangleProximity, false, "useVertexTriangleProximity", "When set together with useFeatureBasedProximity, route self-collision pairs (pair.first == pair.second on a CudaTriangleCollisionModel) through the vertex-triangle proximity kernel. Useful for surgical self-collision such as cutting/tearing."))
     , d_proximityComputeBarycentrics(initData(&d_proximityComputeBarycentrics, true, "proximityComputeBarycentrics", "Populate barycentric weights in each ProximityContact. Set false only when the consumer does not need barys (saves a few writes per contact)."))
@@ -1054,6 +1055,7 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                 d_computeDeviceContactsWhenContactsStayOnDevice.getValue();
             denseGridConfig.compactActiveCells = d_compactActiveCells.getValue();
             denseGridConfig.batchTriangleInsert = d_batchTriangleInsert.getValue();
+            denseGridConfig.useToolActiveCellGeneration = d_useToolActiveCellGeneration.getValue();
 
             // Build the shared FBP/v-t proximity config once.
             backend::FeatureBasedProximityConfig proximityConfig;

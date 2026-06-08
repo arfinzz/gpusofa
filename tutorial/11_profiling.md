@@ -30,7 +30,7 @@ stageSnapshot.wallMilliseconds =
 
 **Important:** because the CPU doesn't wait for the GPU (file 10), wall time
 measures *CPU orchestration only*. It does NOT include the GPU compute that
-overlaps the next frame. In the fast path, `narrow_wall_ms ≈ 0.67` is the cost
+overlaps the next frame. In the fast path, `narrow_wall_ms ≈ 0.56` is the cost
 of extracting surfaces, building config, and issuing launches — not the kernels.
 
 ### Kernel time (CUDA events)
@@ -163,13 +163,19 @@ Open a `_summary.txt` and here's what each line means. (Run
 
 | Field | Meaning |
 |---|---|
-| `avg_narrow_raw_candidate_count` | candidate pairs before dedupe (~2304) |
-| `avg_narrow_unique_candidate_count` | after dedupe (~624) |
+| `avg_narrow_raw_candidate_count` | candidate pairs before dedupe (~2304 one-tissue) |
+| `avg_narrow_unique_candidate_count` | after dedupe (~624 one-tissue; 322,560 large-tissue) |
 | `avg_narrow_duplicate_reduction_ratio` | fraction removed by dedupe (~0.73) |
-| `avg_narrow_output_contact_count` | contacts emitted (~56) |
-| `avg_narrow_vf_contact_count` / `_fv_` / `_ee_` | feature-type breakdown |
+| `avg_narrow_output_contact_count` | contacts emitted (~56 one-tissue; 8018 large-tissue) |
+| `avg_narrow_vf_contact_count` / `_fv_` / `_ee_` | feature-type breakdown (all EE for one-tissue) |
 | `avg_narrow_overflow_count` | dropped due to capacity (should be 0) |
 | `avg_narrow_grid_cell_count` | total cells (32768) |
+
+Note: with the default active-cell generation, the unique-candidate and contact
+counts are **identical** to the all-cells path — the optimization changes which
+cells are scanned, not which pairs survive. If a code change makes these numbers
+drift between the flag on/off, that's the correctness alarm bell (it's how the
+Phase 17 grid-stride bug was caught — file 07 §7.6).
 
 The contact-count fields are **0 in the fast path** because counters aren't read
 back. You only see real values in validation mode
@@ -179,13 +185,14 @@ back. You only see real values in validation mode
 
 ## 11.5 Reading a real summary
 
-Here's an annotated excerpt from the verified fast-path run:
+Here's an annotated excerpt from the verified fast-path run (active-cell
+generation default-on):
 
 ```text
-avg_fps=775.8                       ← ~775 frames/sec
-avg_narrow_wall_ms=0.665            ← CPU spent 0.67 ms orchestrating
-avg_narrow_kernel_ms=0.512          ← (broad-cull window timing)
-avg_narrow_host_synchronization_ms=0.153   ← lean host overhead
+avg_fps=942.7                       ← ~940 frames/sec
+avg_narrow_wall_ms=0.559            ← CPU spent 0.56 ms orchestrating
+avg_narrow_kernel_ms=0.349          ← (broad-cull window timing)
+avg_narrow_host_synchronization_ms=0.210   ← lean host overhead
 avg_host_to_device_bytes=0          ← zero-copy positions + cached indices
 avg_device_to_host_bytes=0          ← contacts stay on GPU
 avg_kernel_launch_count=7           ← the 7-op FBP cascade
@@ -196,14 +203,14 @@ avg_workspace_resize_count=0        ← no per-frame allocation
 And the validation run that actually counts contacts:
 
 ```text
-avg_fps=449.7                       ← slower: one sync per frame
+avg_fps=475.1                       ← slower: one sync per frame
 avg_narrow_output_contact_count=56  ← 56 contacts found
 avg_narrow_ee_contact_count=56      ← all of them edge-edge (file 08 explains why)
 avg_narrow_vf_contact_count=0
 avg_device_to_host_bytes=64         ← the counter readback
 ```
 
-The drop from 775 to 449 FPS is the *entire* cost of asking the GPU "how many
+The drop from ~940 to ~475 FPS is the *entire* cost of asking the GPU "how many
 contacts did you find?" once per frame. That single number tells you why the
 fast path keeps everything on the device.
 
@@ -220,10 +227,16 @@ exports per-kernel metrics. The findings live in
 Key things Nsight told us that the CSV couldn't:
 
 - The FBP kernel uses **68 registers/thread**, which caps occupancy at ~50%.
-- It runs at only **4.8% SM throughput** — because of the over-launch, ~99% of
-  threads exit immediately (this is expected and accepted).
+- On the small scene it runs at only **~5% SM throughput** — with 624 pairs and
+  a 1,024-block grid, most threads have no pair to process (this is expected and
+  accepted; the kernel is only ~17 µs).
 - **Atomic pressure is < 0.5%** everywhere — confirming that atomics are *not* a
   bottleneck (a question the team specifically investigated and put to rest).
+- Nsight also **confirmed the Phase 15 win directly**: the candidate-generation
+  kernel's launched grid dropped from **32,768 blocks (~300 µs)** to
+  **1,024 blocks (~8 µs)** when `useToolActiveCellGeneration` is on — visible in
+  the `launch__grid_size` and `gpu__time_duration` metrics. This is the kind of
+  before/after a CSV throughput number can't show you.
 
 This is the difference between "how long did the frame take?" (CSV) and "why did
 each kernel take that long?" (Nsight).
@@ -243,8 +256,8 @@ slows the frame. So the benchmark is careful to:
 You pick the tool that answers your question without distorting it. A throughput
 number comes from the fast path; a contact count comes from validation mode; a
 register-usage number comes from Nsight. Mixing them up leads to wrong
-conclusions — like thinking FBP is slow because the validation run shows 449 FPS,
-when the production path is actually 775.
+conclusions — like thinking FBP is slow because the validation run shows ~475
+FPS, when the production path is actually ~940.
 
 ---
 

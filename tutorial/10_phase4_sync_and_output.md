@@ -49,24 +49,26 @@ phase — but since the CPU doesn't wait for the GPU, that measurement captures
 only the **CPU-side orchestration time** (extracting surfaces, building config,
 issuing launches), *not* the GPU compute time.
 
-This is why you see, in the fast path:
+This is why you see, in the fast path (with active-cell generation default-on):
 
 ```text
-avg_narrow_wall_ms = 0.67       ← CPU orchestration only
-avg_narrow_kernel_ms = 0.52     ← the broad-cull window the code does time
+avg_narrow_wall_ms = 0.56       ← CPU orchestration only
+avg_narrow_kernel_ms = 0.35     ← the broad-cull window the code does time
 ```
 
 The FBP math kernel runs ~17 µs *on the GPU*, but it overlaps the next frame's
-CPU work, so it never adds to the wall time the CPU observes. The 775 FPS number
-comes from this overlap.
+CPU work, so it never adds to the wall time the CPU observes. The ~940 FPS
+number comes from this overlap. (Before the Phase 15 active-cell generation, the
+same path was ~775 FPS — the difference is the candidate-generation kernel
+dropping from ~300 µs to ~8 µs, see file 06 §6.8 and file 07 §7.4.)
 
 ---
 
-## 10.3 Why the over-launch trick is essential here
+## 10.3 Why the over-launch + grid-stride is essential here
 
-Recall from file 07 that the FBP kernel **over-launches** 65,536 threads and
-each checks `if (tid >= candidateCount) return`. The reason connects directly to
-the sync bypass.
+Recall from file 07 §7.6 that the FBP kernel launches a **fixed grid** and
+grid-strides over the candidate pairs, reading the pair count *from GPU memory*.
+The reason connects directly to the sync bypass.
 
 To launch *exactly* the right number of threads, the CPU would need to know
 `candidateCount` — but that number lives in GPU memory. Reading it means a
@@ -74,10 +76,13 @@ To launch *exactly* the right number of threads, the CPU would need to know
 candidate-generation kernel to finish before it can launch the math kernel. That
 single readback would re-introduce the stall we're trying to avoid.
 
-By over-launching a fixed, generous number and letting threads self-filter, the
-CPU never needs to know the count. No readback, no sync, no stall. This is the
-design choice that took the FBP path from 109 FPS (with the readback) to 775
-FPS (without it).
+By launching a fixed, generous grid and letting the kernel read the count itself
+and grid-stride over the work, the CPU never needs to know the count. No
+readback, no sync, no stall. This is the design choice that took the FBP path
+from 109 FPS (with the readback) to ~940 FPS (without it, and with the
+active-cell generation of file 07 §7.4). The grid-stride loop is also what keeps
+the kernel *correct* when a large scene has more pairs than launched threads
+(file 07 §7.6).
 
 ---
 
@@ -116,8 +121,8 @@ page-locked host memory that transfers faster.) Cost: ~20 bytes D2H + one sync.
 You use this to *validate* that the kernel is finding the right number of
 contacts, not for production.
 
-In the benchmark, turning this on drops one-tissue FBP from 775 → 449 FPS — the
-one sync per frame is the cost.
+In the benchmark, turning this on drops one-tissue FBP from ~940 → ~475 FPS —
+the one sync per frame is the cost.
 
 ### Level 2 — sampled counter readback
 
@@ -189,20 +194,22 @@ DefaultAnimationLoop::step()
 │           build DenseGridConfig
 │           launch 7 GPU ops (non-blocking):
 │              reset grid, memset hash, insert tissue,
-│              insert blade, generate+dedupe pairs,
+│              insert blade (+ build active list),
+│              generate+dedupe pairs (over ~30 active cells),
 │              reset counters, FBP math
-│           RETURN without waiting                              [~0.67 ms CPU wall]
+│           RETURN without waiting                              [~0.56 ms CPU wall]
 │
 ├─ CollisionPipeline::computeCollisionResponse()  nothing
 │
 └─ GpuPipelineBenchmarkController records the frame             [logs timings]
 
 GPU (in the background, overlapping the next frame): finishes the 7 ops,
-   writes ~624 contacts to VRAM, never copies them out.        [0 bytes D2H]
+   writes ~56 contacts to VRAM (from 624 candidate pairs),     [0 bytes D2H]
+   never copies them out.
 ```
 
-Total per-frame PCIe traffic: **0 bytes both ways**. CPU wall time: ~0.67 ms.
-Frame rate: ~775 per second.
+Total per-frame PCIe traffic: **0 bytes both ways**. CPU wall time: ~0.56 ms.
+Frame rate: ~940 per second.
 
 ---
 
@@ -211,8 +218,8 @@ Frame rate: ~775 per second.
 ```text
 The fast path launches kernels and DOES NOT WAIT (no sync, no readback).
 CPU and GPU overlap → the GPU's compute time hides behind the next frame's CPU work.
-The over-launch trick removes the one readback that would have forced a sync.
-Result: 0 bytes H2D, 0 bytes D2H, ~0.67 ms CPU wall, 775 FPS.
+The over-launch + grid-stride removes the one readback that would have forced a sync.
+Result: 0 bytes H2D, 0 bytes D2H, ~0.56 ms CPU wall, ~940 FPS.
 Three opt-in readback levels (counters / sampled / full publication) trade FPS
   for getting data back to the CPU — used only when you actually need it.
 ```

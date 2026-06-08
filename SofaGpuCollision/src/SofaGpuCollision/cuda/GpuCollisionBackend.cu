@@ -232,6 +232,15 @@ struct DenseGridWorkspace
     cudaEvent_t fbpStartEvent { nullptr };
     cudaEvent_t fbpEndEvent { nullptr };
     bool fbpEventsReady { false };
+    // Phase 16: workspace-owned broad-cull timing events. The dense-grid
+    // contact functions used to cudaEventCreate/Destroy these 4 events every
+    // frame (~40-80 us of driver churn). Lazy-created once, reused, freed in
+    // the workspace destructor.
+    cudaEvent_t broadStageStart { nullptr };
+    cudaEvent_t broadStageEnd { nullptr };
+    cudaEvent_t broadTotalStart { nullptr };
+    cudaEvent_t broadTotalEnd { nullptr };
+    bool broadEventsReady { false };
     // Frame counter for sampled deep-counter readback.
     std::uint64_t frameCounter { 0 };
 
@@ -315,6 +324,18 @@ struct DenseGridWorkspace
             fbpEventsReady = false;
             fbpStartEvent = nullptr;
             fbpEndEvent = nullptr;
+        }
+        if (broadEventsReady)
+        {
+            cudaEventDestroy(broadStageStart);
+            cudaEventDestroy(broadStageEnd);
+            cudaEventDestroy(broadTotalStart);
+            cudaEventDestroy(broadTotalEnd);
+            broadEventsReady = false;
+            broadStageStart = nullptr;
+            broadStageEnd = nullptr;
+            broadTotalStart = nullptr;
+            broadTotalEnd = nullptr;
         }
         proximityContacts = nullptr;
         proximityContactCount = nullptr;
@@ -624,6 +645,17 @@ struct DenseGridWorkspace
         cudaError_t err = cudaEventCreate(&fbpStartEvent);
         if (err == cudaSuccess) err = cudaEventCreate(&fbpEndEvent);
         fbpEventsReady = (err == cudaSuccess);
+        return err;
+    }
+
+    cudaError_t ensureBroadEvents()
+    {
+        if (broadEventsReady) return cudaSuccess;
+        cudaError_t err = cudaEventCreate(&broadStageStart);
+        if (err == cudaSuccess) err = cudaEventCreate(&broadStageEnd);
+        if (err == cudaSuccess) err = cudaEventCreate(&broadTotalStart);
+        if (err == cudaSuccess) err = cudaEventCreate(&broadTotalEnd);
+        broadEventsReady = (err == cudaSuccess);
         return err;
     }
 };
@@ -1190,7 +1222,10 @@ __device__ void insertTriangleAabbIntoGrid(
     DeviceCellBucket* grid,
     std::uint32_t* cellIds,
     std::uint32_t* overflowCount,
-    DeviceDenseGridStats* denseGridStats)
+    DeviceDenseGridStats* denseGridStats,
+    const bool buildToolActiveList = false,
+    std::uint32_t* activeCellIds = nullptr,
+    std::uint32_t* activeCellCount = nullptr)
 {
     int3 cellMin {};
     int3 cellMax {};
@@ -1215,6 +1250,20 @@ __device__ void insertTriangleAabbIntoGrid(
                 if (localIndex < bucketCapacity)
                 {
                     cellIds[cellId * bucketCapacity + localIndex] = triangleId;
+                    // Phase 15: build the mixed-cell list as a side effect of the
+                    // tool insert. The FIRST tool triangle to claim slot 0 in a
+                    // cell that ALREADY contains tissue appends the cell id once.
+                    // localIndex == 0 gives natural dedupe (each cell at most
+                    // once); grid[cellId].tissueCount is final because the tissue
+                    // insert kernel completes before the tool insert kernel on the
+                    // serialized stream. activeCellIds is sized to cellCount, and
+                    // distinct cells <= cellCount, so the append can never overflow.
+                    if (buildToolActiveList && !insertTissue && localIndex == 0u &&
+                        grid[cellId].tissueCount > 0u)
+                    {
+                        const std::uint32_t activeIndex = atomicAdd(activeCellCount, 1u);
+                        activeCellIds[activeIndex] = cellId;
+                    }
                     if (denseGridStats != nullptr)
                     {
                         if (insertTissue)
@@ -1244,7 +1293,10 @@ __global__ void insertPackedTrianglesKernel(
     DeviceCellBucket* grid,
     std::uint32_t* cellIds,
     std::uint32_t* overflowCount,
-    DeviceDenseGridStats* denseGridStats)
+    DeviceDenseGridStats* denseGridStats,
+    const bool buildToolActiveList = false,
+    std::uint32_t* activeCellIds = nullptr,
+    std::uint32_t* activeCellCount = nullptr)
 {
     const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
     if (triangleId >= triangleCount)
@@ -1260,7 +1312,10 @@ __global__ void insertPackedTrianglesKernel(
         grid,
         cellIds,
         overflowCount,
-        denseGridStats);
+        denseGridStats,
+        buildToolActiveList,
+        activeCellIds,
+        activeCellCount);
 }
 
 __global__ void insertIndexedTrianglesKernel(
@@ -1272,7 +1327,10 @@ __global__ void insertIndexedTrianglesKernel(
     DeviceCellBucket* grid,
     std::uint32_t* cellIds,
     std::uint32_t* overflowCount,
-    DeviceDenseGridStats* denseGridStats)
+    DeviceDenseGridStats* denseGridStats,
+    const bool buildToolActiveList = false,
+    std::uint32_t* activeCellIds = nullptr,
+    std::uint32_t* activeCellCount = nullptr)
 {
     const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
     if (triangleId >= triangleCount)
@@ -1289,7 +1347,10 @@ __global__ void insertIndexedTrianglesKernel(
         grid,
         cellIds,
         overflowCount,
-        denseGridStats);
+        denseGridStats,
+        buildToolActiveList,
+        activeCellIds,
+        activeCellCount);
 }
 
 __global__ void insertPackedTrianglePairKernel(
@@ -2032,14 +2093,16 @@ __global__ void featureBasedProximityKernel(
     const float contactDistance,
     const bool computeBarycentrics)
 {
-    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Grid-stride over ALL candidate pairs. The launch grid is a fixed modest
+    // size (over-launch), so the stride loop is what guarantees every pair is
+    // processed even when pairCount exceeds the launched thread count (large
+    // scenes produce far more than 65 536 candidate pairs).
     const std::uint32_t pairCount = *candidatePairCount;
-    if (tid >= pairCount)
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    const float distThreshSq = contactDistance * contactDistance;
+    for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < pairCount; idx += stride)
     {
-        return;
-    }
-
-    const std::uint64_t pair = candidatePairs[tid];
+    const std::uint64_t pair = candidatePairs[idx];
     const std::uint32_t aIdx = static_cast<std::uint32_t>(pair >> 32);
     const std::uint32_t bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
 
@@ -2047,8 +2110,6 @@ __global__ void featureBasedProximityKernel(
     const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
     const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
     const float3 bV[3] = { tb.p0, tb.p1, tb.p2 };
-
-    const float distThreshSq = contactDistance * contactDistance;
 
     float bestDistSq = INFINITY;
     int bestKind = 0;
@@ -2124,14 +2185,14 @@ __global__ void featureBasedProximityKernel(
 
     if (bestDistSq > distThreshSq)
     {
-        return;
+        continue;
     }
 
     const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
     if (outIdx >= maxContacts)
     {
         atomicAdd(overflowCount, 1u);
-        return;
+        continue;
     }
 
     DeviceProximityContact c;
@@ -2170,6 +2231,7 @@ __global__ void featureBasedProximityKernel(
     if (bestKind == 0)      atomicAdd(vfCount, 1u);
     else if (bestKind == 1) atomicAdd(fvCount, 1u);
     else                    atomicAdd(eeCount, 1u);
+    } // grid-stride loop
 }
 
 // Resets the proximity contact counters and per-class tallies.
@@ -2272,11 +2334,14 @@ __global__ void featureBasedVertexTriangleProximityKernel(
     const bool computeBarycentrics,
     const std::uint32_t selfCollisionVertexExclusionStride)  // 0 to disable; otherwise skip (triId, vertId) where vertId is one of the triangle's 3 vertices
 {
-    const std::uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Grid-stride over ALL (triangle, vertex) candidate pairs so the fixed
+    // modest launch grid still processes every pair when pairCount exceeds the
+    // launched thread count.
     const std::uint32_t pairCount = *candidatePairCount;
-    if (tid >= pairCount) return;
-
-    const std::uint64_t pair = candidatePairs[tid];
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < pairCount; idx += stride)
+    {
+    const std::uint64_t pair = candidatePairs[idx];
     const std::uint32_t triId   = static_cast<std::uint32_t>(pair >> 32);
     const std::uint32_t pointId = static_cast<std::uint32_t>(pair & 0xffffffffu);
 
@@ -2291,7 +2356,7 @@ __global__ void featureBasedVertexTriangleProximityKernel(
         const std::uint32_t i2 = triangleIndices[3u * triId + 2u];
         if (pointId == i0 || pointId == i1 || pointId == i2)
         {
-            return;
+            continue;
         }
     }
 
@@ -2304,13 +2369,13 @@ __global__ void featureBasedVertexTriangleProximityKernel(
     const float3 diff = sub3(cp, p);
     const float distSq = dot3(diff, diff);
 
-    if (distSq > contactDistance * contactDistance) return;
+    if (distSq > contactDistance * contactDistance) continue;
 
     const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
     if (outIdx >= maxContacts)
     {
         atomicAdd(overflowCount, 1u);
-        return;
+        continue;
     }
 
     DeviceProximityContact c;
@@ -2345,6 +2410,7 @@ __global__ void featureBasedVertexTriangleProximityKernel(
     c.signedDistance = dist;
     contacts[outIdx] = c;
     atomicAdd(vfCount, 1u);
+    } // grid-stride loop
 }
 
 } // namespace
@@ -3216,40 +3282,24 @@ bool computeDenseGridTriangleContacts(
     const auto toolBlocks =
         static_cast<std::uint32_t>((toolTriangles.size() + threadCount - 1) / threadCount);
 
-    cudaEvent_t stageStart {};
-    cudaEvent_t stageEnd {};
-    err = cudaEventCreate(&stageStart);
-    if (err == cudaSuccess)
-    {
-        err = cudaEventCreate(&stageEnd);
-    }
-    cudaEvent_t totalStart {};
-    cudaEvent_t totalEnd {};
-    if (err == cudaSuccess && !config.detailedProfiling)
-    {
-        err = cudaEventCreate(&totalStart);
-    }
-    if (err == cudaSuccess && !config.detailedProfiling)
-    {
-        err = cudaEventCreate(&totalEnd);
-    }
+    // Phase 16: reuse workspace-owned events instead of creating/destroying
+    // four CUDA events every frame. The aliases below keep the rest of this
+    // function unchanged; destroyStageEvents is now a no-op because the events
+    // live for the plugin's lifetime (freed in the workspace destructor).
+    err = workspace.ensureBroadEvents();
     if (err != cudaSuccess)
     {
         diagnostic = cudaGetErrorString(err);
         freeAll();
         return false;
     }
+    cudaEvent_t& stageStart = workspace.broadStageStart;
+    cudaEvent_t& stageEnd = workspace.broadStageEnd;
+    cudaEvent_t& totalStart = workspace.broadTotalStart;
+    cudaEvent_t& totalEnd = workspace.broadTotalEnd;
 
     std::uint32_t denseGridLaunchCount = 0;
-    auto destroyStageEvents = [&]() {
-        cudaEventDestroy(stageStart);
-        cudaEventDestroy(stageEnd);
-        if (!config.detailedProfiling)
-        {
-            cudaEventDestroy(totalStart);
-            cudaEventDestroy(totalEnd);
-        }
-    };
+    auto destroyStageEvents = [&]() { /* workspace-owned; freed at plugin unload */ };
 
     if (!config.detailedProfiling)
     {
@@ -3912,6 +3962,15 @@ bool computeDenseGridIndexedTriangleContacts(
         return false;
     }
 
+    // Phase 15: tool-active-cell generation builds the active list during the
+    // tool insert, which relies on tissue being inserted before tool. Fused
+    // insertion (batchTriangleInsert) breaks that ordering.
+    if (config.useToolActiveCellGeneration && config.batchTriangleInsert)
+    {
+        diagnostic = "useToolActiveCellGeneration is incompatible with batchTriangleInsert (the active list relies on tissue-before-tool insert ordering).";
+        return false;
+    }
+
     if (config.gridResolutionX == 0 || config.gridResolutionY == 0 || config.gridResolutionZ == 0 ||
         config.maxTissueTrianglesPerCell == 0 || config.maxToolTrianglesPerCell == 0 ||
         config.maxCandidatePairs == 0 ||
@@ -4157,40 +4216,24 @@ bool computeDenseGridIndexedTriangleContacts(
     const auto toolBlocks =
         static_cast<std::uint32_t>((toolSurface.triangleCount + threadCount - 1) / threadCount);
 
-    cudaEvent_t stageStart {};
-    cudaEvent_t stageEnd {};
-    err = cudaEventCreate(&stageStart);
-    if (err == cudaSuccess)
-    {
-        err = cudaEventCreate(&stageEnd);
-    }
-    cudaEvent_t totalStart {};
-    cudaEvent_t totalEnd {};
-    if (err == cudaSuccess && !config.detailedProfiling)
-    {
-        err = cudaEventCreate(&totalStart);
-    }
-    if (err == cudaSuccess && !config.detailedProfiling)
-    {
-        err = cudaEventCreate(&totalEnd);
-    }
+    // Phase 16: reuse workspace-owned events instead of creating/destroying
+    // four CUDA events every frame. The aliases below keep the rest of this
+    // function unchanged; destroyStageEvents is now a no-op because the events
+    // live for the plugin's lifetime (freed in the workspace destructor).
+    err = workspace.ensureBroadEvents();
     if (err != cudaSuccess)
     {
         diagnostic = cudaGetErrorString(err);
         freeAll();
         return false;
     }
+    cudaEvent_t& stageStart = workspace.broadStageStart;
+    cudaEvent_t& stageEnd = workspace.broadStageEnd;
+    cudaEvent_t& totalStart = workspace.broadTotalStart;
+    cudaEvent_t& totalEnd = workspace.broadTotalEnd;
 
     std::uint32_t denseGridLaunchCount = 0;
-    auto destroyStageEvents = [&]() {
-        cudaEventDestroy(stageStart);
-        cudaEventDestroy(stageEnd);
-        if (!config.detailedProfiling)
-        {
-            cudaEventDestroy(totalStart);
-            cudaEventDestroy(totalEnd);
-        }
-    };
+    auto destroyStageEvents = [&]() { /* workspace-owned; freed at plugin unload */ };
 
     if (!config.detailedProfiling)
     {
@@ -4312,7 +4355,10 @@ bool computeDenseGridIndexedTriangleContacts(
                 deviceGrid,
                 deviceCellToolIds,
                 deviceOverflowCount,
-                activeDeviceDenseGridStats);
+                activeDeviceDenseGridStats,
+                config.useToolActiveCellGeneration,                                  // buildToolActiveList
+                config.useToolActiveCellGeneration ? deviceActiveCellIds : nullptr,
+                config.useToolActiveCellGeneration ? deviceActiveCellCount : nullptr);
             return cudaGetLastError();
         });
         denseGridLaunchCount += 1;
@@ -4321,7 +4367,10 @@ bool computeDenseGridIndexedTriangleContacts(
             executionStats->denseGridInsertToolMilliseconds += insertToolMs;
         }
     }
-    if (err == cudaSuccess && config.compactActiveCells)
+    // Phase 9 compaction: separate full-grid scan (regressed; off by default).
+    // Phase 15 (useToolActiveCellGeneration) builds the active list during the
+    // tool insert above, so it never runs this scan.
+    if (err == cudaSuccess && config.compactActiveCells && !config.useToolActiveCellGeneration)
     {
         double compactActiveCellsMs = 0.0;
         const std::uint32_t compactBlocks = (cellCount + threadCount - 1u) / threadCount;
@@ -4344,14 +4393,18 @@ bool computeDenseGridIndexedTriangleContacts(
     }
     if (err == cudaSuccess)
     {
+        // Phase 15: when useToolActiveCellGeneration is set, generate over the
+        // tool-built active-cell list (a small fixed grid that device-reads the
+        // count and grid-strides) instead of one block per grid cell.
+        const bool useActiveGeneration = config.compactActiveCells || config.useToolActiveCellGeneration;
+        const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
         double generatePairsMs = 0.0;
         err = runCudaOperation(config.detailedProfiling, stageStart, stageEnd, generatePairsMs, [&]() {
             ScopedNvtxRange range("indexed generate pairs", config.detailedProfiling);
             if (config.useGpuHashDedupe)
             {
-                if (config.compactActiveCells)
+                if (useActiveGeneration)
                 {
-                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
                     generateActiveDenseGridUniqueCandidatePairsKernel<<<activeBlocks, threadCount>>>(
                         deviceGrid,
                         deviceActiveCellIds,
@@ -4383,9 +4436,8 @@ bool computeDenseGridIndexedTriangleContacts(
             }
             else
             {
-                if (config.compactActiveCells)
+                if (useActiveGeneration)
                 {
-                    const std::uint32_t activeBlocks = std::min(cellCount, 1024u);
                     generateActiveDenseGridCandidatePairsKernel<<<activeBlocks, threadCount>>>(
                         deviceGrid,
                         deviceActiveCellIds,
@@ -4891,8 +4943,12 @@ bool computeFeatureBasedProximityContacts(
     // For surgical-scene workloads candidate counts rarely exceed ~10k so 256 blocks
     // = 65 536 threads is a comfortable upper bound and runs as one scheduler wave
     // on the 16 SMs of a GTX 1650 Ti.
+    // The kernel grid-strides over all candidate pairs, so this is a
+    // saturation target, not a correctness bound: 1024 blocks fills the 16-SM
+    // GTX 1650 Ti and the stride loop covers any pairCount (large scenes can
+    // produce hundreds of thousands of pairs).
     constexpr std::uint32_t threadCount = 256;
-    constexpr std::uint32_t kFbpMaxBlocks = 256;  // 65 536 threads upper cap
+    constexpr std::uint32_t kFbpMaxBlocks = 1024;
     const std::uint32_t fbpUpperPairs = std::min(gridConfig.maxCandidatePairs, kFbpMaxBlocks * threadCount);
     const std::uint32_t fbpBlocks =
         std::max(1u, (fbpUpperPairs + threadCount - 1u) / threadCount);
@@ -5296,8 +5352,9 @@ bool computeFeatureBasedVertexTriangleContacts(
         workspace.proximityEeCount);
     if (executionStats != nullptr) executionStats->kernelLaunchCount += 1;
 
-    // 7) Narrow phase: feature-based vertex-triangle proximity
-    constexpr std::uint32_t kFbpMaxBlocks = 256;
+    // 7) Narrow phase: feature-based vertex-triangle proximity.
+    // Grid-strides over all pairs; 1024 blocks is a GPU-saturation target.
+    constexpr std::uint32_t kFbpMaxBlocks = 1024;
     const std::uint32_t fbpUpperPairs = std::min(gridConfig.maxCandidatePairs, kFbpMaxBlocks * threadCount);
     const std::uint32_t fbpBlocks = std::max(1u, (fbpUpperPairs + threadCount - 1u) / threadCount);
     featureBasedVertexTriangleProximityKernel<<<fbpBlocks, threadCount>>>(

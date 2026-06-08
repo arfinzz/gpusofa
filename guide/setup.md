@@ -229,7 +229,8 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 | `run_backend_dense_grid_benchmark_wsl_gpu_proj.sh` | Standalone backend bench (no SOFA scene) | direct kernel-only |
 | `run_gpu_kernel_profile_wsl.sh` | NVTX-annotated profiling run | event timings on |
 | `run_nsight_collision_profile_wsl_gpu_proj.sh` | Nsight Compute + Nsight Systems capture | full profiling |
-| `run_fbp_smoke_test_wsl.sh` | **One-tissue/one-blade with FBP enabled** (Phase 11) | FBP, detection-only, readback off |
+| `run_fbp_smoke_test_wsl.sh` | **One-tissue/one-blade with FBP enabled** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
+| `run_fbp_large_tissue_wsl.sh` | **Large-tissue/subdivided-blade FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
 | `run_vertex_triangle_smoke_wsl.sh` | **V-t self-collision** (Phase 12) | FBP + v-t self, readback on |
 | `run_cross_model_vt_smoke_wsl.sh` | **V-t cross-model** (Phase 12 cross-model) | FBP + v-t cross, readback on |
 | `run_nsight_fbp_profile_wsl.sh` | **Nsight Compute on FBP + v-t kernels** | all three scenes, focused metric set |
@@ -288,8 +289,9 @@ These all default sensibly. Set them only to override.
 | `SOFA_USE_DIRECT_DEVICE_POSITIONS` | 1 | Use SOFA CUDA `deviceRead()` pointer directly |
 | `SOFA_READ_COUNTERS_WHEN_CONTACTS_STAY_ON_DEVICE` | 0 | D2H counter reads in detection-only mode |
 | `SOFA_COMPUTE_DEVICE_CONTACTS_WHEN_CONTACTS_STAY_ON_DEVICE` | 0 | Run exact-contact kernel even when contacts stay device-side |
-| `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction (regressed) |
-| `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed) |
+| `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction via a separate full-grid scan — **regressed**, superseded by `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` |
+| `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed). Mutually exclusive with tool-active-cell generation |
+| `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` | **1** | **Phase 15 — DEFAULT ON (guide/plan.md §5.15).** Generate candidate pairs over tool-occupied (mixed) cells only — list built during the tool insert, no separate scan. **Measured 4.3× FPS (221 → 943) and 38× faster generation (300 → 7.9 µs) on one-tissue, 1.08× on large-tissue, contact counts bit-identical, never a regression.** Set to 0 only to A/B against the old all-cells path |
 
 ### 6.4  Feature-based proximity (Phase 11+12)
 
@@ -331,7 +333,9 @@ Use this when you want the headline FPS number.
 wsl -d wsl-gpu-proj -- bash -c 'export SOFA_BENCHMARK_LOG_DIR=/home/arfin/gpu-sofa/output/benchmark_logs/my_tri_tri_fast; export SOFA_PROXIMITY_READ_CONTACT_COUNTER=0; bash /home/arfin/gpu-sofa/scripts/run_fbp_smoke_test_wsl.sh'
 ```
 
-Expected: ~700-800 FPS, ~0.5-0.7 ms narrow wall, 0 H2D + 0 D2H bytes.
+Expected: **~900-1000 FPS** (with Phase 15 tool-active-cell generation
+default-on), ~0.5 ms narrow wall, 0 H2D + 0 D2H bytes. (Was ~700-800 FPS
+before Phase 15.)
 
 ### 7.2  Validation mode (visible contact counts)
 
@@ -392,6 +396,70 @@ wsl -d wsl-gpu-proj -- ncu --import <ncu-rep> --csv --page raw --metrics gpu__ti
 The Nsight Systems sibling produces a `.nsys-rep` timeline; the script also
 runs a full-run fallback in case the NVTX capture-range exits without a
 report.
+
+### 7.7  A/B protocol for tool-active-cell generation (§5.15, now default-on)
+
+`SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` is **implemented and default-on**.
+This protocol re-measures it against the old all-cells generation (set the
+flag to 0 for baseline) **on the same cool GPU, back to back** — useful for
+re-validating on a new scene or after a kernel change. The GTX 1650 Ti has
+overturned plausible optimizations before (`compactActiveCells` regressed),
+so always measure on a cool GPU.
+
+```powershell
+# 0. Confirm the GPU is cool before starting (throttling invalidates A/B).
+wsl -d wsl-gpu-proj -- nvidia-smi --query-gpu=temperature.gpu,clocks.gr --format=csv,noheader
+
+# A. Baseline: current all-cells generation
+wsl -d wsl-gpu-proj -- bash -c 'export SOFA_BENCHMARK_LOG_DIR=/home/arfin/gpu-sofa/output/benchmark_logs/ab_gen_baseline; export SOFA_USE_TOOL_ACTIVE_CELL_GENERATION=0; bash /home/arfin/gpu-sofa/scripts/run_fbp_smoke_test_wsl.sh'
+
+# B. New: tool-active-cell generation
+wsl -d wsl-gpu-proj -- bash -c 'export SOFA_BENCHMARK_LOG_DIR=/home/arfin/gpu-sofa/output/benchmark_logs/ab_gen_active; export SOFA_USE_TOOL_ACTIVE_CELL_GENERATION=1; bash /home/arfin/gpu-sofa/scripts/run_fbp_smoke_test_wsl.sh'
+
+# Compare the headline lines
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/peek_fbp_summary.sh /home/arfin/gpu-sofa/output/benchmark_logs/ab_gen_baseline
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/peek_fbp_summary.sh /home/arfin/gpu-sofa/output/benchmark_logs/ab_gen_active
+```
+
+What to look for (measured 2026-05-25 — these are the actual results, not
+targets):
+
+- `avg_narrow_wall_ms` dropped 4.00 → 0.56 ms (one-tissue fast path).
+- `avg_fps` rose 221 → 943 (one-tissue), 108 → 116 (large-tissue).
+- `avg_narrow_output_contact_count` (validation mode,
+  `SOFA_PROXIMITY_READ_CONTACT_COUNTER=1`) was **bit-identical** between
+  off/on: 56 (one-tissue), 8018 (large-tissue). This is the key correctness
+  check — the optimization changes *which cells are scanned*, not *which
+  contacts emit*. If the count changes, the active-cell list is dropping
+  real candidate pairs.
+- `avg_narrow_overflow_count` stayed 0.
+
+For a large-tissue A/B use `scripts/run_fbp_large_tissue_wsl.sh` instead of
+the one-tissue smoke script.
+
+Nsight confirmation — the generation kernel grid dropped from 32 768 to
+1 024 blocks (and the kernel from ~300 µs to 7.9 µs):
+
+```powershell
+wsl -d wsl-gpu-proj -- bash -c 'export SOFA_PROFILE_ROOT=/home/arfin/gpu-sofa/output/benchmark_logs/ab_gen_nsight; export SOFA_USE_TOOL_ACTIVE_CELL_GENERATION=1; bash /home/arfin/gpu-sofa/scripts/run_nsight_fbp_profile_wsl.sh'
+# launch__grid_size for generateActiveDenseGridUniqueCandidatePairsKernel = 1024
+```
+
+### 7.8  Event-caching optimization (§5.16, landed)
+
+Workspace-cached broad-cull events are **always on**. They removed
+~40-80 µs/frame of `cudaEventCreate`/`cudaEventDestroy` churn with no change
+to contact counts, byte transfers, or launch counts.
+
+### 7.9  Large-tissue FBP run
+
+```powershell
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_fbp_large_tissue_wsl.sh
+```
+
+Expected (validation mode): ~110-120 FPS, 8018 contacts (5397 VF / 880 FV /
+1741 EE), overflow 0. The subdivided blade produces ~322 560 candidate
+pairs, so this scene exercises the FBP grid-stride loop (§5.17 in plan.md).
 
 ---
 

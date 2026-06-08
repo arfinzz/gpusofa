@@ -236,8 +236,8 @@ that's nowhere near the blade.
 
 ## 6.8 From cells to candidate pairs
 
-Once every triangle is inserted, the grid is scanned cell by cell. For each
-cell that has *both* tissue and tool triangles, we form all combinations:
+Once every triangle is inserted, the grid is scanned and for each cell that has
+*both* tissue and tool triangles, we form all combinations:
 
 ```text
 candidate pairs from a cell = (its tissue triangles) × (its tool triangles)
@@ -251,6 +251,38 @@ These pairs are the candidates that the expensive narrow-phase math will
 actually evaluate. For the benchmark, the grid reduces 153,600 brute-force
 checks down to about **2,304 raw candidate pairs** (and 624 after removing
 duplicates — next section).
+
+### Which cells get scanned? (the Phase 15 optimization)
+
+There are two ways to do this scan, and the project uses the smarter one by
+default:
+
+1. **All-cells scan (the original, now the fallback).** Visit *every* one of the
+   32,768 cells, check each for mixed tissue+tool content. The blade only
+   touches ~30 cells, so ~32,738 cells are visited for nothing. This is the
+   single most expensive kernel in the original pipeline (~300 µs — file 07).
+
+2. **Tool-active-cell scan (Phase 15, the default since 2026-05-25).** Notice the
+   asymmetry: the *tissue* is huge (covers thousands of cells), but the *tool*
+   is tiny (touches ~30 cells). A pair can only exist in a cell that has a tool
+   triangle. So instead of scanning all cells, scan only the **tool-occupied
+   cells** — about 30 of them.
+
+   The clever part: that list of tool-occupied cells is built **for free during
+   the blade insert** (kernel 4). When the first blade triangle lands in a cell
+   that already contains tissue, that cell's ID is appended to an "active list."
+   No separate scan pass is needed — the list is a side effect of an insert
+   that already runs. (Details and the correctness argument are in file 07 §7.4
+   and `guide/plan.md` §5.15.)
+
+   Result: candidate generation visits ~30 cells instead of 32,768. On the
+   one-tissue scene this dropped the generation kernel from ~300 µs to ~8 µs —
+   a 38× speedup — and the whole frame from ~221 to ~943 FPS. It produces the
+   **exact same candidate pairs** (it just skips cells that could never
+   contribute one), so the contacts are bit-identical.
+
+The flag is `useToolActiveCellGeneration` (default `true`). The all-cells scan
+is still there as a fallback and for the rare scene where the tool is not small.
 
 ---
 
@@ -298,6 +330,8 @@ The dense grid = a 64×8×64 box of cells covering scene space.
 Each cell has a tissue bucket and a tool bucket.
 A triangle is inserted into every cell its (inflated) bounding box overlaps.
 Cells with BOTH tissue and tool triangles generate candidate pairs.
+By default, only the ~30 tool-occupied (mixed) cells are scanned, not all
+  32,768 — the list of those cells is built for free during the blade insert.
 Duplicate pairs are removed with a GPU hash table.
 Result: ~624 unique candidate pairs instead of 153,600 brute-force checks.
 ```

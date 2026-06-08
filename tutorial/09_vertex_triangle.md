@@ -34,10 +34,12 @@ than triangle-triangle — it's just *one* closest-point-on-triangle test per
 
 The vertex-triangle path reuses almost everything from files 06–08:
 
-- The **dense grid** — same cells, same insertion, same candidate generation.
+- The **dense grid** — same cells, same insertion, same candidate generation
+  (including the active-cell optimization from file 06 §6.8 / file 07 §7.4).
 - The **closest-point-on-triangle math** (`closestPointOnTriangleBary`, Ericson
   5.1.5) — the exact same function from file 08.
-- The **workspace**, the **over-launch trick**, the **sync bypass**.
+- The **workspace**, the **over-launch + grid-stride** narrow kernel, the
+  **sync bypass**.
 
 What's different:
 
@@ -85,40 +87,51 @@ The candidate-generation kernel then pairs them up exactly as before, producing
 
 ## 9.4 The narrow kernel — `featureBasedVertexTriangleProximityKernel`
 
-One thread per `(triangle, vertex)` candidate pair:
+Like the tri-tri kernel (file 07 §7.6), this one **grid-strides** over all
+`(triangle, vertex)` candidate pairs — a fixed grid is launched and each thread
+loops over `idx, idx+stride, …` so the kernel is correct even when there are
+more pairs than launched threads:
 
 ```cpp
-const std::uint64_t pair = candidatePairs[tid];
-const std::uint32_t triId   = pair >> 32;          // triangle ID
-const std::uint32_t pointId = pair & 0xffffffff;   // vertex ID
+const std::uint32_t pairCount = *candidatePairCount;
+const std::uint32_t stride = gridDim.x * blockDim.x;
+for (uint32_t idx = blockIdx.x*blockDim.x + threadIdx.x; idx < pairCount; idx += stride) {
+    const std::uint64_t pair = candidatePairs[idx];
+    const std::uint32_t triId   = pair >> 32;          // triangle ID
+    const std::uint32_t pointId = pair & 0xffffffff;   // vertex ID
 
-// --- self-collision exclusion (see 9.5) ---
-if (selfCollisionVertexExclusionStride != 0) {
-    const std::uint32_t i0 = triangleIndices[3*triId+0];
-    const std::uint32_t i1 = triangleIndices[3*triId+1];
-    const std::uint32_t i2 = triangleIndices[3*triId+2];
-    if (pointId == i0 || pointId == i1 || pointId == i2) return;   // skip own corners
+    // --- self-collision exclusion (see 9.5) ---
+    if (selfCollisionVertexExclusionStride != 0) {
+        const std::uint32_t i0 = triangleIndices[3*triId+0];
+        const std::uint32_t i1 = triangleIndices[3*triId+1];
+        const std::uint32_t i2 = triangleIndices[3*triId+2];
+        if (pointId == i0 || pointId == i1 || pointId == i2) continue;   // skip own corners
+    }
+
+    const DeviceTriangle tri = indexedTriangleAt(trianglePositions, triangleIndices, triId);
+    const float3 p = pointPositions[pointId];
+
+    const float3 bary = closestPointOnTriangleBary(p, tri.p0, tri.p1, tri.p2);
+    const float3 cp   = reconstructFromBary(tri.p0, tri.p1, tri.p2, bary);
+    const float distSq = dot3(sub3(cp, p), sub3(cp, p));
+
+    if (distSq > contactDistance*contactDistance) continue;   // too far → next pair
+
+    // emit a VertexFace contact
+    const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
+    contacts[outIdx] = { pointId, triId, /*VertexFace*/, /*bary=(1,0,0)*/, bary, p, cp, normal, dist };
+    atomicAdd(vfCount, 1u);
 }
-
-const DeviceTriangle tri = indexedTriangleAt(trianglePositions, triangleIndices, triId);
-const float3 p = pointPositions[pointId];
-
-const float3 bary = closestPointOnTriangleBary(p, tri.p0, tri.p1, tri.p2);
-const float3 cp   = reconstructFromBary(tri.p0, tri.p1, tri.p2, bary);
-const float distSq = dot3(sub3(cp, p), sub3(cp, p));
-
-if (distSq > contactDistance*contactDistance) return;   // too far
-
-// emit a VertexFace contact
-const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
-contacts[outIdx] = { pointId, triId, /*VertexFace*/, /*bary=(1,0,0)*/, bary, p, cp, normal, dist };
-atomicAdd(vfCount, 1u);
 ```
 
 It's the same closest-point math from file 08, but run *once* (point vs face)
 instead of 15 times. That's why the vertex-triangle kernel is about 2× cheaper
 than the triangle-triangle kernel and uses only 32 registers per thread vs 68
 (measured in `reports/gpu_collision_phase11_12_kernel_profile_20260525.md`).
+
+(The grid-stride here is the same Phase 17 fix as the tri-tri kernel — without
+it, a large self-collision scene with more than ~262,144 candidate pairs would
+silently drop the overflow. See file 07 §7.6.)
 
 ---
 

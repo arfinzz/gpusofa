@@ -244,6 +244,10 @@ if (bestDistSq > contactDistance*contactDistance) return;   // 0.0009 threshold
 // otherwise emit the contact with bestKind, bestBarycentrics, bestPoints, ...
 ```
 
+(This shows the logic for *one* candidate pair. In the real kernel this body sits
+inside a grid-stride loop — file 07 §7.6 — so the early-out is a `continue` to
+the next pair, not a `return` from the whole thread.)
+
 The winning `bestKind` is recorded as the contact's `featureKind`
 (VertexFace / FaceVertex / EdgeEdge). This is why the CSV reports a VF/FV/EE
 breakdown — it's literally a tally of which feature won for each contact.

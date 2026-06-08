@@ -218,6 +218,16 @@ material.
 **Candidate pair** — a `(tissue triangle, tool triangle)` combination generated
 from a shared cell; a pair worth checking precisely.
 
+**Mixed cell / active cell** — a cell that contains *both* tissue and tool
+primitives. Only these can produce candidate pairs. The list of active cells is
+built during the tool insert and drives the default candidate generation.
+
+**Tool-active-cell generation** — the default candidate-generation strategy
+(Phase 15). Instead of scanning all 32,768 cells, it scans only the ~30 active
+cells (whose list was built for free during the tool insert). 38× faster than
+the all-cells scan, with bit-identical output. Flag: `useToolActiveCellGeneration`
+(default on).
+
 **Dedupe (deduplication)** — removing duplicate candidate pairs (generated when
 triangles span multiple shared cells) via a GPU hash table.
 
@@ -252,9 +262,15 @@ every frame.
 **`DenseGridConfig`** — the bundle of grid parameters (bounds, resolution,
 contact distance, capacities, flags) passed from the scene to the backend.
 
-**Over-launch** — launching a fixed, generous number of threads (65,536) and
-having each exit early if it has no work, to avoid a synchronous readback of the
-exact count.
+**Over-launch** — launching a fixed, generous number of threads (up to ~262,144)
+without first reading the exact work count from the GPU, to avoid a synchronous
+readback. Paired with a grid-stride loop so every work item is still processed.
+
+**Grid-stride loop** — a kernel pattern where each thread processes items
+`idx, idx+stride, idx+2·stride, …` (stride = total launched threads). It makes a
+kernel correct for *any* number of items regardless of how many threads were
+launched. Used by both proximity kernels (Phase 17 fix); without it, a large
+scene with more pairs than threads silently dropped the overflow.
 
 **Own-corner exclusion** — in self-collision, skipping (triangle, vertex) pairs
 where the vertex is one of the triangle's own corners (would falsely report
@@ -306,13 +322,18 @@ and closest-points-between-segments, implemented as device functions.
 | Tissue vertices | 6,561 |
 | Blade triangles | 12 |
 | Grid cells | 32,768 (64×8×64) |
+| Active (mixed) cells scanned | ~30 (default), vs all 32,768 (old path) |
 | Contact distance | 0.03 |
 | Raw candidate pairs | ~2,304 |
 | Unique candidate pairs | ~624 |
 | Contacts (FBP) | ~56 (all edge-edge) |
-| Fast-path FPS | ~775 |
+| Fast-path FPS | ~940 (with active-cell generation; was ~775 before) |
 | Fast-path H2D / D2H bytes | 0 / 0 |
 | Kernel launches / memsets | 7 / 1 (FBP path) |
+
+For comparison, the **large-tissue/subdivided-blade** scene: 79,520 collision
+elements, ~322,560 candidate pairs, 8,018 contacts (5397 VF / 880 FV / 1741 EE),
+~116 FPS. This scene is what exercises the grid-stride loop (file 07 §7.6).
 
 ---
 

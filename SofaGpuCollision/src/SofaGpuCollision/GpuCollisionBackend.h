@@ -201,6 +201,19 @@ struct DenseGridConfig
     bool computeDeviceContactsWhenContactsStayOnDevice { false };
     bool compactActiveCells { false };
     bool batchTriangleInsert { false };
+    // Phase 15: generate candidate pairs over tool-occupied (mixed) cells only.
+    // The active-cell list is built during the tool insert (no separate scan),
+    // then candidate generation launches a small fixed grid over that list
+    // instead of one block per grid cell. Distinct from compactActiveCells
+    // (which scans all cells and regressed). Mutually exclusive with
+    // batchTriangleInsert (which breaks the tissue-before-tool ordering this
+    // path relies on).
+    //
+    // DEFAULT ON as of 2026-05-25: measured 4.3x faster on one-tissue/one-blade
+    // and 1.08x on large-tissue/blade, with bit-identical contact output and
+    // zero overflow on both. The path is structurally never worse than the
+    // all-cells generator (active list <= cellCount, grid-strided).
+    bool useToolActiveCellGeneration { true };
 };
 
 // Configuration for the feature-based proximity (VF/EE) narrow phase. Reuses

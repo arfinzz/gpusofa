@@ -23,17 +23,23 @@ Primary optimization metric: integrated SOFA wall time. Secondary: emit
 contact data in a form that a CUDA constraint solver can consume directly
 (barycentric weights + signed distance + normal, kept on device).
 
-The 2026-05-25 production fast path delivers:
+The 2026-05-25 production fast path (with Phase 15 tool-active-cell
+generation now default-on) delivers:
 
 | Scene | FPS | Narrow wall | H2D / D2H bytes per frame |
 |---|---:|---:|---:|
-| one-tissue / one-blade, exact-contact detection | 633 | 0.69 ms | 0 / 0 |
-| one-tissue / one-blade, **tri-tri FBP** | **775** | **0.67 ms** | **0 / 0** |
-| 2-layer slab, **v-t self-collision** | 1385 | 0.66 ms | 0 / 16 |
-| tissue + tool cloud, **v-t cross-model** | 1968 | 0.37 ms | 0 / 16 |
+| one-tissue / one-blade, **tri-tri FBP** | **~940** | **~0.5 ms** | **0 / 0** |
+| 2-layer slab, **v-t self-collision** | ~1400 | ~0.5 ms | 0 / 16 |
+| tissue + tool cloud, **v-t cross-model** | ~1900 | ~0.4 ms | 0 / 16 |
+| large-tissue / subdivided-blade, tri-tri FBP | ~116 | ~4.1 ms | 0 / 16 |
+
+(FPS figures are thermally sensitive on this laptop; ranges given. The
+one-tissue tri-tri FBP path was ~775 FPS before Phase 15 and ~940 after.)
 
 All four paths share the same dense-grid broad cull. The differences are in
-the narrow-pass kernel and the host-side dispatch.
+the narrow-pass kernel and the host-side dispatch. **Phase 15 (§5.15)
+collapsed the candidate-generation kernel from ~300 µs to ~8 µs, making it
+no longer the bottleneck.**
 
 ---
 
@@ -70,15 +76,21 @@ proximityReadContactCounter               = false       ← unless validating
 proximityKeepContactsOnDevice             = true        ← constraint-solver-ready
 readCountersWhenContactsStayOnDevice      = false       ← unless validating
 computeDeviceContactsWhenContactsStayOnDevice = false   ← unless using legacy exact-contact device-side
-compactActiveCells                        = false       ← regressed on GTX 1650 Ti
-batchTriangleInsert                       = false       ← regressed on GTX 1650 Ti
+useToolActiveCellGeneration               = true        ← DEFAULT ON (Phase 15, §5.15)
+compactActiveCells                        = false       ← regressed on GTX 1650 Ti, superseded by the above
+batchTriangleInsert                       = false       ← regressed; mutually exclusive with useToolActiveCellGeneration
 ```
 
-The optional `compactActiveCells` and `batchTriangleInsert` are runtime
-switches kept for experimentation. The 2026-05-14 profile showed that
-enabling either regressed one-tissue narrow wall from ~1.18 ms to ~5.09 ms,
-so the default keeps them off. The architecture leaves them in place because
-a future larger-scene workload could flip the conclusion.
+`useToolActiveCellGeneration` is the Phase 15 optimization and is **default
+on** (4.3× on one-tissue, 1.08× on large-tissue, bit-identical output,
+never a regression — §5.15).
+
+The older `compactActiveCells` and `batchTriangleInsert` remain runtime
+switches but stay **off**: the 2026-05-14 profile showed both regressed
+(one-tissue narrow wall ~1.18 → ~5.09 ms). `compactActiveCells` is
+effectively superseded by `useToolActiveCellGeneration`, which achieves the
+active-cell idea without the separate full-grid scan that made
+`compactActiveCells` slow.
 
 ---
 
@@ -127,6 +139,9 @@ section below for the "why" and the measured outcome.
 | 12 | Vertex-triangle proximity | Done end-to-end (self + cross-model) | §5.12 |
 | 13 | Atomic / lock optimization | Decided against | §5.13 |
 | 14 | Profiling reshape | Done | §5.14 |
+| 15 | Tool-active-cell candidate generation | **Done — DEFAULT ON 2026-05-25** | §5.15 |
+| 16 | Workspace-cached broad-cull CUDA events | **Done 2026-05-25** | §5.16 |
+| 17 | FBP/v-t grid-stride correctness fix | **Done 2026-05-25** | §5.17 |
 
 ---
 
@@ -513,6 +528,304 @@ reached the CSV, and CUDA events were created/destroyed per frame.
 kernel time, expose VF/FV/EE breakdowns, and report a derived host-sync
 column for diagnosing the wall-vs-kernel gap.
 
+### 5.15  Tool-active-cell candidate generation (DONE, DEFAULT ON, 2026-05-25)
+
+**Status: implemented, verified correct on both small AND large scenes,
+default ON.** Controlled by `useToolActiveCellGeneration` (now default
+true). Scoped to the **indexed** contact path
+(`computeDenseGridIndexedTriangleContacts`), which is the production
+FBP/exact-contact broad cull. The packed fallback path ignores the flag
+and stays correct (just unoptimized).
+
+**Measured (one-tissue/one-blade, 2026-05-25 A/B, same cool GPU
+back-to-back):**
+
+```text
+Fast path (production, no counter readback):
+  baseline (off):  221 FPS, 4.00 ms narrow wall, 3.83 ms narrow kernel
+  active  (on):    943 FPS, 0.56 ms narrow wall, 0.35 ms narrow kernel
+  -> 4.3x FPS, 10.9x lower kernel time
+
+Validation (counter readback on):
+  baseline (off):  119 FPS, 56 contacts (all EE), overflow 0
+  active  (on):    475 FPS, 56 contacts (all EE), overflow 0
+  -> CONTACT COUNTS BIT-IDENTICAL
+
+Nsight, generation kernel only:
+  baseline: generateDenseGridUniqueCandidatePairsKernel       grid=32768, 300 us
+  active:   generateActiveDenseGridUniqueCandidatePairsKernel grid= 1024, 7.9 us
+  -> 32x fewer launched blocks, 38x faster generation
+```
+
+**Measured (large-tissue/blade, 79 520 collision elements, subdivided
+blade, after the §5.17 grid-stride fix):**
+
+```text
+Validation (counter readback on):
+  baseline (off):  108 FPS, 4.63 ms narrow wall, 3.91 ms narrow kernel
+  active  (on):    116 FPS, 4.09 ms narrow wall, 3.33 ms narrow kernel
+  -> 1.08x FPS; 8018 contacts (5397 VF / 880 FV / 1741 EE) BIT-IDENTICAL
+     between off/on; unique_candidate_count=322560 identical; overflow 0
+```
+
+**Verdict and default decision.** The win is large on the one-tissue
+scene (4.3×, where the tiny 12-triangle blade touches ~30 cells) and
+modest on the large scene (1.08×, where the subdivided blade touches many
+cells so the tool/tissue asymmetry is weaker and the FBP kernel itself
+dominates). **It is never a regression** — contact output is bit-identical
+on both scenes and the active list is structurally ≤ cellCount (grid-
+strided), so the path can never do more work than the all-cells generator.
+On that evidence the default was flipped to **ON** (`DenseGridConfig` and
+the `GpuCollisionNarrowPhase` Data field both default true; the benchmark
+scenes' env-flag defaults are now true).
+
+Generation dropped from ~80% of GPU time to ~13% on the small scene. Total
+GPU kernel time per frame ~380 us -> ~61 us. Report:
+`reports/gpu_collision_phase15_16_optimization_20260525.md`.
+
+**The `compactActiveCells` precedent (why this needed measuring).** The
+2026-05-14 `compactActiveCells` experiment regressed because it ran a
+*separate full-grid scan*. Phase 15 avoids that scan entirely (it builds
+the list during the tool insert), which is why it wins where the older
+approach lost. The large-scene A/B was the gate for flipping the default,
+and it cleared.
+
+---
+
+**Original design notes (as-built):** This is the highest-value
+optimization. It attacks the single dominant cost in the narrow phase.
+
+**The problem.** Nsight (`reports/end_to_end_verification_20260525.md`
+§7) shows `generateDenseGridUniqueCandidatePairsKernel` consuming
+**~300 µs = ~80% of all GPU time** in the tri-tri FBP path. The cause is
+structural: the kernel launches **one block per grid cell**:
+
+```cpp
+generateDenseGridUniqueCandidatePairsKernel<<<cellCount, 256>>>   // cellCount = 32 768
+...
+const std::uint32_t cellId = blockIdx.x;   // ONE block per cell, ALL cells
+```
+
+The blade (tool) only occupies ~30 cells. So ~32 738 blocks read an empty
+or single-class bucket, find `toolCount == 0` → `totalPairs == 0` → exit
+having done nothing. The 300 µs is **block-scheduling overhead for 32 768
+mostly-empty blocks across 16 SMs (~512 dispatch waves)**, measured at
+only 26 % SM throughput. The actual useful pair work (624 unique pairs)
+is trivial.
+
+**Why this is NOT the failed `compactActiveCells` (Phase 9).** The
+existing `compactActiveCells` experiment ran a separate
+`compactActiveDenseGridCellsKernel` that **scans all 32 768 cells** (one
+thread per cell) to build a mixed-cell list. That scan reads the entire
+256 KB grid — the same memory traffic as the generation it replaces — so
+it regressed (1.18 → 5.09 ms on the GTX 1650 Ti). The new approach
+**never scans all cells**.
+
+**The design: build the active-cell list for free during the tool insert.**
+
+The tool insert (`insertIndexedTrianglesKernel` with `insertTissue=false`)
+is already running, already launch-bound (1 block, 244 idle threads for a
+12-triangle blade). We piggyback the active-list build onto it. In
+`insertTriangleAabbIntoGrid`, when inserting a TOOL triangle:
+
+```cpp
+const std::uint32_t localIndex = atomicAdd(&grid[cellId].toolCount, 1u);
+// NEW: register this cell as active the first time a tool triangle lands
+// in it, but only when tissue is already present in the cell.
+if (buildToolActiveList && localIndex == 0u && grid[cellId].tissueCount > 0u) {
+    const std::uint32_t a = atomicAdd(activeCellCount, 1u);
+    activeCellIds[a] = cellId;   // activeCellIds is sized to cellCount, cannot overflow
+}
+```
+
+Correctness arguments:
+
+- `localIndex == 0` ⇒ "first tool triangle to claim a slot in this cell"
+  ⇒ each cell is appended **at most once** (natural dedupe, no extra
+  pass).
+- `grid[cellId].tissueCount > 0` is valid because **tissue insert
+  (kernel 2) completes before tool insert (kernel 3)** on the serialized
+  default stream. So the list contains exactly the **mixed** cells
+  (~30 or fewer), not just tool cells. Tool-only cells contribute zero
+  pairs anyway, so excluding them is a pure win.
+- `resetDenseGridKernel` already zeroes `activeCellCount` (line 1036),
+  so no extra reset is needed.
+- `activeCellIds` is already allocated to `cellCount` entries
+  (`ensure(...)` line 515), so the append can never overflow.
+
+**Generation reuses an existing kernel.** The repo **already has**
+`generateActiveDenseGridUniqueCandidatePairsKernel` (added for the
+`compactActiveCells` experiment). It device-reads `*activeCellCount` and
+grid-strides:
+
+```cpp
+const std::uint32_t activeCount = *activeCellCount;
+for (uint32_t activeIndex = blockIdx.x; activeIndex < activeCount; activeIndex += gridDim.x) { ... }
+```
+
+So we launch a **fixed modest grid** — e.g. `<<<256, 256>>>` — with **no
+host readback**. The ~30 active cells are handled by the first ~30 blocks;
+the remaining ~226 blocks read the device count, see they're out of
+range, and exit in ~1 instruction. **256 blocks vs 32 768 = 128× fewer
+launched blocks**, and only ~30 do real work.
+
+**New opt-in flag.** Add `useToolActiveCellGeneration`:
+
+- `DenseGridConfig.useToolActiveCellGeneration` (backend)
+- `GpuCollisionNarrowPhase` Data field `useToolActiveCellGeneration`
+- env var `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION`
+
+Kept **distinct from `compactActiveCells`** so the regressed experiment
+stays off and the two are independently measurable.
+
+**Incompatibilities.** This path depends on tissue being inserted before
+tool. It is therefore **mutually exclusive with `batchTriangleInsert`**
+(which fuses both inserts and breaks the ordering). The backend must
+reject the combination with a diagnostic (same pattern as
+`canonicalPairEmission` being rejected for indexed mode).
+
+**Expected outcome.** Generation: ~300 µs → target < 30 µs. Narrow wall
+~0.83 ms → target ~0.5 ms. FPS ~672 → target ~900-1000 on the one-tissue
+scene. The insert kernels, FBP kernel, and contact output are unchanged.
+
+**Risk.** On the 1650 Ti, even empty-block early-exit is cheap, so the
+real win may be smaller than the theoretical 10×. The 2026-05-14
+`compactActiveCells` regression is the cautionary precedent — but that
+failure was the *separate scan*, which this design eliminates. **Must be
+A/B measured** before becoming a default. If it wins, consider making it
+the default for the indexed path (it is never worse than the dense path:
+the active list is always ≤ the number of cells).
+
+**Implementation checklist.**
+
+1. Add `useToolActiveCellGeneration` to `DenseGridConfig` (header + stub).
+2. Add `buildToolActiveList`, `activeCellIds`, `activeCellCount` params to
+   `insertTriangleAabbIntoGrid` and the indexed/packed insert kernels.
+3. Append-on-first-tool-insert logic as above.
+4. In `computeDenseGridIndexedTriangleContacts` (and the packed variant),
+   when `useToolActiveCellGeneration`, launch the tool insert with the
+   active-list outputs, then launch
+   `generateActiveDenseGridUniqueCandidatePairsKernel<<<kActiveGenBlocks, 256>>>`
+   instead of the all-cells generator.
+5. Reject `useToolActiveCellGeneration && batchTriangleInsert`.
+6. Wire the Data field + env var in `GpuCollisionNarrowPhase` and the
+   benchmark scenes.
+7. A/B benchmark one-tissue + large-tissue, capture Nsight on the new
+   generation launch, write a finding report.
+
+### 5.16  Workspace-cached broad-cull CUDA events (DONE, 2026-05-25)
+
+**Status: implemented, always on.** The four broad-cull timing events
+(`broadStageStart/End`, `broadTotalStart/End`) now live on
+`DenseGridWorkspace`, lazy-created once via `ensureBroadEvents()` and
+freed in the workspace destructor. Both contact functions alias the
+cached handles; `destroyStageEvents()` is now a no-op. Verified: v-t
+self (2700 VF) and v-t cross (254 VF) contact counts unchanged, no
+correctness change. Removes ~40-80 us/frame of `cudaEventCreate` /
+`cudaEventDestroy` driver churn (small relative to the Phase 15 win but
+free and always on).
+
+---
+
+**Original design notes (as-built):** Small, low-risk CPU-side win.
+
+**The problem.** `computeDenseGridIndexedTriangleContacts` (line ~3219)
+and `computeDenseGridTriangleContacts` (line ~4160) each call
+`cudaEventCreate` 2-4× and `cudaEventDestroy` 2-4× **every frame** for
+their `stageStart`/`stageEnd`/`totalStart`/`totalEnd` timing events. At
+~5-10 µs per create/destroy on the GTX 1650 Ti, that is **~40-80 µs of
+pure driver overhead per frame** — a measurable chunk of the
+`host_synchronization_ms` gap.
+
+**The design.** Mirror exactly what Phase 5.14 already did for the FBP
+events (`fbpStartEvent` / `fbpEndEvent`). Add to `DenseGridWorkspace`:
+
+```cpp
+cudaEvent_t broadStageStart{}, broadStageEnd{}, broadTotalStart{}, broadTotalEnd{};
+bool broadEventsReady{false};
+cudaError_t ensureBroadEvents() {
+    if (broadEventsReady) return cudaSuccess;
+    cudaError_t err = cudaEventCreate(&broadStageStart);
+    if (err == cudaSuccess) err = cudaEventCreate(&broadStageEnd);
+    if (err == cudaSuccess) err = cudaEventCreate(&broadTotalStart);
+    if (err == cudaSuccess) err = cudaEventCreate(&broadTotalEnd);
+    broadEventsReady = (err == cudaSuccess);
+    return err;
+}
+```
+
+Replace the per-frame `cudaEventCreate`/`cudaEventDestroy` in both
+functions with `workspace.ensureBroadEvents()` + the cached handles. Drop
+the `destroyStageEvents()` calls (events live for plugin lifetime, freed
+in the workspace destructor). `cudaEventRecord` overwrites the timestamp
+each frame, so reuse is safe.
+
+**Expected outcome.** ~40-80 µs/frame off `host_synchronization_ms`.
+Narrow wall ~0.83 ms → ~0.75 ms, FPS ~672 → ~750 on the one-tissue scene
+(stacks additively with Phase 5.15).
+
+**Risk.** Minimal — this is a mechanical mirror of a change that already
+shipped for the FBP events. The only subtlety is that `detailedProfiling`
+mode currently creates the stage events conditionally; with caching we
+create all four once regardless (unused events cost nothing).
+
+**Implementation checklist.**
+
+1. Add the four `broad*` events + `broadEventsReady` + `ensureBroadEvents()`
+   to `DenseGridWorkspace`.
+2. Free them in `release()` (guarded by `broadEventsReady`).
+3. Swap both functions to use the cached handles; delete the per-frame
+   create/destroy and the `destroyStageEvents()` lambda.
+4. Verify with a fast-path run that `host_synchronization_ms` drops and no
+   correctness change.
+
+### 5.17  FBP / v-t grid-stride correctness fix (DONE, 2026-05-25)
+
+**Status: fixed.** A real correctness bug, discovered during the Phase 15
+large-tissue A/B, affecting all FBP and v-t output (not introduced by
+Phase 15 — Phase 15 exposed it).
+
+**The bug.** `featureBasedProximityKernel` and
+`featureBasedVertexTriangleProximityKernel` processed exactly one candidate
+pair per thread (`candidatePairs[tid]`) with **no grid-stride loop**. They
+launched a fixed over-launch grid of 256 blocks × 256 threads = **65 536
+threads**. On the one-tissue scene (624 candidate pairs) this was fine, but
+the large-tissue scene produces **322 560 candidate pairs** — so the kernel
+silently processed only the first 65 536 and **dropped ~80% of pairs**.
+
+The bug was invisible until the large-tissue A/B because (a) all prior
+scenes had < 65 536 pairs, and (b) it produced a *plausible* contact count.
+It surfaced as a discrepancy: baseline emitted 3691 contacts, active 3790,
+even though both had identical `unique_candidate_count` (322 560). The
+cause was that the two paths order `candidatePairs[]` differently (cell
+order vs active-list order), so each processed a different first-65 536
+subset.
+
+**The fix.** Wrap both kernel bodies in a grid-stride loop:
+
+```cpp
+const uint32_t pairCount = *candidatePairCount;
+const uint32_t stride = gridDim.x * blockDim.x;
+for (uint32_t idx = blockIdx.x*blockDim.x + threadIdx.x; idx < pairCount; idx += stride) {
+    ... process candidatePairs[idx] ...   // returns became continues
+}
+```
+
+Now every pair is processed regardless of launch grid size. The launch
+grid is purely a GPU-saturation target (bumped to 1024 blocks). After the
+fix, the large-tissue scene emits **8018 contacts** (5397 VF / 880 FV /
+1741 EE) — bit-identical between baseline and active, and the *correct*
+count (the old 3691/3790 were both wrong).
+
+**Impact.** This makes FBP and v-t correct for arbitrarily large candidate-
+pair counts. Small scenes (< 65 536 pairs) are unaffected (one-tissue still
+56 EE, v-t self 2700 VF, v-t cross 254 VF). The fix is independent of
+Phase 15 but was a prerequisite for trusting the large-scene A/B.
+
+**Lesson recorded:** the over-launch pattern (introduced in the Phase 11
+sync fix, §5.11) needs a grid-stride loop to be correct, not just a
+per-thread bound check. Any future over-launched kernel must grid-stride.
+
 ---
 
 ## 6. Phase 11/12 follow-ups (landed 2026-05-25)
@@ -626,6 +939,26 @@ No structural regression.
 ---
 
 ## 7. Remaining work (priority order)
+
+### 7.0  Generation + event optimizations — LANDED + DEFAULT ON 2026-05-25
+
+Fully closed out. Both optimizations are implemented, verified correct on
+small *and* large scenes, and Phase 15 is now **default ON**. A latent
+correctness bug exposed during the large-scene A/B was also fixed (§5.17).
+
+1. **Tool-active-cell candidate generation (§5.15)** — DONE, default ON.
+   Generation kernel 300 µs → 7.9 µs (38×), one-tissue fast path
+   221 → 943 FPS (4.3×), large-tissue 108 → 116 FPS (1.08×), contact
+   counts bit-identical on both. Generation grid dropped 32 768 → 1 024
+   blocks (Nsight-confirmed).
+2. **Workspace-cached broad-cull events (§5.16)** — DONE, always on.
+3. **FBP/v-t grid-stride correctness fix (§5.17)** — DONE. Both proximity
+   kernels now grid-stride over all candidate pairs; large scenes no
+   longer silently drop ~80% of pairs.
+
+Nothing remains open here. The next-tier opportunities (extend active-cell
+generation to the v-t point-insert path; warp-per-pair FBP for register
+pressure) are tracked in §7.4 and §7.5.
 
 ### 7.1  Profiling polish (small, opportunistic)
 
