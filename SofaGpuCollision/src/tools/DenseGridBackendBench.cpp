@@ -581,5 +581,114 @@ int main()
                   << "vt_csv=" << vtPath.string() << '\n';
     }
 
+    // -----------------------------------------------------------------------
+    // EXPERIMENTAL: hash + prefix-sum broad cull (must match the tri-tri FBP
+    // phase contact count exactly — same geometry, same narrow kernel).
+    // -----------------------------------------------------------------------
+    if (envBool("SOFA_BACKEND_BENCH_RUN_HASH", true))
+    {
+        std::cout << "\n--- bench: hash + prefix-sum (tri-tri) ---\n";
+        const auto tissueIndexed = packedToIndexed(tissue);
+        const auto bladeIndexed = packedToIndexed(blade);
+
+        TriangleIndexedSurface tissueSurface;
+        tissueSurface.positions = tissueIndexed.positions.data();
+        tissueSurface.devicePositions = nullptr;
+        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
+        tissueSurface.triangleIndices = tissueIndexed.indices.data();
+        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
+        tissueSurface.surfaceId = 0xC001ull;
+        tissueSurface.topologyVersion = 1;
+
+        TriangleIndexedSurface bladeSurface;
+        bladeSurface.positions = bladeIndexed.positions.data();
+        bladeSurface.devicePositions = nullptr;
+        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
+        bladeSurface.triangleIndices = bladeIndexed.indices.data();
+        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
+        bladeSurface.surfaceId = 0xC002ull;
+        bladeSurface.topologyVersion = 1;
+
+        SofaGpuCollision::backend::HashPrefixSumConfig hashConfig;
+        hashConfig.hashTableSize = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_TABLE_SIZE", 0));
+        hashConfig.maxProbe = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_MAX_PROBE", 64));
+
+        FeatureBasedProximityConfig fbpConfig;
+        fbpConfig.contactDistance = config.contactDistance;
+        fbpConfig.computeBarycentrics = true;
+        fbpConfig.keepContactsOnDevice = false;
+        fbpConfig.readContactCounter = true;
+        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+
+        const std::filesystem::path hashPath = outputPath.parent_path() / (outputPath.stem().string() + "_hash.csv");
+        std::ofstream hashCsv(hashPath, std::ios::out | std::ios::trunc);
+        hashCsv << std::fixed << std::setprecision(9);
+        hashCsv << "step,wall_ms,gpu_kernel_ms,h2d_bytes,d2h_bytes,kernel_launch_count,cuda_memset_count,"
+                   "hash_table_size,occupied_slots,raw_pairs,unique_pairs,emitted_contacts,vf,fv,ee,"
+                   "bucket_overflow,probe_overflow\n";
+
+        double hashWallTotal = 0.0, hashKernelTotal = 0.0;
+        int hashMeasured = 0;
+        std::uint64_t hashLastContacts = 0, hashLastUnique = 0, hashLastOccupied = 0, hashLastTable = 0;
+        std::uint64_t hashLastVf = 0, hashLastFv = 0, hashLastEe = 0, hashLastBucketOf = 0, hashLastProbeOf = 0;
+
+        for (int step = 0; step < steps + warmup; ++step)
+        {
+            std::vector<ProximityContact> hashContacts;
+            SofaGpuCollision::backend::BackendExecutionStats stats;
+            FeatureBasedProximityStats proximityStats;
+            SofaGpuCollision::backend::HashPrefixSumStats hashStatsOut;
+            std::string diagnostic;
+
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = SofaGpuCollision::backend::computeHashPrefixSumProximityContacts(
+                tissueSurface, bladeSurface, config, hashConfig, fbpConfig,
+                hashContacts, &proximityStats, &hashStatsOut, diagnostic, &stats);
+            const double wallMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (!ok) { std::cerr << "Hash bench failed: " << diagnostic << "\n"; return 5; }
+
+            if (step >= warmup)
+            {
+                ++hashMeasured;
+                hashWallTotal += wallMs;
+                hashKernelTotal += stats.gpuKernelMilliseconds;
+                hashLastContacts = proximityStats.emittedContactCount;
+                hashLastUnique = hashStatsOut.uniquePairCount;
+                hashLastOccupied = hashStatsOut.occupiedSlotCount;
+                hashLastTable = hashStatsOut.hashTableSize;
+                hashLastVf = proximityStats.vfContactCount;
+                hashLastFv = proximityStats.fvContactCount;
+                hashLastEe = proximityStats.eeContactCount;
+                hashLastBucketOf = hashStatsOut.bucketOverflowCount;
+                hashLastProbeOf = hashStatsOut.hashProbeOverflowCount;
+            }
+
+            hashCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
+                    << stats.hostToDeviceBytes << ',' << stats.deviceToHostBytes << ','
+                    << stats.kernelLaunchCount << ',' << stats.cudaMemsetCount << ','
+                    << hashStatsOut.hashTableSize << ',' << hashStatsOut.occupiedSlotCount << ','
+                    << hashStatsOut.rawPairCount << ',' << hashStatsOut.uniquePairCount << ','
+                    << proximityStats.emittedContactCount << ','
+                    << proximityStats.vfContactCount << ',' << proximityStats.fvContactCount << ','
+                    << proximityStats.eeContactCount << ','
+                    << hashStatsOut.bucketOverflowCount << ',' << hashStatsOut.hashProbeOverflowCount << '\n';
+        }
+
+        std::cout << "hash_measured_steps=" << hashMeasured << '\n'
+                  << "hash_wall_avg_ms=" << (hashMeasured > 0 ? hashWallTotal / hashMeasured : 0.0) << '\n'
+                  << "hash_gpu_kernel_avg_ms=" << (hashMeasured > 0 ? hashKernelTotal / hashMeasured : 0.0) << '\n'
+                  << "hash_table_size=" << hashLastTable << '\n'
+                  << "hash_occupied_slots=" << hashLastOccupied << '\n'
+                  << "hash_unique_pairs=" << hashLastUnique << '\n'
+                  << "hash_contacts=" << hashLastContacts << " (vf=" << hashLastVf
+                  << " fv=" << hashLastFv << " ee=" << hashLastEe << ")\n"
+                  << "hash_bucket_overflow=" << hashLastBucketOf
+                  << " hash_probe_overflow=" << hashLastProbeOf << '\n'
+                  << "hash_csv=" << hashPath.string() << '\n'
+                  << "CORRECTNESS: hash_contacts (" << hashLastContacts
+                  << ") should equal fbp_contacts above.\n";
+    }
+
     return 0;
 }

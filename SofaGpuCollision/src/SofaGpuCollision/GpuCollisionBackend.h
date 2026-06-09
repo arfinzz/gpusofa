@@ -239,6 +239,32 @@ struct FeatureBasedProximityStats
     float minSignedDistance { 0.0f };
 };
 
+// Experimental (experiment/hash-prefixsum-broadphase branch): configuration for
+// the spatial-hash + prefix-sum work-expansion broad cull. This is an ALTERNATIVE
+// to the dense-grid broad cull, intended for large-tissue + large-tool scenes
+// where the dense grid's fixed cell array wastes memory and the block-per-cell
+// candidate generation load-balances poorly. The narrow phase is unchanged (it
+// reuses the same feature-based proximity kernel on the generated pairs).
+struct HashPrefixSumConfig
+{
+    // Number of slots in the open-addressing spatial hash table. 0 = auto-derive
+    // from the input sizes. Must be a power of two when non-zero; the backend
+    // rounds up to the next power of two regardless.
+    std::uint32_t hashTableSize { 0 };
+    // Maximum linear-probe steps before an insertion gives up (counts as overflow).
+    std::uint32_t maxProbe { 64 };
+};
+
+struct HashPrefixSumStats
+{
+    std::uint32_t hashTableSize { 0 };
+    std::uint32_t occupiedSlotCount { 0 };       // hash slots that ended up non-empty
+    std::uint32_t rawPairCount { 0 };            // total pairs before dedup (the prefix-sum total)
+    std::uint32_t uniquePairCount { 0 };         // after dedup
+    std::uint32_t hashProbeOverflowCount { 0 };  // insertions that exceeded maxProbe
+    std::uint32_t bucketOverflowCount { 0 };     // triangles dropped from full slot buckets
+};
+
 SOFA_GPU_COLLISION_API BackendStatus probe();
 
 SOFA_GPU_COLLISION_API bool computeBroadPhasePairs(
@@ -306,6 +332,27 @@ SOFA_GPU_COLLISION_API bool computeFeatureBasedVertexTriangleContacts(
     const FeatureBasedProximityConfig& proximityConfig,
     std::vector<ProximityContact>& contacts,
     FeatureBasedProximityStats* proximityStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
+
+// Experimental (experiment/hash-prefixsum-broadphase branch): triangle-triangle
+// feature-based proximity using a spatial-hash + prefix-sum broad cull instead
+// of the dense grid. The grid geometry (bounds, resolution, contact distance,
+// per-cell capacities) still comes from DenseGridConfig — the cells are the same;
+// only the storage (hash table vs dense array) and the candidate generation
+// (prefix-sum work expansion vs block-per-cell) differ. The narrow phase reuses
+// the same FBP kernel, so contact output is identical to
+// computeFeatureBasedProximityContacts. Intended for large-tissue + large-tool
+// scenes. Independent of DenseGridWorkspace (its own HashGridWorkspace).
+SOFA_GPU_COLLISION_API bool computeHashPrefixSumProximityContacts(
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    const DenseGridConfig& gridConfig,
+    const HashPrefixSumConfig& hashConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    HashPrefixSumStats* hashStats,
     std::string& diagnostic,
     BackendExecutionStats* executionStats = nullptr);
 

@@ -132,4 +132,32 @@ bool computeFeatureBasedVertexTriangleContacts(
     return false;
 }
 
+bool computeHashPrefixSumProximityContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const HashPrefixSumConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    HashPrefixSumStats* hashStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr)
+    {
+        *executionStats = BackendExecutionStats {};
+    }
+    if (proximityStats != nullptr)
+    {
+        *proximityStats = FeatureBasedProximityStats {};
+    }
+    if (hashStats != nullptr)
+    {
+        *hashStats = HashPrefixSumStats {};
+    }
+    diagnostic = "GPU hash + prefix-sum proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
 } // namespace SofaGpuCollision::backend

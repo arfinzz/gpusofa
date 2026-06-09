@@ -236,6 +236,8 @@ output-mode switches and the dense-grid configuration.
 | `compactActiveCells` | **false** | Experimental: compact mixed cells via a separate full-grid scan. Regressed on GTX 1650 Ti, superseded by `useToolActiveCellGeneration` |
 | `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed; mutually exclusive with `useToolActiveCellGeneration` |
 | `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
+| `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; ~+13% FPS / −14% narrow wall on 12.8k+1.6k tris. See `reports/hash_prefixsum_broadphase_experiment_20260609.md`. Requires `useFeatureBasedProximity=true` |
+| `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |
 | `proximityComputeBarycentrics` | true | Populate ProximityContact barycentric weights |
