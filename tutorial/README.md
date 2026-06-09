@@ -11,10 +11,16 @@ example-driven companion to it. The guide is a reference; this is a lesson.
 
 ## How to read this
 
-Read the files in order. Each one builds on the previous.
+**New here? Read [00_high_level_flow.md](00_high_level_flow.md) first** — it's the
+easy, no-jargon big picture of the whole system on one page. Then read the rest
+in order; each builds on the previous. The final file,
+[13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md),
+is the complete engineering lookup table (every kernel, data structure, and
+thread count) — use it as a reference, not a bedtime read.
 
 | File | What you'll learn | Time |
 |---|---|---|
+| [00_high_level_flow.md](00_high_level_flow.md) | **Start here.** The whole system in plain words, one frame top to bottom | 10 min |
 | [01_foundations.md](01_foundations.md) | What SOFA is, what a mesh is, CPU vs GPU, the CUDA words you need | 15 min |
 | [02_the_scene.md](02_the_scene.md) | Line-by-line tour of the benchmark scene file | 15 min |
 | [03_phase0_setup.md](03_phase0_setup.md) | What happens before the clock starts: plugin load, GPU memory, caches | 15 min |
@@ -27,6 +33,11 @@ Read the files in order. Each one builds on the previous.
 | [10_phase4_sync_and_output.md](10_phase4_sync_and_output.md) | Why the benchmark is so fast: the synchronization bypass | 10 min |
 | [11_profiling.md](11_profiling.md) | How timing works and what every number in the CSV means | 15 min |
 | [12_glossary.md](12_glossary.md) | Every term, defined in one place | reference |
+| [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md) | **Reference.** Every kernel, its inputs/outputs, the data structures, kernel counts, and exactly how threads are allocated | reference |
+
+> Companion outside the tutorial: [reports/README_metrics_explained.md](../reports/README_metrics_explained.md)
+> defines every number the benchmarks print (FPS, kernel time, contact counts, …)
+> and how each is calculated.
 
 ## The one-sentence summary
 
