@@ -3,6 +3,12 @@
 **Branch:** `experiment/hash-prefixsum-broadphase` (additive, opt-in, default-off)
 **Date:** 2026-06-09
 **Status:** Working, correctness-verified, faster than the dense grid in the large+large regime.
+**Independently re-verified 2026-06-09 (second pass):** clean rebuild, backend
+bench `hash_contacts=488=fbp_contacts` (vf 0 / fv 133 / ee 355, occupied_slots
+16,536, unique_pairs 6,720, overflow 0); SOFA A/B `dense=hash=2354` contacts
+(1119/428/807), raw 61,920 / unique 33,408 identical on both legs, overflow 0,
+hash +10.9 % FPS / −17 % narrow wall on a cool GPU. All §3 and §4 numbers
+reproduce.
 
 > This is an **experimental alternative broad cull** for the tri–tri feature-based
 > proximity (FBP) path. It does **not** touch the existing dense-grid implementation.

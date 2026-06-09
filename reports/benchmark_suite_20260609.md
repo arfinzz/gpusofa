@@ -15,6 +15,17 @@ counter readback on (contact counts visible). Older reports archived under
 > spatial-hash + prefix-sum broad cull gives **+11.8 % FPS / −15 % narrow wall**
 > on the large-tissue + large-tool scene, with bit-identical contacts.
 
+> **Independent re-run verification (2026-06-09, second pass).** The full suite
+> + the hash A/B were re-executed from a clean build of this branch. **Every
+> contact count reproduced exactly**: small 56 EE, large 8018 (5397/880/1741),
+> v-t self 2700 VF, v-t cross 254 VF, hash dense/on 2354 (1119/428/807),
+> overflow 0 everywhere. The hash path's per-cell counts matched dense exactly
+> (raw 61,920 / unique 33,408 on both legs) and ran +10.9–19.5 % faster
+> depending on thermal state. The standalone backend bench also reproduced
+> 488 = 488 hash/dense parity with 0 overflow. Warm small fast-path re-read
+> 733.8 FPS, matching the 723.8 below. All numbers in this report are confirmed
+> reproducible; absolute FPS varies within the documented thermal band.
+
 ---
 
 ## 1. Today's measured results
