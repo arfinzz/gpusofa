@@ -71,7 +71,7 @@ That's the entire system. The rest is detail.
 ## Each step, in plain words
 
 ### 1. The scene
-A small Python file (e.g. `test_gpu_one_tissue_one_blade_dense_grid_benchmark.py`)
+A small Python file (e.g. `testscenes/one_tissue_one_blade.py`)
 lists the two meshes and switches on the GPU collision components. Think of it as
 the "level file." Tour of one such file:
 [02_the_scene.md](02_the_scene.md).

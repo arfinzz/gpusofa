@@ -37,7 +37,7 @@ back-to-back (thermally fair), contacts verified identical on every pair.
 
 ## 1. The headline: a small→large sweep (same session, A/B per row)
 
-All three rows are the **same scene file** (`test_gpu_hash_prefixsum_large.py`)
+All three rows are the **same scene file** (`testscenes/hash_prefixsum_large.py`)
 at three geometry sizes. Each row is a dense leg and a hash leg run back-to-back.
 Contacts are **bit-identical** within every row (the correctness check); the
 numbers below are the speed payoff.

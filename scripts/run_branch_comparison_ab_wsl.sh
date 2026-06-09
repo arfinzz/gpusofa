@@ -15,7 +15,7 @@ set -uo pipefail
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 REPO="${REPO:-/home/arfin/gpu-sofa}"
 LIB="${SOFA_GPU_COLLISION_LIB:-${REPO}/SofaGpuCollision/build-profile/libSofaGpuCollision.so}"
-SCENE="${REPO}/test_gpu_hash_prefixsum_large.py"
+SCENE="${REPO}/testscenes/hash_prefixsum_large.py"
 STEPS="${SOFA_BENCHMARK_STEPS:-160}"
 BASE="${REPO}/output/benchmark_logs/branch_cmp_20260609"
 

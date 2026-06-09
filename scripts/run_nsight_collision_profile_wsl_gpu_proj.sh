@@ -69,7 +69,7 @@ nsys profile \
         -l SofaCUDA \
         -l "${SOFA_GPU_COLLISION_LIB}" \
         -g batch -n "${NSYS_STEPS}" \
-        "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+        "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
     > "${PROFILE_ROOT}/nsight/nsys_stdout.txt" 2> "${PROFILE_ROOT}/nsight/nsys_stderr.txt"
 NSYS_STATUS=$?
 import_nsys_report "${PROFILE_ROOT}/nsight/gpu_collision_nsys"
@@ -92,7 +92,7 @@ if [[ ! -f "${PROFILE_ROOT}/nsight/gpu_collision_nsys.nsys-rep" ]]; then
             -l SofaCUDA \
             -l "${SOFA_GPU_COLLISION_LIB}" \
             -g batch -n "${NSYS_FULL_STEPS}" \
-            "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+            "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
         > "${PROFILE_ROOT}/nsight/nsys_full_stdout.txt" 2> "${PROFILE_ROOT}/nsight/nsys_full_stderr.txt"
     NSYS_FULL_STATUS=$?
 fi
@@ -118,7 +118,7 @@ if [[ "${NSYS_STATUS}" != "0" ]]; then
             -l SofaCUDA \
             -l "${SOFA_GPU_COLLISION_LIB}" \
             -g batch -n "${NSYS_STEPS}" \
-            "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+            "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
         > "${PROFILE_ROOT}/nsight/nsys_light_stdout.txt" 2> "${PROFILE_ROOT}/nsight/nsys_light_stderr.txt"
     NSYS_LIGHT_STATUS=$?
     import_nsys_report "${PROFILE_ROOT}/nsight/gpu_collision_nsys_light"
@@ -141,7 +141,7 @@ ncu \
         -l SofaCUDA \
         -l "${SOFA_GPU_COLLISION_LIB}" \
         -g batch -n "${NCU_STEPS}" \
-        "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+        "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
     > "${PROFILE_ROOT}/nsight/ncu_stdout.txt" 2> "${PROFILE_ROOT}/nsight/ncu_stderr.txt"
 NCU_STATUS=$?
 
@@ -165,7 +165,7 @@ if [[ "${NCU_STATUS}" != "0" ]]; then
             -l SofaCUDA \
             -l "${SOFA_GPU_COLLISION_LIB}" \
             -g batch -n "${NCU_STEPS}" \
-            "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+            "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
         > "${PROFILE_ROOT}/nsight/ncu_launch_stdout.txt" 2> "${PROFILE_ROOT}/nsight/ncu_launch_stderr.txt"
     NCU_LAUNCH_STATUS=$?
 fi

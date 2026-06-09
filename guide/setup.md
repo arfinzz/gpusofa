@@ -97,7 +97,7 @@ For ongoing development, sync only what changed:
 
 ```powershell
 wsl -d wsl-gpu-proj -- rsync -a /mnt/c/Users/arfin/Desktop/'GPU SOFA'/SofaGpuCollision/src/ /home/arfin/gpu-sofa/SofaGpuCollision/src/
-wsl -d wsl-gpu-proj -- rsync -a /mnt/c/Users/arfin/Desktop/'GPU SOFA'/test_gpu_*.py /home/arfin/gpu-sofa/
+wsl -d wsl-gpu-proj -- rsync -a --delete /mnt/c/Users/arfin/Desktop/'GPU SOFA'/testscenes/ /home/arfin/gpu-sofa/testscenes/
 wsl -d wsl-gpu-proj -- rsync -a /mnt/c/Users/arfin/Desktop/'GPU SOFA'/scripts/ /home/arfin/gpu-sofa/scripts/
 wsl -d wsl-gpu-proj -- rsync -a /mnt/c/Users/arfin/Desktop/'GPU SOFA'/guide/ /home/arfin/gpu-sofa/guide/
 ```
@@ -187,25 +187,21 @@ If numbers are wildly off, see §8 (troubleshooting).
 
 ## 4. Scene catalogue
 
-| Scene | What it tests | Expected output |
+All benchmark scenes live in **`testscenes/`** and import shared helpers from
+`testscenes/dense_collision_benchmark_common.py`. These five are the canonical,
+actively-maintained scenes (legacy CPU baselines and the phase 0–10 validation
+scenes were removed in the 2026-06-09 cleanup — recover from git history if
+needed):
+
+| Scene (`testscenes/`) | What it tests | Expected output |
 |---|---|---|
-| `test_cpu_one_tissue_one_blade_benchmark.py` | CPU baseline | ~130 FPS, ~7-8 ms narrow wall |
-| `test_gpu_one_tissue_one_blade_dense_grid_benchmark.py` | GPU dense-grid (exact-contact or FBP via env var) | Fast path: 633-775 FPS, ~0.7 ms narrow wall |
-| `test_cpu_large_tissue_blade_benchmark.py` | CPU baseline, larger mesh | ~40 FPS |
-| `test_gpu_large_tissue_blade_dense_grid_benchmark.py` | GPU dense-grid, larger mesh | 25-90 FPS depending on power state |
-| `test_gpu_self_collision_vertex_triangle_smoke.py` | **Phase 12 self-collision** | 1300-2100 FPS, 2700 VertexFace contacts |
-| `test_gpu_cross_model_vertex_triangle_smoke.py` | **Phase 12 cross-model** | 1500-4200 FPS, 254 VertexFace contacts |
-| `test_gpu_hash_prefixsum_large.py` | **Experimental hash + prefix-sum broad cull** (large tissue + large tool, ~14,368 elements) | dense ~344 FPS / hash ~384 FPS, 2354 contacts (identical) |
+| `one_tissue_one_blade.py` | GPU dense-grid tri-tri **FBP**, small tool (the surgical default; exact-contact still selectable via env var) | fast warm ~720 FPS, ~0.47 ms narrow wall; validation **56 EdgeEdge** contacts |
+| `large_tissue_blade.py` | GPU dense-grid FBP, large mesh (~79,520 elements) | fast ~146 FPS / validation ~114 FPS, **8018** contacts (5397/880/1741) |
+| `self_collision_vertex_triangle.py` | **Phase 12 v-t self-collision** | 1300–2100 FPS, **2700 VertexFace** contacts |
+| `cross_model_vertex_triangle.py` | **Phase 12 v-t cross-model** | 1500–4200 FPS, **254 VertexFace** contacts |
+| `hash_prefixsum_large.py` | **Experimental hash + prefix-sum broad cull** (large tissue + large tool, ~14,368 elements) | dense ~344 / hash ~384 FPS, **2354** contacts (identical dense vs hash) |
 
-Validation-only scenes (not for production benchmarking):
-
-| Scene | Purpose |
-|---|---|
-| `test_gpu_dense_phase45_validation.py` | Phase 4 + 5 caching/readback regressions |
-| `test_gpu_phase5_overlap_validation.py` | Phase 5 overlap correctness |
-| `test_gpu_tissue_phase45_validation.py` | Tissue-only Phase 4 + 5 |
-
-Common scene helpers in `dense_collision_benchmark_common.py`:
+Common scene helpers in `testscenes/dense_collision_benchmark_common.py`:
 
 - `generate_tissue_surface_grid(nx, nz, sx, sz, y)` — flat NxN triangle grid
 - `generate_tissue_mesh(...)` — full 3D tetrahedralized tissue with surface skin
@@ -223,22 +219,21 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 `SOFA_PLUGIN_PATH`, `LD_LIBRARY_PATH`, env-var defaults, and invokes
 `runSofa -g batch`.
 
-| Script | Scene | Default mode |
+| Script | Scene(s) | Default mode |
 |---|---|---|
-| `run_one_tissue_one_blade_benchmarks_wsl.sh` | CPU + GPU one-tissue/one-blade (back-to-back) | exact-contact, 60 steps |
-| `run_large_tissue_blade_benchmarks_wsl.sh` | CPU + GPU large-tissue/blade | exact-contact, 60 steps |
-| `run_scene_size_scaling_benchmarks_wsl.sh` | Scaling study across multiple sizes | exact-contact |
-| `run_backend_dense_grid_benchmark_wsl_gpu_proj.sh` | Standalone backend bench (no SOFA scene) | direct kernel-only |
-| `run_gpu_kernel_profile_wsl.sh` | NVTX-annotated profiling run | event timings on |
-| `run_nsight_collision_profile_wsl_gpu_proj.sh` | Nsight Compute + Nsight Systems capture | full profiling |
-| `run_fbp_smoke_test_wsl.sh` | **One-tissue/one-blade with FBP enabled** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
-| `run_fbp_large_tissue_wsl.sh` | **Large-tissue/subdivided-blade FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
-| `run_vertex_triangle_smoke_wsl.sh` | **V-t self-collision** (Phase 12) | FBP + v-t self, readback on |
-| `run_cross_model_vt_smoke_wsl.sh` | **V-t cross-model** (Phase 12 cross-model) | FBP + v-t cross, readback on |
-| `run_nsight_fbp_profile_wsl.sh` | **Nsight Compute on FBP + v-t kernels** | all three scenes, focused metric set |
-| `run_full_benchmark_suite_wsl.sh` | **All current scenes** (small, large, v-t self, v-t cross, hash A/B) in fast + validation modes | 160 steps/leg, writes one summary per leg |
-| `run_hash_prefixsum_large_ab_wsl.sh` | **Hash A/B** — large tissue + large tool, dense vs hash+prefix-sum | counter-on, contact-count parity check |
+| `run_full_benchmark_suite_wsl.sh` | **All five canonical scenes** (small, large, v-t self, v-t cross, hash A/B) in fast + validation modes | 160 steps/leg, writes one summary per leg |
+| `run_fbp_smoke_test_wsl.sh` | **`one_tissue_one_blade.py` with FBP** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
+| `run_fbp_large_tissue_wsl.sh` | **`large_tissue_blade.py` FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
+| `run_vertex_triangle_smoke_wsl.sh` | **`self_collision_vertex_triangle.py`** (Phase 12) | FBP + v-t self, readback on |
+| `run_cross_model_vt_smoke_wsl.sh` | **`cross_model_vertex_triangle.py`** (Phase 12 cross-model) | FBP + v-t cross, readback on |
+| `run_hash_prefixsum_large_ab_wsl.sh` | **Hash A/B** — `hash_prefixsum_large.py`, dense vs hash+prefix-sum | counter-on, contact-count parity check |
+| `run_branch_comparison_ab_wsl.sh` | **Branch comparison** — `hash_prefixsum_large.py` dense vs hash at two tool sizes (mixed + large) | counter-on, prints per-leg summary |
+| `run_tiny_ab_wsl.sh` | **Tiny-scene A/B** — small tissue + small tool, dense vs hash (the regime where dense wins) | counter-on |
 | `run_small_warm_ab_wsl.sh` | **Warm small-scene A/B** — discards a cold-clock warm-up leg, then fast + validation | use for a representative fast-path FPS |
+| `run_nsight_fbp_profile_wsl.sh` | **Nsight Compute on FBP + v-t kernels** | three scenes, focused metric set |
+| `run_nsight_collision_profile_wsl_gpu_proj.sh` | Nsight Compute + Nsight Systems capture (`one_tissue_one_blade.py`) | full profiling |
+| `run_gpu_kernel_profile_wsl.sh` | NVTX-annotated profiling run | event timings on |
+| `run_backend_dense_grid_benchmark_wsl_gpu_proj.sh` | Standalone backend bench (no SOFA scene) | direct kernel-only |
 
 Override the log directory or step count per run:
 
@@ -297,7 +292,7 @@ These all default sensibly. Set them only to override.
 | `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction via a separate full-grid scan — **regressed**, superseded by `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` |
 | `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed). Mutually exclusive with tool-active-cell generation |
 | `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` | **1** | **Phase 15 — DEFAULT ON (guide/plan.md §5.15).** Generate candidate pairs over tool-occupied (mixed) cells only — list built during the tool insert, no separate scan. **Measured 4.3× FPS (221 → 943) and 38× faster generation (300 → 7.9 µs) on one-tissue, 1.08× on large-tissue, contact counts bit-identical, never a regression.** Set to 0 only to A/B against the old all-cells path |
-| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `test_gpu_hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; measured +11.8 % FPS / −15 % narrow wall, contacts bit-identical. Requires FBP on. See `reports/hash_prefixsum_broadphase_experiment_20260609.md` |
+| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; measured +11.8 % FPS / −15 % narrow wall, contacts bit-identical. Requires FBP on. See `reports/hash_prefixsum_broadphase_experiment_20260609.md` |
 | `SOFA_HASH_TABLE_SIZE` | **0** | Hash table slot count for the above. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 
 ### 6.4  Feature-based proximity (Phase 11+12)

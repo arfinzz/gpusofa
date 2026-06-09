@@ -38,4 +38,4 @@ echo "Logs -> ${LOG_DIR}"
     -l SofaPython3 \
     -l SofaCUDA \
     -l "${SOFA_GPU_COLLISION_LIB}" \
-    "${REPO_DIR}/test_gpu_cross_model_vertex_triangle_smoke.py"
+    "${REPO_DIR}/testscenes/cross_model_vertex_triangle.py"

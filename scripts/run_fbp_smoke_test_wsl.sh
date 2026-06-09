@@ -43,4 +43,4 @@ echo "Logs -> ${LOG_DIR}"
     -l SofaPython3 \
     -l SofaCUDA \
     -l "${SOFA_GPU_COLLISION_LIB}" \
-    "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py"
+    "${REPO_DIR}/testscenes/one_tissue_one_blade.py"

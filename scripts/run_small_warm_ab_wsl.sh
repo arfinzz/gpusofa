@@ -10,7 +10,7 @@ SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 LIB="${SOFA_GPU_COLLISION_LIB:-${REPO_DIR}/SofaGpuCollision/build-profile/libSofaGpuCollision.so}"
 RUNDIR="${SOFA_BENCHMARK_LOG_DIR:-${REPO_DIR}/output/benchmark_logs/small_warm_$(date +%Y%m%d_%H%M%S)}"
 STEPS="${SOFA_BENCHMARK_STEPS:-160}"
-SCENE="${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py"
+SCENE="${REPO_DIR}/testscenes/one_tissue_one_blade.py"
 
 SOFA_PLUGIN_LIB_PATHS="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf "%p:" 2>/dev/null || true)"
 export SOFA_PLUGIN_PATH="${SOFA_ROOT}/lib:${SOFA_ROOT}/plugins:${SOFA_PLUGIN_LIB_PATHS%:}"

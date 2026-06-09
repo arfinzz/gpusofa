@@ -55,7 +55,7 @@ Ericson closest-feature math), so the produced contacts must be bit-identical.
 | `cuda/GpuCollisionBackend.cu` | `HashGridWorkspace` (persistent, grow-on-demand), hash kernels (`resetHashGridKernel`, `insertHashGridTrianglesKernel`, `computeHashPairsPerSlotKernel`, `setHashRawTotalKernel`, `generateHashPrefixSumCandidatePairsKernel`), and the public `computeHashPrefixSumProximityContacts` 9-step pipeline reusing `featureBasedProximityKernel` |
 | `GpuCollisionNarrowPhase.{h,cpp}` | `Data<bool> useHashPrefixSumGeneration` (default **false**), `Data<uint> hashTableSize` (default **0** = auto). Dispatch sub-branch inside the existing FBP branch |
 | `tools/DenseGridBackendBench.cpp` | Standalone hash phase gated by `SOFA_BACKEND_BENCH_RUN_HASH`, writes `<label>_hash.csv`, prints a correctness assertion |
-| `test_gpu_hash_prefixsum_large.py` | Large tissue (12,800 tris) + large blade tool (1,568 tris) scene, hash flag from env |
+| `testscenes/hash_prefixsum_large.py` | Large tissue (12,800 tris) + large blade tool (1,568 tris) scene, hash flag from env |
 | `scripts/run_hash_prefixsum_large_ab_wsl.sh` | A/B launcher: same scene, dense leg then hash leg |
 
 **Pipeline (9 steps)** in `computeHashPrefixSumProximityContacts`:
@@ -83,7 +83,7 @@ hash_contacts = 488  (vf=0  fv=133  ee=355)   ← identical
 hash_table_size=65536  occupied_slots=16536  unique_pairs=6720  overflow=0
 ```
 
-### 3b. Real SOFA scene (`test_gpu_hash_prefixsum_large.py`, 12,800 + 1,568 tris)
+### 3b. Real SOFA scene (`testscenes/hash_prefixsum_large.py`, 12,800 + 1,568 tris)
 A/B run, 190 measured steps each. **Every** broad-/narrow-phase count is identical:
 
 | metric | dense_baseline | hash_prefixsum |

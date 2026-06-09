@@ -106,14 +106,18 @@ SofaGpuCollision/
 Outside the plugin:
 
 ```text
-test_gpu_one_tissue_one_blade_dense_grid_benchmark.py   Tri-tri scene (default)
-test_gpu_self_collision_vertex_triangle_smoke.py        V-t self-collision scene
-test_gpu_cross_model_vertex_triangle_smoke.py           V-t cross-model scene
-dense_collision_benchmark_common.py                      Shared geometry generators
-scripts/                                                 WSL launchers + verification tools
-guide/                                                   This documentation
-reports/                                                 Generated reports and decks
-output/                                                  Raw benchmark/profile artifacts (gitignored)
+testscenes/                                          ALL benchmark scenes live here
+  one_tissue_one_blade.py                            Tri-tri FBP, small tool (surgical default)
+  large_tissue_blade.py                              Tri-tri FBP, large mesh
+  self_collision_vertex_triangle.py                  V-t self-collision scene
+  cross_model_vertex_triangle.py                     V-t cross-model scene
+  hash_prefixsum_large.py                            Hash + prefix-sum broad-cull A/B scene
+  dense_collision_benchmark_common.py                Shared geometry generators (imported by all scenes)
+scripts/                                             WSL launchers + verification tools
+guide/                                               This documentation
+tutorial/                                            Beginner course
+reports/                                             Generated reports and decks
+output/                                              Raw benchmark/profile artifacts (gitignored)
 ```
 
 ---

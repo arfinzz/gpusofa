@@ -68,6 +68,7 @@ root.addObject("GpuCollisionBroadPhase", enableGPU=True, allowCPUFallback=True)
 root.addObject("GpuCollisionNarrowPhase", enableGPU=True, allowCPUFallback=True)
 ```
 
-An example scene is included at:
-
-- `examples/python/test_gpu_collision_plugin_benchmark.py`
+Ready-to-run benchmark scenes live in the repository's `testscenes/` directory
+(e.g. `testscenes/one_tissue_one_blade.py` for the tri-tri path,
+`testscenes/self_collision_vertex_triangle.py` for self-collision). Launch them
+with the wrappers in `scripts/` (see `guide/setup.md`).

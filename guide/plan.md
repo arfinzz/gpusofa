@@ -450,11 +450,11 @@ A general vertex-triangle kernel handles both with the same math:
     `CudaTriangleCollisionModel`, extract both and call the v-t backend.
     SurfaceIds differ so own-corner exclusion stays off.
 - Two new SOFA scenes:
-  - `test_gpu_self_collision_vertex_triangle_smoke.py`: a two-layer slab
+  - `testscenes/self_collision_vertex_triangle.py`: a two-layer slab
     with `selfCollision=True`. Each top vertex is 0.05 above a bottom
     triangle; `contactDistance=0.06` makes every top vertex emit one or
     more contacts.
-  - `test_gpu_cross_model_vertex_triangle_smoke.py`: a tissue triangle
+  - `testscenes/cross_model_vertex_triangle.py`: a tissue triangle
     grid + a small tool point cloud hovering above it.
 
 **Outcome.** Verified end-to-end 2026-05-25:
@@ -840,9 +840,10 @@ per-thread bound check. Any future over-launched kernel must grid-stride.
 
 ### 5.18  Spatial-hash + prefix-sum broad cull (EXPERIMENTAL, opt-in, default-off)
 
-**Status: working and correctness-verified on branch
-`experiment/hash-prefixsum-broadphase`. Not merged; default-off; dense path
-byte-identical when the flag is off.**
+**Status: working, correctness-verified, and MERGED to `main` (2026-06-09,
+fast-forward). Opt-in, default-off; with the flag off the dense path is
+byte-identical to the pre-merge behaviour, so the merge cost the default path
+nothing. `main` now carries both the stable FBP/v-t engine and this hash cull.**
 
 **Why.** The dense grid + Phase 15 tool-active-cell path assumes an
 *asymmetry* — a small tool sweeping a large tissue, so only ~30 cells are

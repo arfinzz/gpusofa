@@ -83,19 +83,19 @@ run_scene() {
 }
 
 # --- Run 1: tri-tri FBP ---
-run_scene "tri_tri_fbp" "${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py" \
+run_scene "tri_tri_fbp" "${REPO_DIR}/testscenes/one_tissue_one_blade.py" \
     SOFA_USE_FEATURE_BASED_PROXIMITY=1 \
     SOFA_USE_VERTEX_TRIANGLE_PROXIMITY=0 \
     SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 
 # --- Run 2: v-t self-collision ---
-run_scene "vt_self_collision" "${REPO_DIR}/test_gpu_self_collision_vertex_triangle_smoke.py" \
+run_scene "vt_self_collision" "${REPO_DIR}/testscenes/self_collision_vertex_triangle.py" \
     SOFA_USE_FEATURE_BASED_PROXIMITY=1 \
     SOFA_USE_VERTEX_TRIANGLE_PROXIMITY=1 \
     SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 
 # --- Run 3: v-t cross-model ---
-run_scene "vt_cross_model" "${REPO_DIR}/test_gpu_cross_model_vertex_triangle_smoke.py" \
+run_scene "vt_cross_model" "${REPO_DIR}/testscenes/cross_model_vertex_triangle.py" \
     SOFA_USE_FEATURE_BASED_PROXIMITY=1 \
     SOFA_USE_VERTEX_TRIANGLE_PROXIMITY=1 \
     SOFA_PROXIMITY_READ_CONTACT_COUNTER=1

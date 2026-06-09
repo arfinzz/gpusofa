@@ -49,11 +49,11 @@ run_leg() {
             "${scene}"
 }
 
-SMALL="${REPO_DIR}/test_gpu_one_tissue_one_blade_dense_grid_benchmark.py"
-LARGE="${REPO_DIR}/test_gpu_large_tissue_blade_dense_grid_benchmark.py"
-VT_SELF="${REPO_DIR}/test_gpu_self_collision_vertex_triangle_smoke.py"
-VT_CROSS="${REPO_DIR}/test_gpu_cross_model_vertex_triangle_smoke.py"
-HASH="${REPO_DIR}/test_gpu_hash_prefixsum_large.py"
+SMALL="${REPO_DIR}/testscenes/one_tissue_one_blade.py"
+LARGE="${REPO_DIR}/testscenes/large_tissue_blade.py"
+VT_SELF="${REPO_DIR}/testscenes/self_collision_vertex_triangle.py"
+VT_CROSS="${REPO_DIR}/testscenes/cross_model_vertex_triangle.py"
+HASH="${REPO_DIR}/testscenes/hash_prefixsum_large.py"
 
 # --- tri-tri FBP: small ---
 run_leg small_fastpath   "${SMALL}" SOFA_USE_FEATURE_BASED_PROXIMITY=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=0

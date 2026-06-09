@@ -205,7 +205,7 @@ own-corner exclusion. Elegant — no extra data, just reusing the surface two wa
 
 ### Verified result
 
-The self-collision smoke test (`test_gpu_self_collision_vertex_triangle_smoke.py`)
+The self-collision smoke test (`testscenes/self_collision_vertex_triangle.py`)
 is a two-layer slab: 512 vertices, 900 triangles, layers 0.05 apart, contact
 distance 0.06 so each top vertex is in range of a bottom triangle. Measured:
 **1385 FPS, 2700 contacts, all VertexFace.** 2700 ÷ 512 ≈ 5.3 contacts per
@@ -253,7 +253,7 @@ model's pointer → own-corner exclusion stays **off** (correct for cross-model)
 
 ### Verified result
 
-The cross-model smoke test (`test_gpu_cross_model_vertex_triangle_smoke.py`) is
+The cross-model smoke test (`testscenes/cross_model_vertex_triangle.py`) is
 a 41×41 tissue grid + an 8×8 tool point cloud hovering 0.04 above it. Measured:
 **1968 FPS, 254 contacts, all VertexFace.** Each tool point finds ~4 nearby
 tissue triangles.

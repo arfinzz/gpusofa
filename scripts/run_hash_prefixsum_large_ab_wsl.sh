@@ -20,7 +20,7 @@ SOFA_GPU_COLLISION_LIB="${SOFA_GPU_COLLISION_LIB:-${REPO_DIR}/SofaGpuCollision/b
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 BASE_LOG_DIR="${SOFA_BENCHMARK_LOG_DIR:-${REPO_DIR}/output/benchmark_logs/hash_prefixsum_large_${RUN_STAMP}}"
 STEPS="${SOFA_BENCHMARK_STEPS:-120}"
-SCENE="${REPO_DIR}/test_gpu_hash_prefixsum_large.py"
+SCENE="${REPO_DIR}/testscenes/hash_prefixsum_large.py"
 
 SOFA_PLUGIN_LIB_PATHS="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf "%p:" 2>/dev/null || true)"
 export SOFA_PLUGIN_PATH="${SOFA_ROOT}/lib:${SOFA_ROOT}/plugins:${SOFA_PLUGIN_LIB_PATHS%:}"

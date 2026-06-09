@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Vertex-triangle self-collision smoke test for the Phase 12 SOFA wiring.
-# Runs test_gpu_self_collision_vertex_triangle_smoke.py with FBP + v-t
+# Runs testscenes/self_collision_vertex_triangle.py with FBP + v-t
 # enabled. Counter readback is on by default so the run reports the emitted
 # contact count for verification.
 
@@ -40,4 +40,4 @@ echo "Logs -> ${LOG_DIR}"
     -l SofaPython3 \
     -l SofaCUDA \
     -l "${SOFA_GPU_COLLISION_LIB}" \
-    "${REPO_DIR}/test_gpu_self_collision_vertex_triangle_smoke.py"
+    "${REPO_DIR}/testscenes/self_collision_vertex_triangle.py"
