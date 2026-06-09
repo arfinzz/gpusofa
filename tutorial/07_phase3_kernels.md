@@ -233,6 +233,19 @@ variant — it just skips the ~32,738 cells that could never contribute a pair.
 That's why the contact output is bit-identical between the two (verified by
 A/B; `guide/plan.md` §5.15).
 
+> **Advanced sidebar — a third, experimental broad cull.** The two variants
+> above both use the *dense* grid (a fixed 32,768-cell array). There is a third,
+> **optional and default-off** broad cull on the `experiment/hash-prefixsum-broadphase`
+> branch: a **spatial hash** (only occupied cells take a table slot, claimed with
+> `atomicCAS`) plus **prefix-sum work-expansion** (count `tissue×tool` pairs per
+> occupied cell, `exclusive_scan` them, then launch *one thread per candidate
+> pair*). It feeds the **same** kernel 7 below, so contacts are bit-identical to
+> the dense path. It's aimed at the *both-large* case (large tissue **and** large
+> tool, ~1,500+ triangles each), where it measured **+11.8 % FPS / −15 % narrow
+> wall**. Turn it on with `useHashPrefixSumGeneration=True`. Beginners can skip
+> this — the dense active-cell path above is the default. Details:
+> `reports/hash_prefixsum_broadphase_experiment_20260609.md`.
+
 > **A correctness note from the field.** When this optimization was added, a
 > large-scene A/B (a subdivided blade producing 322,560 candidate pairs)
 > revealed a *separate* latent bug in kernel 7 — see §7.6. The active-cell

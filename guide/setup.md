@@ -4,7 +4,8 @@ End-to-end instructions for running, building, profiling, and tuning the
 GPU SOFA collision pipeline. Read top to bottom for a fresh machine; jump
 to a section if you already know the lay of the land.
 
-Last refreshed: 2026-05-25 (post Phase 12 cross-model wiring).
+Last refreshed: 2026-06-09 (full-suite benchmark refresh + experimental
+spatial-hash + prefix-sum broad cull on branch `experiment/hash-prefixsum-broadphase`).
 
 ---
 
@@ -192,8 +193,9 @@ If numbers are wildly off, see §8 (troubleshooting).
 | `test_gpu_one_tissue_one_blade_dense_grid_benchmark.py` | GPU dense-grid (exact-contact or FBP via env var) | Fast path: 633-775 FPS, ~0.7 ms narrow wall |
 | `test_cpu_large_tissue_blade_benchmark.py` | CPU baseline, larger mesh | ~40 FPS |
 | `test_gpu_large_tissue_blade_dense_grid_benchmark.py` | GPU dense-grid, larger mesh | 25-90 FPS depending on power state |
-| `test_gpu_self_collision_vertex_triangle_smoke.py` | **Phase 12 self-collision** | 1300-1400 FPS, 2700 VertexFace contacts |
-| `test_gpu_cross_model_vertex_triangle_smoke.py` | **Phase 12 cross-model** | 1500-2000 FPS, ~250 VertexFace contacts |
+| `test_gpu_self_collision_vertex_triangle_smoke.py` | **Phase 12 self-collision** | 1300-2100 FPS, 2700 VertexFace contacts |
+| `test_gpu_cross_model_vertex_triangle_smoke.py` | **Phase 12 cross-model** | 1500-4200 FPS, 254 VertexFace contacts |
+| `test_gpu_hash_prefixsum_large.py` | **Experimental hash + prefix-sum broad cull** (large tissue + large tool, ~14,368 elements) | dense ~344 FPS / hash ~384 FPS, 2354 contacts (identical) |
 
 Validation-only scenes (not for production benchmarking):
 
@@ -234,6 +236,9 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 | `run_vertex_triangle_smoke_wsl.sh` | **V-t self-collision** (Phase 12) | FBP + v-t self, readback on |
 | `run_cross_model_vt_smoke_wsl.sh` | **V-t cross-model** (Phase 12 cross-model) | FBP + v-t cross, readback on |
 | `run_nsight_fbp_profile_wsl.sh` | **Nsight Compute on FBP + v-t kernels** | all three scenes, focused metric set |
+| `run_full_benchmark_suite_wsl.sh` | **All current scenes** (small, large, v-t self, v-t cross, hash A/B) in fast + validation modes | 160 steps/leg, writes one summary per leg |
+| `run_hash_prefixsum_large_ab_wsl.sh` | **Hash A/B** — large tissue + large tool, dense vs hash+prefix-sum | counter-on, contact-count parity check |
+| `run_small_warm_ab_wsl.sh` | **Warm small-scene A/B** — discards a cold-clock warm-up leg, then fast + validation | use for a representative fast-path FPS |
 
 Override the log directory or step count per run:
 
@@ -292,6 +297,8 @@ These all default sensibly. Set them only to override.
 | `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction via a separate full-grid scan — **regressed**, superseded by `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` |
 | `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed). Mutually exclusive with tool-active-cell generation |
 | `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` | **1** | **Phase 15 — DEFAULT ON (guide/plan.md §5.15).** Generate candidate pairs over tool-occupied (mixed) cells only — list built during the tool insert, no separate scan. **Measured 4.3× FPS (221 → 943) and 38× faster generation (300 → 7.9 µs) on one-tissue, 1.08× on large-tissue, contact counts bit-identical, never a regression.** Set to 0 only to A/B against the old all-cells path |
+| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `test_gpu_hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; measured +11.8 % FPS / −15 % narrow wall, contacts bit-identical. Requires FBP on. See `reports/hash_prefixsum_broadphase_experiment_20260609.md` |
+| `SOFA_HASH_TABLE_SIZE` | **0** | Hash table slot count for the above. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 
 ### 6.4  Feature-based proximity (Phase 11+12)
 
@@ -460,6 +467,35 @@ wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_fbp_large_tissue_ws
 Expected (validation mode): ~110-120 FPS, 8018 contacts (5397 VF / 880 FV /
 1741 EE), overflow 0. The subdivided blade produces ~322 560 candidate
 pairs, so this scene exercises the FBP grid-stride loop (§5.17 in plan.md).
+
+### 7.10  Full benchmark suite (all scenes, one command)
+
+```powershell
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_full_benchmark_suite_wsl.sh
+```
+
+Runs small, large, v-t self, v-t cross, and the hash A/B — each in fast-path
+and validation legs — into `output/benchmark_logs/full_suite_<stamp>/<leg>/`.
+The 2026-06-09 run is reported in `reports/benchmark_suite_20260609.md`.
+
+> **Cold-clock caveat.** The *first* leg in a fresh process is contaminated by
+> CUDA-context init + GPU clock ramp (the 1650 Ti idles at a low clock). For a
+> representative small fast-path number, use `run_small_warm_ab_wsl.sh`, which
+> discards a warm-up leg first. Today's warm small fast path: 723.8 FPS,
+> 0.47 ms narrow wall, 0.28 ms narrow kernel.
+
+### 7.11  Experimental hash + prefix-sum broad cull (A/B)
+
+```powershell
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_hash_prefixsum_large_ab_wsl.sh
+```
+
+Runs the large-tissue + large-tool scene twice — dense grid (`useHashPrefixSumGeneration=0`)
+then hash + prefix-sum (`=1`). Contact counts MUST match between legs (2354,
+1119 VF / 428 FV / 807 EE); the FPS / narrow-wall delta is the payoff
+(measured +11.8 % FPS, −15 % narrow wall on 2026-06-09). This path is
+**default-off and opt-in**; the dense grid is untouched. Design + numbers:
+`reports/hash_prefixsum_broadphase_experiment_20260609.md`.
 
 ---
 

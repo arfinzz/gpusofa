@@ -6,7 +6,8 @@ paragraph, the measured outcome, and (where rejected) an explanation of the
 alternative that was considered. New work appends; finished phases stay so
 their rationale remains discoverable.
 
-Last refreshed: 2026-05-25.
+Last refreshed: 2026-06-09 (full-suite re-benchmark + experimental hash +
+prefix-sum broad cull, §5.18).
 
 ---
 
@@ -40,6 +41,16 @@ All four paths share the same dense-grid broad cull. The differences are in
 the narrow-pass kernel and the host-side dispatch. **Phase 15 (§5.15)
 collapsed the candidate-generation kernel from ~300 µs to ~8 µs, making it
 no longer the bottleneck.**
+
+**2026-06-09 re-benchmark (`reports/benchmark_suite_20260609.md`).** The full
+suite was re-run on the same hardware. Contact counts are **bit-identical** to
+the numbers above on every scene (56 EE small, 8018 large, 2700 VF self,
+254 VF cross). Narrow-phase wall and kernel times are **at or better than**
+the 2026-05-25 figures (e.g. small fast path 0.47 ms wall / 0.28 ms kernel vs
+0.56 / 0.35); whole-pipeline FPS varies within this laptop's known
+thermal/power-state band (§7.2). A new **experimental** spatial-hash +
+prefix-sum broad cull (§5.18, opt-in, default-off) adds +11.8 % FPS / −15 %
+narrow wall on a large-tissue + large-tool scene with bit-identical contacts.
 
 ---
 
@@ -142,6 +153,7 @@ section below for the "why" and the measured outcome.
 | 15 | Tool-active-cell candidate generation | **Done — DEFAULT ON 2026-05-25** | §5.15 |
 | 16 | Workspace-cached broad-cull CUDA events | **Done 2026-05-25** | §5.16 |
 | 17 | FBP/v-t grid-stride correctness fix | **Done 2026-05-25** | §5.17 |
+| 18 | Spatial-hash + prefix-sum broad cull | **Experimental, opt-in, default-off (branch)** | §5.18 |
 
 ---
 
@@ -825,6 +837,59 @@ Phase 15 but was a prerequisite for trusting the large-scene A/B.
 **Lesson recorded:** the over-launch pattern (introduced in the Phase 11
 sync fix, §5.11) needs a grid-stride loop to be correct, not just a
 per-thread bound check. Any future over-launched kernel must grid-stride.
+
+### 5.18  Spatial-hash + prefix-sum broad cull (EXPERIMENTAL, opt-in, default-off)
+
+**Status: working and correctness-verified on branch
+`experiment/hash-prefixsum-broadphase`. Not merged; default-off; dense path
+byte-identical when the flag is off.**
+
+**Why.** The dense grid + Phase 15 tool-active-cell path assumes an
+*asymmetry* — a small tool sweeping a large tissue, so only ~30 cells are
+mixed. When **both** sides are large (the target: ~1,500-triangle tool against
+a large tissue), that asymmetry weakens: the tool lights up many cells and the
+fixed 32,768-cell grid spends memory on empty space.
+
+**What was done.** A self-contained alternative broad cull that scales with
+*occupancy* instead of a fixed cell count, feeding the **same** FBP narrow
+kernel:
+
+1. **Spatial hash** — open-addressing table keyed by linear cell id, slots
+   claimed lock-free with `atomicCAS`; per-slot tissue/tool triangle counts
+   bumped with `atomicAdd`. Only occupied cells consume a slot.
+2. **Prefix-sum work expansion** — per occupied slot, candidate pairs =
+   `tissueCount × toolCount`; `thrust::exclusive_scan` over those counts gives
+   global offsets; then **one thread per candidate pair**, each binary-searching
+   the offset array to recover `(slot, localPair)`. Perfect load balance, no
+   serial per-cell loop.
+
+Auto table size = `nextPow2((firstTris + secondTris) × 4)`, min 1024. New
+backend entry `computeHashPrefixSumProximityContacts`; new Data fields
+`useHashPrefixSumGeneration` (default false) + `hashTableSize` (default 0 =
+auto); dispatch sub-branch inside the existing FBP branch (the original call
+moves verbatim into the `else`).
+
+**Measured (2026-06-09, large tissue + large tool, 14,368 elements, same-session
+A/B).**
+
+```text
+                 FPS     narrow_wall  narrow_kernel  contacts (VF/FV/EE)
+dense grid       343.6   1.997 ms     1.439 ms       2354 (1119/428/807)
+hash+prefix-sum  384.1   1.695 ms     1.254 ms       2354 (1119/428/807)
+                 +11.8%  -15.1%       -12.9%         BIT-IDENTICAL, overflow 0
+```
+
+Standalone backend bench also bit-identical (488 = 488). Reports:
+`reports/hash_prefixsum_broadphase_experiment_20260609.md` (design) and
+`reports/benchmark_suite_20260609.md` (suite).
+
+**Scope / caveats.**
+- Regime-specific: for small-tool/large-tissue the Phase 15 path is cheaper and
+  still wins. This is for the both-large case.
+- Only the cross-model tri–tri FBP path is routed through the hash cull; the
+  v-t (self + cross) kernels are unchanged.
+- Extending the hash + prefix-sum expansion to the v-t point-insert path, and
+  deriving table size from a measured occupancy histogram, are open follow-ups.
 
 ---
 

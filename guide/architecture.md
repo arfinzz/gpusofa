@@ -5,7 +5,9 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: 2026-05-25 after the Phase 12 cross-model wiring landed.
+Last refreshed: 2026-06-09 (added the experimental spatial-hash + prefix-sum
+broad-cull Data flags, §5.18 in plan.md; built on the 2026-05-25 Phase 12
+cross-model architecture).
 
 ---
 
