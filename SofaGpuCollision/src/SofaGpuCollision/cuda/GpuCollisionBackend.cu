@@ -1,5 +1,6 @@
 #include <SofaGpuCollision/GpuCollisionBackend.h>
 
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
@@ -8,7 +9,6 @@
 #define SOFAGPUCOLLISION_HAS_NVTX 0
 #endif
 #include <thrust/device_ptr.h>
-#include <thrust/scan.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 
@@ -2082,8 +2082,10 @@ __global__ void featureBasedProximityKernel(
     const std::uint32_t* __restrict__ firstIndices,
     const BackendTriangleVertex* __restrict__ secondPositions,
     const std::uint32_t* __restrict__ secondIndices,
-    const std::uint64_t* __restrict__ candidatePairs,
+    const std::uint64_t* __restrict__ candidatePairs64,
+    const std::uint32_t* __restrict__ candidatePairs32,
     const std::uint32_t* __restrict__ candidatePairCount,
+    const bool useCompactCandidatePairs,
     DeviceProximityContact* __restrict__ contacts,
     std::uint32_t* __restrict__ contactCount,
     std::uint32_t* __restrict__ overflowCount,
@@ -2103,9 +2105,20 @@ __global__ void featureBasedProximityKernel(
     const float distThreshSq = contactDistance * contactDistance;
     for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < pairCount; idx += stride)
     {
-    const std::uint64_t pair = candidatePairs[idx];
-    const std::uint32_t aIdx = static_cast<std::uint32_t>(pair >> 32);
-    const std::uint32_t bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
+    std::uint32_t aIdx = 0u;
+    std::uint32_t bIdx = 0u;
+    if (useCompactCandidatePairs)
+    {
+        const std::uint32_t pair = candidatePairs32[idx];
+        aIdx = pair >> 16u;
+        bIdx = pair & 0xffffu;
+    }
+    else
+    {
+        const std::uint64_t pair = candidatePairs64[idx];
+        aIdx = static_cast<std::uint32_t>(pair >> 32);
+        bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
+    }
 
     const DeviceTriangle ta = indexedTriangleAt(firstPositions, firstIndices, aIdx);
     const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
@@ -2424,26 +2437,40 @@ __global__ void featureBasedVertexTriangleProximityKernel(
 
 constexpr std::uint32_t kEmptyHashCellKey = 0xffffffffu;
 
-// Open-addressing spatial hash of occupied cells. Each slot stores one cell's
-// linear id (key), its tissue/tool counts, and fixed-capacity triangle-id lists
-// (same per-cell capacity model as the dense grid). Sized to occupied cells.
+constexpr std::uint32_t kInvalidHashBucket = 0xffffffffu;
+constexpr std::uint32_t kOverflowHashBucket = 0xfffffffeu;
+constexpr std::uint32_t kEmptyCompactPairSlot = 0xffffffffu;
+
+// Open-addressing spatial hash of occupied cells. Table slots store only
+// (cellKey -> compact bucket id); per-cell counts and primitive ids live in
+// compact bucket arrays sized by the maximum possible occupied cells, not by the
+// hash-table slot count. The pair hash keeps a touched-slot list so steady-state
+// frames clear only slots written by the previous frame.
 struct HashGridWorkspace
 {
     std::uint32_t* cellKeys { nullptr };
+    std::uint32_t* slotBucketIds { nullptr };
+    std::uint32_t* bucketCellIds { nullptr };
     std::uint32_t* tissueCount { nullptr };
     std::uint32_t* toolCount { nullptr };
     std::uint32_t* tissueIds { nullptr };
     std::uint32_t* toolIds { nullptr };
-    std::uint32_t* pairsPerSlot { nullptr };
+    std::uint32_t* mixedBucketIds { nullptr };
+    std::uint32_t* pairsPerBucket { nullptr };
     std::uint32_t* pairOffsets { nullptr };
     std::uint32_t* rawTotal { nullptr };
     std::uint64_t* candidatePairs { nullptr };
+    std::uint32_t* compactCandidatePairs { nullptr };
     unsigned long long* pairHashKeys { nullptr };
+    std::uint32_t* compactPairHashKeys { nullptr };
+    std::uint32_t* touchedPairHashSlots { nullptr };
     std::uint32_t* candidateCount { nullptr };
     std::uint32_t* rawCandidateCount { nullptr };
     std::uint32_t* overflowCount { nullptr };
     std::uint32_t* probeOverflowCount { nullptr };
-    std::uint32_t* occupiedSlotCount { nullptr };
+    std::uint32_t* occupiedBucketCount { nullptr };
+    std::uint32_t* mixedBucketCount { nullptr };
+    std::uint32_t* touchedPairHashCount { nullptr };
     void* proximityContacts { nullptr };
     std::uint32_t* proximityContactCount { nullptr };
     std::uint32_t* proximityOverflowCount { nullptr };
@@ -2454,22 +2481,30 @@ struct HashGridWorkspace
     std::uint32_t* secondIndices { nullptr };
     BackendTriangleVertex* firstPositions { nullptr };   // used only for host-input fallback
     BackendTriangleVertex* secondPositions { nullptr };
-    std::uint32_t* countersHostPinned { nullptr };  // 6 uint32, pinned
+    std::uint32_t* countersHostPinned { nullptr };  // 10 uint32, pinned
+    void* scanTempStorage { nullptr };
 
     std::size_t cellKeysCapacity { 0 };
+    std::size_t slotBucketIdCapacity { 0 };
+    std::size_t bucketCellIdCapacity { 0 };
     std::size_t tissueCountCapacity { 0 };
     std::size_t toolCountCapacity { 0 };
-    std::size_t pairsPerSlotCapacity { 0 };
+    std::size_t mixedBucketIdCapacity { 0 };
+    std::size_t pairsPerBucketCapacity { 0 };
     std::size_t pairOffsetsCapacity { 0 };
     std::size_t tissueIdCapacity { 0 };
     std::size_t toolIdCapacity { 0 };
     std::size_t candidateCapacity { 0 };
+    std::size_t compactCandidateCapacity { 0 };
     std::size_t pairHashCapacity { 0 };
+    std::size_t compactPairHashCapacity { 0 };
+    std::size_t touchedPairHashSlotCapacity { 0 };
     std::size_t contactCapacity { 0 };
     std::size_t firstIndexCapacity { 0 };
     std::size_t secondIndexCapacity { 0 };
     std::size_t firstPositionCapacity { 0 };
     std::size_t secondPositionCapacity { 0 };
+    std::size_t scanTempStorageBytes { 0 };
     std::uint64_t firstSurfaceId { 0 };
     std::uint64_t secondSurfaceId { 0 };
     std::uint64_t firstTopologyVersion { ~0ull };
@@ -2477,45 +2512,62 @@ struct HashGridWorkspace
     cudaEvent_t startEvent { nullptr };
     cudaEvent_t endEvent { nullptr };
     bool eventsReady { false };
+    bool pairHashKeysInitialized { false };
+    bool compactPairHashKeysInitialized { false };
+    bool useCompactCandidatePairs { false };
 
     ~HashGridWorkspace() { release(); }
 
     void release()
     {
-        cudaFree(cellKeys); cudaFree(tissueCount); cudaFree(toolCount);
-        cudaFree(tissueIds); cudaFree(toolIds);
-        cudaFree(pairsPerSlot); cudaFree(pairOffsets); cudaFree(rawTotal);
-        cudaFree(candidatePairs); cudaFree(pairHashKeys);
+        cudaFree(cellKeys); cudaFree(slotBucketIds); cudaFree(bucketCellIds);
+        cudaFree(tissueCount); cudaFree(toolCount);
+        cudaFree(tissueIds); cudaFree(toolIds); cudaFree(mixedBucketIds);
+        cudaFree(pairsPerBucket); cudaFree(pairOffsets); cudaFree(rawTotal);
+        cudaFree(candidatePairs); cudaFree(compactCandidatePairs);
+        cudaFree(pairHashKeys); cudaFree(compactPairHashKeys); cudaFree(touchedPairHashSlots);
         cudaFree(candidateCount); cudaFree(rawCandidateCount);
-        cudaFree(overflowCount); cudaFree(probeOverflowCount); cudaFree(occupiedSlotCount);
+        cudaFree(overflowCount); cudaFree(probeOverflowCount);
+        cudaFree(occupiedBucketCount); cudaFree(mixedBucketCount); cudaFree(touchedPairHashCount);
         cudaFree(proximityContacts);
         cudaFree(proximityContactCount); cudaFree(proximityOverflowCount);
         cudaFree(proximityVfCount); cudaFree(proximityFvCount); cudaFree(proximityEeCount);
         cudaFree(firstIndices); cudaFree(secondIndices);
         cudaFree(firstPositions); cudaFree(secondPositions);
+        cudaFree(scanTempStorage);
         cudaFreeHost(countersHostPinned);
         if (eventsReady) { cudaEventDestroy(startEvent); cudaEventDestroy(endEvent); }
-        cellKeys = nullptr; tissueCount = nullptr; toolCount = nullptr;
-        tissueIds = nullptr; toolIds = nullptr;
-        pairsPerSlot = nullptr; pairOffsets = nullptr; rawTotal = nullptr;
-        candidatePairs = nullptr; pairHashKeys = nullptr;
+        cellKeys = nullptr; slotBucketIds = nullptr; bucketCellIds = nullptr;
+        tissueCount = nullptr; toolCount = nullptr;
+        tissueIds = nullptr; toolIds = nullptr; mixedBucketIds = nullptr;
+        pairsPerBucket = nullptr; pairOffsets = nullptr; rawTotal = nullptr;
+        candidatePairs = nullptr; compactCandidatePairs = nullptr;
+        pairHashKeys = nullptr; compactPairHashKeys = nullptr; touchedPairHashSlots = nullptr;
         candidateCount = nullptr; rawCandidateCount = nullptr;
-        overflowCount = nullptr; probeOverflowCount = nullptr; occupiedSlotCount = nullptr;
+        overflowCount = nullptr; probeOverflowCount = nullptr;
+        occupiedBucketCount = nullptr; mixedBucketCount = nullptr; touchedPairHashCount = nullptr;
         proximityContacts = nullptr;
         proximityContactCount = nullptr; proximityOverflowCount = nullptr;
         proximityVfCount = nullptr; proximityFvCount = nullptr; proximityEeCount = nullptr;
         firstIndices = nullptr; secondIndices = nullptr;
         firstPositions = nullptr; secondPositions = nullptr;
+        scanTempStorage = nullptr;
         countersHostPinned = nullptr;
         startEvent = nullptr; endEvent = nullptr; eventsReady = false;
         tissueIdCapacity = 0; toolIdCapacity = 0;
-        candidateCapacity = 0; pairHashCapacity = 0; contactCapacity = 0;
+        candidateCapacity = 0; compactCandidateCapacity = 0;
+        pairHashCapacity = 0; compactPairHashCapacity = 0; touchedPairHashSlotCapacity = 0;
+        contactCapacity = 0;
         firstIndexCapacity = 0; secondIndexCapacity = 0;
         firstPositionCapacity = 0; secondPositionCapacity = 0;
-        cellKeysCapacity = 0; tissueCountCapacity = 0; toolCountCapacity = 0;
-        pairsPerSlotCapacity = 0; pairOffsetsCapacity = 0;
+        cellKeysCapacity = 0; slotBucketIdCapacity = 0; bucketCellIdCapacity = 0;
+        tissueCountCapacity = 0; toolCountCapacity = 0;
+        mixedBucketIdCapacity = 0; pairsPerBucketCapacity = 0; pairOffsetsCapacity = 0;
+        scanTempStorageBytes = 0;
         firstSurfaceId = 0; secondSurfaceId = 0;
         firstTopologyVersion = ~0ull; secondTopologyVersion = ~0ull;
+        pairHashKeysInitialized = false; compactPairHashKeysInitialized = false;
+        useCompactCandidatePairs = false;
     }
 
     cudaError_t ensureEvents()
@@ -2529,6 +2581,7 @@ struct HashGridWorkspace
 
     cudaError_t ensure(
         const std::size_t tableSize,
+        const std::size_t bucketCapacity,
         const std::size_t maxTissuePerCell,
         const std::size_t maxToolPerCell,
         const std::size_t maxCandidatePairs,
@@ -2539,21 +2592,58 @@ struct HashGridWorkspace
         const std::size_t secondIndexCount,
         const std::size_t firstVertexCount,    // 0 when first positions are direct device pointers
         const std::size_t secondVertexCount,   // 0 when second positions are direct device pointers
+        const bool compactPairs,
         std::uint64_t& newlyAllocatedBytes)
     {
+        useCompactCandidatePairs = compactPairs;
         cudaError_t err = ensureDeviceArray(cellKeys, cellKeysCapacity, tableSize, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(tissueCount, tissueCountCapacity, tableSize, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(toolCount, toolCountCapacity, tableSize, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(pairsPerSlot, pairsPerSlotCapacity, tableSize, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(pairOffsets, pairOffsetsCapacity, tableSize, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(tissueIds, tissueIdCapacity, tableSize * maxTissuePerCell, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(toolIds, toolIdCapacity, tableSize * maxToolPerCell, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(candidatePairs, candidateCapacity, maxCandidatePairs, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(pairHashKeys, pairHashCapacity, pairHashCount, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(slotBucketIds, slotBucketIdCapacity, tableSize, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(bucketCellIds, bucketCellIdCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(tissueCount, tissueCountCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(toolCount, toolCountCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(mixedBucketIds, mixedBucketIdCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(pairsPerBucket, pairsPerBucketCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(pairOffsets, pairOffsetsCapacity, bucketCapacity, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(tissueIds, tissueIdCapacity, bucketCapacity * maxTissuePerCell, newlyAllocatedBytes);
+        if (err == cudaSuccess) err = ensureDeviceArray(toolIds, toolIdCapacity, bucketCapacity * maxToolPerCell, newlyAllocatedBytes);
+        if (err == cudaSuccess && !compactPairs) err = ensureDeviceArray(candidatePairs, candidateCapacity, maxCandidatePairs, newlyAllocatedBytes);
+        if (err == cudaSuccess && compactPairs) err = ensureDeviceArray(compactCandidatePairs, compactCandidateCapacity, maxCandidatePairs, newlyAllocatedBytes);
+        if (err == cudaSuccess && !compactPairs)
+        {
+            if (pairHashCount > pairHashCapacity) pairHashKeysInitialized = false;
+            err = ensureDeviceArray(pairHashKeys, pairHashCapacity, pairHashCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess && compactPairs)
+        {
+            if (pairHashCount > compactPairHashCapacity) compactPairHashKeysInitialized = false;
+            err = ensureDeviceArray(compactPairHashKeys, compactPairHashCapacity, pairHashCount, newlyAllocatedBytes);
+        }
+        if (err == cudaSuccess) err = ensureDeviceArray(touchedPairHashSlots, touchedPairHashSlotCapacity, pairHashCount, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(firstIndices, firstIndexCapacity, firstIndexCount, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(secondIndices, secondIndexCapacity, secondIndexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && firstVertexCount > 0) err = ensureDeviceArray(firstPositions, firstPositionCapacity, firstVertexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && secondVertexCount > 0) err = ensureDeviceArray(secondPositions, secondPositionCapacity, secondVertexCount, newlyAllocatedBytes);
+        if (err == cudaSuccess && bucketCapacity > 0)
+        {
+            std::size_t requiredTempBytes = 0;
+            err = cub::DeviceScan::ExclusiveSum(
+                nullptr,
+                requiredTempBytes,
+                pairsPerBucket,
+                pairOffsets,
+                static_cast<int>(bucketCapacity));
+            if (err == cudaSuccess && requiredTempBytes > scanTempStorageBytes)
+            {
+                cudaFree(scanTempStorage);
+                scanTempStorage = nullptr;
+                err = cudaMalloc(&scanTempStorage, requiredTempBytes);
+                if (err == cudaSuccess)
+                {
+                    scanTempStorageBytes = requiredTempBytes;
+                    newlyAllocatedBytes += static_cast<std::uint64_t>(requiredTempBytes);
+                }
+            }
+        }
         const std::size_t contactCount = maxContacts;
         if (err == cudaSuccess && (proximityContacts == nullptr || contactCapacity < contactCount))
         {
@@ -2567,7 +2657,9 @@ struct HashGridWorkspace
         if (err == cudaSuccess && rawCandidateCount == nullptr)     err = cudaMallocTracked(rawCandidateCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && overflowCount == nullptr)         err = cudaMallocTracked(overflowCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && probeOverflowCount == nullptr)    err = cudaMallocTracked(probeOverflowCount, 1, newlyAllocatedBytes);
-        if (err == cudaSuccess && occupiedSlotCount == nullptr)     err = cudaMallocTracked(occupiedSlotCount, 1, newlyAllocatedBytes);
+        if (err == cudaSuccess && occupiedBucketCount == nullptr)   err = cudaMallocTracked(occupiedBucketCount, 1, newlyAllocatedBytes);
+        if (err == cudaSuccess && mixedBucketCount == nullptr)      err = cudaMallocTracked(mixedBucketCount, 1, newlyAllocatedBytes);
+        if (err == cudaSuccess && touchedPairHashCount == nullptr)  err = cudaMallocTracked(touchedPairHashCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityContactCount == nullptr) err = cudaMallocTracked(proximityContactCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityOverflowCount == nullptr) err = cudaMallocTracked(proximityOverflowCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityVfCount == nullptr)      err = cudaMallocTracked(proximityVfCount, 1, newlyAllocatedBytes);
@@ -2604,23 +2696,33 @@ __device__ __forceinline__ std::uint32_t hashCellSlot(const std::uint32_t cellId
     return static_cast<std::uint32_t>(mixCandidatePairHash(static_cast<std::uint64_t>(cellId) + 1ull)) & mask;
 }
 
-__global__ void resetHashGridKernel(
+__global__ void resetCompactHashGridKernel(
     std::uint32_t* cellKeys,
+    std::uint32_t* slotBucketIds,
+    const std::uint32_t tableSize,
     std::uint32_t* tissueCount,
     std::uint32_t* toolCount,
-    const std::uint32_t tableSize,
+    std::uint32_t* pairsPerBucket,
+    const std::uint32_t bucketCapacity,
     std::uint32_t* rawCandidateCount,
     std::uint32_t* candidateCount,
     std::uint32_t* overflowCount,
     std::uint32_t* probeOverflowCount,
-    std::uint32_t* occupiedSlotCount)
+    std::uint32_t* occupiedBucketCount,
+    std::uint32_t* mixedBucketCount,
+    std::uint32_t* touchedPairHashCount)
 {
     const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id < tableSize)
     {
         cellKeys[id] = kEmptyHashCellKey;
+        slotBucketIds[id] = kInvalidHashBucket;
+    }
+    if (id < bucketCapacity)
+    {
         tissueCount[id] = 0u;
         toolCount[id] = 0u;
+        pairsPerBucket[id] = 0u;
     }
     if (id == 0)
     {
@@ -2628,28 +2730,125 @@ __global__ void resetHashGridKernel(
         *candidateCount = 0u;
         *overflowCount = 0u;
         *probeOverflowCount = 0u;
-        *occupiedSlotCount = 0u;
+        *occupiedBucketCount = 0u;
+        *mixedBucketCount = 0u;
+        *touchedPairHashCount = 0u;
     }
 }
 
-// One thread per triangle. Inserts the triangle into every cell its inflated
-// AABB overlaps, via open-addressing into the hash table.
-__global__ void insertHashGridTrianglesKernel(
+__global__ void clearTouchedPairHash64Kernel(
+    unsigned long long* pairHashKeys,
+    const std::uint32_t* touchedSlots,
+    const std::uint32_t* touchedCount)
+{
+    const std::uint32_t count = *touchedCount;
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x; id < count; id += stride)
+    {
+        pairHashKeys[touchedSlots[id]] = static_cast<unsigned long long>(kEmptyPairSlot);
+    }
+}
+
+__global__ void clearTouchedPairHash32Kernel(
+    std::uint32_t* pairHashKeys,
+    const std::uint32_t* touchedSlots,
+    const std::uint32_t* touchedCount)
+{
+    const std::uint32_t count = *touchedCount;
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x; id < count; id += stride)
+    {
+        pairHashKeys[touchedSlots[id]] = kEmptyCompactPairSlot;
+    }
+}
+
+__global__ void markCompactHashGridCellsKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const std::uint32_t triangleCount,
+    const DeviceDenseGridConfig config,
+    const std::uint32_t tableSize,
+    const std::uint32_t maxProbe,
+    std::uint32_t* cellKeys,
+    std::uint32_t* probeOverflowCount)
+{
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId >= triangleCount) return;
+
+    const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+    int3 cellMin, cellMax;
+    if (!denseGridCellSpan(triangleAabb(triangle, config.contactDistance), config, cellMin, cellMax))
+        return;
+
+    const std::uint32_t mask = tableSize - 1u;
+
+    for (int z = cellMin.z; z <= cellMax.z; ++z)
+    for (int y = cellMin.y; y <= cellMax.y; ++y)
+    for (int x = cellMin.x; x <= cellMax.x; ++x)
+    {
+        const std::uint32_t cellId = denseCellId(x, y, z, config);
+        std::uint32_t slot = hashCellSlot(cellId, mask);
+        bool placed = false;
+        for (std::uint32_t probe = 0; probe < maxProbe; ++probe)
+        {
+            const std::uint32_t previous = atomicCAS(&cellKeys[slot], kEmptyHashCellKey, cellId);
+            if (previous == kEmptyHashCellKey || previous == cellId)
+            {
+                placed = true;
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (!placed) atomicAdd(probeOverflowCount, 1u);
+    }
+}
+
+__global__ void compactHashGridSlotsKernel(
+    const std::uint32_t* cellKeys,
+    std::uint32_t* slotBucketIds,
+    std::uint32_t* bucketCellIds,
+    const std::uint32_t tableSize,
+    const std::uint32_t bucketCapacity,
+    std::uint32_t* occupiedBucketCount,
+    std::uint32_t* overflowCount)
+{
+    const std::uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot >= tableSize) return;
+    const std::uint32_t cellId = cellKeys[slot];
+    if (cellId == kEmptyHashCellKey) return;
+
+    const std::uint32_t bucketIdx = atomicAdd(occupiedBucketCount, 1u);
+    if (bucketIdx < bucketCapacity)
+    {
+        bucketCellIds[bucketIdx] = cellId;
+        slotBucketIds[slot] = bucketIdx;
+    }
+    else
+    {
+        slotBucketIds[slot] = kOverflowHashBucket;
+        atomicAdd(overflowCount, 1u);
+    }
+}
+
+__global__ void fillCompactHashGridTrianglesKernel(
     const BackendTriangleVertex* __restrict__ positions,
     const std::uint32_t* __restrict__ triangleIndices,
     const std::uint32_t triangleCount,
     const bool insertTissue,
     const DeviceDenseGridConfig config,
     const std::uint32_t tableSize,
+    const std::uint32_t bucketCapacity,
     const std::uint32_t maxProbe,
-    std::uint32_t* cellKeys,
+    const std::uint32_t* cellKeys,
+    const std::uint32_t* slotBucketIds,
     std::uint32_t* tissueCount,
     std::uint32_t* toolCount,
     std::uint32_t* tissueIds,
     std::uint32_t* toolIds,
+    std::uint32_t* mixedBucketIds,
+    std::uint32_t* mixedBucketCount,
     std::uint32_t* overflowCount,
-    std::uint32_t* probeOverflowCount,
-    std::uint32_t* occupiedSlotCount)
+    std::uint32_t* probeOverflowCount)
 {
     const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
     if (triangleId >= triangleCount) return;
@@ -2668,119 +2867,307 @@ __global__ void insertHashGridTrianglesKernel(
     {
         const std::uint32_t cellId = denseCellId(x, y, z, config);
         std::uint32_t slot = hashCellSlot(cellId, mask);
-        bool placed = false;
+        std::uint32_t bucketIdx = kInvalidHashBucket;
         for (std::uint32_t probe = 0; probe < maxProbe; ++probe)
         {
-            const std::uint32_t prev = atomicCAS(&cellKeys[slot], kEmptyHashCellKey, cellId);
-            if (prev == kEmptyHashCellKey)
+            const std::uint32_t key = cellKeys[slot];
+            if (key == cellId)
             {
-                // we claimed an empty slot for this cell (first time anyone saw it)
-                atomicAdd(occupiedSlotCount, 1u);
+                bucketIdx = slotBucketIds[slot];
+                break;
             }
-            if (prev == kEmptyHashCellKey || prev == cellId)
+            if (key == kEmptyHashCellKey)
             {
-                std::uint32_t* countPtr = insertTissue ? &tissueCount[slot] : &toolCount[slot];
-                const std::uint32_t local = atomicAdd(countPtr, 1u);
-                if (local < bucketCap)
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (bucketIdx == kInvalidHashBucket)
+        {
+            atomicAdd(probeOverflowCount, 1u);
+            continue;
+        }
+        if (bucketIdx == kOverflowHashBucket || bucketIdx >= bucketCapacity)
+        {
+            atomicAdd(overflowCount, 1u);
+            continue;
+        }
+
+        std::uint32_t* countPtr = insertTissue ? &tissueCount[bucketIdx] : &toolCount[bucketIdx];
+        const std::uint32_t local = atomicAdd(countPtr, 1u);
+        if (local < bucketCap)
+        {
+            std::uint32_t* ids = insertTissue ? tissueIds : toolIds;
+            ids[bucketIdx * bucketCap + local] = triangleId;
+            if (!insertTissue && local == 0u && tissueCount[bucketIdx] > 0u)
+            {
+                const std::uint32_t mixedIndex = atomicAdd(mixedBucketCount, 1u);
+                if (mixedIndex < bucketCapacity)
                 {
-                    std::uint32_t* ids = insertTissue ? tissueIds : toolIds;
-                    ids[slot * bucketCap + local] = triangleId;
+                    mixedBucketIds[mixedIndex] = bucketIdx;
                 }
                 else
                 {
                     atomicAdd(overflowCount, 1u);
                 }
-                placed = true;
-                break;
             }
-            slot = (slot + 1u) & mask;   // collision with a different cell → probe next
         }
-        if (!placed) atomicAdd(probeOverflowCount, 1u);
+        else
+        {
+            atomicAdd(overflowCount, 1u);
+        }
     }
 }
 
-// One thread per slot. pairsPerSlot = tissue × tool (capped). Empty slots → 0.
-__global__ void computeHashPairsPerSlotKernel(
+__global__ void computeCompactHashPairsPerBucketKernel(
     const std::uint32_t* tissueCount,
     const std::uint32_t* toolCount,
-    const std::uint32_t tableSize,
+    const std::uint32_t* mixedBucketIds,
+    const std::uint32_t* mixedBucketCount,
+    const std::uint32_t bucketCapacity,
     const std::uint32_t maxTissuePerCell,
     const std::uint32_t maxToolPerCell,
-    std::uint32_t* pairsPerSlot)
+    std::uint32_t* pairsPerBucket,
+    std::uint32_t* rawCandidateCount)
 {
     const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id >= tableSize) return;
-    const std::uint32_t t = min(tissueCount[id], maxTissuePerCell);
-    const std::uint32_t u = min(toolCount[id], maxToolPerCell);
-    pairsPerSlot[id] = t * u;
+    if (id >= bucketCapacity) return;
+    const std::uint32_t mixedCount = min(*mixedBucketCount, bucketCapacity);
+    if (id >= mixedCount)
+    {
+        pairsPerBucket[id] = 0u;
+        return;
+    }
+    const std::uint32_t bucketIdx = mixedBucketIds[id];
+    const std::uint32_t t = min(tissueCount[bucketIdx], maxTissuePerCell);
+    const std::uint32_t u = min(toolCount[bucketIdx], maxToolPerCell);
+    const std::uint32_t pairs = t * u;
+    pairsPerBucket[id] = pairs;
+    if (pairs > 0u)
+    {
+        atomicAdd(rawCandidateCount, pairs);
+    }
 }
 
-// 1-thread kernel: rawTotal = pairOffsets[last] + pairsPerSlot[last] after the scan.
-__global__ void setHashRawTotalKernel(
+__global__ void setCompactHashRawTotalKernel(
     const std::uint32_t* pairOffsets,
-    const std::uint32_t* pairsPerSlot,
-    const std::uint32_t tableSize,
+    const std::uint32_t* pairsPerBucket,
+    const std::uint32_t bucketCapacity,
     std::uint32_t* rawTotal)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0)
-        *rawTotal = pairOffsets[tableSize - 1u] + pairsPerSlot[tableSize - 1u];
-}
-
-// Find the largest slot index s with pairOffsets[s] <= g (g < rawTotal guarantees
-// a valid, non-empty slot). Binary search over the exclusive-scan offsets.
-__device__ __forceinline__ std::uint32_t findSlotForPair(
-    const std::uint32_t* pairOffsets, const std::uint32_t tableSize, const std::uint32_t g)
-{
-    std::uint32_t lo = 0u, hi = tableSize;          // search in [lo, hi)
-    while (lo + 1u < hi)
     {
-        const std::uint32_t mid = lo + ((hi - lo) >> 1);
-        if (pairOffsets[mid] <= g) lo = mid; else hi = mid;
+        const std::uint32_t total =
+            bucketCapacity == 0u ? 0u : pairOffsets[bucketCapacity - 1u] + pairsPerBucket[bucketCapacity - 1u];
+        *rawTotal = total;
     }
-    return lo;
 }
 
-// Thread-per-raw-pair (grid-stride). Decodes the global pair index into a
-// (slot, tissueLocal, toolLocal), reads the triangle ids, and deduplicates into
-// the unique candidate list via the shared pair-hash helper.
-__global__ void generateHashPrefixSumCandidatePairsKernel(
-    const std::uint32_t* cellKeys,
+__device__ __forceinline__ std::uint32_t encodeCompactCandidatePair(
+    const std::uint32_t firstTriangleId,
+    const std::uint32_t secondTriangleId)
+{
+    return (firstTriangleId << 16u) | secondTriangleId;
+}
+
+__device__ bool insertUniqueCandidatePair64Tracked(
+    const std::uint64_t pair,
+    unsigned long long* pairHashKeys,
+    std::uint32_t* touchedPairHashSlots,
+    std::uint32_t* touchedPairHashCount,
+    const std::uint32_t pairHashCapacity,
+    std::uint64_t* candidatePairs,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    std::uint32_t* probeOverflowCount,
+    const std::uint32_t maxCandidatePairs)
+{
+    constexpr std::uint32_t kMaxProbeCount = 256u;
+    const std::uint32_t mask = pairHashCapacity - 1u;
+    std::uint32_t slot = static_cast<std::uint32_t>(mixCandidatePairHash(pair)) & mask;
+    for (std::uint32_t probe = 0; probe < kMaxProbeCount; ++probe)
+    {
+        const std::uint64_t previous = atomicCAS(
+            &pairHashKeys[slot],
+            static_cast<unsigned long long>(kEmptyPairSlot),
+            static_cast<unsigned long long>(pair));
+        if (previous == kEmptyPairSlot)
+        {
+            const std::uint32_t touchedIndex = atomicAdd(touchedPairHashCount, 1u);
+            if (touchedIndex < pairHashCapacity)
+            {
+                touchedPairHashSlots[touchedIndex] = slot;
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+            const std::uint32_t outputIndex = atomicAdd(candidateCount, 1u);
+            if (outputIndex < maxCandidatePairs)
+            {
+                candidatePairs[outputIndex] = pair;
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+            return true;
+        }
+        if (previous == pair)
+        {
+            return false;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    atomicAdd(probeOverflowCount, 1u);
+    atomicAdd(overflowCount, 1u);
+    return false;
+}
+
+__device__ bool insertUniqueCandidatePair32Tracked(
+    const std::uint32_t pair,
+    std::uint32_t* pairHashKeys,
+    std::uint32_t* touchedPairHashSlots,
+    std::uint32_t* touchedPairHashCount,
+    const std::uint32_t pairHashCapacity,
+    std::uint32_t* candidatePairs,
+    std::uint32_t* candidateCount,
+    std::uint32_t* overflowCount,
+    std::uint32_t* probeOverflowCount,
+    const std::uint32_t maxCandidatePairs)
+{
+    constexpr std::uint32_t kMaxProbeCount = 256u;
+    const std::uint32_t mask = pairHashCapacity - 1u;
+    std::uint32_t slot = static_cast<std::uint32_t>(mixCandidatePairHash(pair)) & mask;
+    for (std::uint32_t probe = 0; probe < kMaxProbeCount; ++probe)
+    {
+        const std::uint32_t previous = atomicCAS(&pairHashKeys[slot], kEmptyCompactPairSlot, pair);
+        if (previous == kEmptyCompactPairSlot)
+        {
+            const std::uint32_t touchedIndex = atomicAdd(touchedPairHashCount, 1u);
+            if (touchedIndex < pairHashCapacity)
+            {
+                touchedPairHashSlots[touchedIndex] = slot;
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+            const std::uint32_t outputIndex = atomicAdd(candidateCount, 1u);
+            if (outputIndex < maxCandidatePairs)
+            {
+                candidatePairs[outputIndex] = pair;
+            }
+            else
+            {
+                atomicAdd(overflowCount, 1u);
+            }
+            return true;
+        }
+        if (previous == pair)
+        {
+            return false;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    atomicAdd(probeOverflowCount, 1u);
+    atomicAdd(overflowCount, 1u);
+    return false;
+}
+
+__global__ void generateMixedHashCandidatePairs64Kernel(
     const std::uint32_t* tissueCount,
     const std::uint32_t* toolCount,
+    const std::uint32_t* mixedBucketIds,
+    const std::uint32_t* mixedBucketCount,
     const std::uint32_t* tissueIds,
     const std::uint32_t* toolIds,
-    const std::uint32_t* pairOffsets,
-    const std::uint32_t* rawTotalPtr,
-    const std::uint32_t tableSize,
+    const std::uint32_t mixedBucketCapacity,
     const std::uint32_t maxTissuePerCell,
     const std::uint32_t maxToolPerCell,
     const std::uint32_t pairHashCapacity,
     const std::uint32_t maxCandidatePairs,
     std::uint64_t* candidatePairs,
     unsigned long long* pairHashKeys,
-    std::uint32_t* rawCandidateCount,
+    std::uint32_t* touchedPairHashSlots,
+    std::uint32_t* touchedPairHashCount,
     std::uint32_t* candidateCount,
+    std::uint32_t* probeOverflowCount,
     std::uint32_t* overflowCount)
 {
-    const std::uint32_t total = *rawTotalPtr;
-    const std::uint32_t stride = gridDim.x * blockDim.x;
-    for (std::uint32_t g = blockIdx.x * blockDim.x + threadIdx.x; g < total; g += stride)
+    const std::uint32_t mixedCount = min(*mixedBucketCount, mixedBucketCapacity);
+    for (std::uint32_t mixedIndex = blockIdx.x; mixedIndex < mixedCount; mixedIndex += gridDim.x)
     {
-        const std::uint32_t slot = findSlotForPair(pairOffsets, tableSize, g);
-        const std::uint32_t local = g - pairOffsets[slot];
-        const std::uint32_t u = min(toolCount[slot], maxToolPerCell);
-        if (u == 0u) continue;
-        const std::uint32_t tissueLocal = local / u;
-        const std::uint32_t toolLocal   = local % u;
-        const std::uint32_t tissueTriId = tissueIds[slot * maxTissuePerCell + tissueLocal];
-        const std::uint32_t toolTriId   = toolIds[slot * maxToolPerCell + toolLocal];
+        const std::uint32_t bucketIdx = mixedBucketIds[mixedIndex];
+        const std::uint32_t t = min(tissueCount[bucketIdx], maxTissuePerCell);
+        const std::uint32_t u = min(toolCount[bucketIdx], maxToolPerCell);
+        const std::uint64_t totalPairs = static_cast<std::uint64_t>(t) * static_cast<std::uint64_t>(u);
+        for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+        {
+            const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / u);
+            const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % u);
+            const std::uint32_t tissueTriId = tissueIds[bucketIdx * maxTissuePerCell + tissueLocal];
+            const std::uint32_t toolTriId = toolIds[bucketIdx * maxToolPerCell + toolLocal];
+            insertUniqueCandidatePair64Tracked(
+                encodeCandidatePair(tissueTriId, toolTriId),
+                pairHashKeys,
+                touchedPairHashSlots,
+                touchedPairHashCount,
+                pairHashCapacity,
+                candidatePairs,
+                candidateCount,
+                overflowCount,
+                probeOverflowCount,
+                maxCandidatePairs);
+        }
+    }
+}
 
-        atomicAdd(rawCandidateCount, 1u);
-        insertUniqueCandidatePair(
-            encodeCandidatePair(tissueTriId, toolTriId),
-            pairHashKeys, pairHashCapacity,
-            candidatePairs, candidateCount, overflowCount,
-            nullptr, maxCandidatePairs);
+__global__ void generateMixedHashCandidatePairs32Kernel(
+    const std::uint32_t* tissueCount,
+    const std::uint32_t* toolCount,
+    const std::uint32_t* mixedBucketIds,
+    const std::uint32_t* mixedBucketCount,
+    const std::uint32_t* tissueIds,
+    const std::uint32_t* toolIds,
+    const std::uint32_t mixedBucketCapacity,
+    const std::uint32_t maxTissuePerCell,
+    const std::uint32_t maxToolPerCell,
+    const std::uint32_t pairHashCapacity,
+    const std::uint32_t maxCandidatePairs,
+    std::uint32_t* candidatePairs,
+    std::uint32_t* pairHashKeys,
+    std::uint32_t* touchedPairHashSlots,
+    std::uint32_t* touchedPairHashCount,
+    std::uint32_t* candidateCount,
+    std::uint32_t* probeOverflowCount,
+    std::uint32_t* overflowCount)
+{
+    const std::uint32_t mixedCount = min(*mixedBucketCount, mixedBucketCapacity);
+    for (std::uint32_t mixedIndex = blockIdx.x; mixedIndex < mixedCount; mixedIndex += gridDim.x)
+    {
+        const std::uint32_t bucketIdx = mixedBucketIds[mixedIndex];
+        const std::uint32_t t = min(tissueCount[bucketIdx], maxTissuePerCell);
+        const std::uint32_t u = min(toolCount[bucketIdx], maxToolPerCell);
+        const std::uint64_t totalPairs = static_cast<std::uint64_t>(t) * static_cast<std::uint64_t>(u);
+        for (std::uint64_t localPair = threadIdx.x; localPair < totalPairs; localPair += blockDim.x)
+        {
+            const std::uint32_t tissueLocal = static_cast<std::uint32_t>(localPair / u);
+            const std::uint32_t toolLocal = static_cast<std::uint32_t>(localPair % u);
+            const std::uint32_t tissueTriId = tissueIds[bucketIdx * maxTissuePerCell + tissueLocal];
+            const std::uint32_t toolTriId = toolIds[bucketIdx * maxToolPerCell + toolLocal];
+            insertUniqueCandidatePair32Tracked(
+                encodeCompactCandidatePair(tissueTriId, toolTriId),
+                pairHashKeys,
+                touchedPairHashSlots,
+                touchedPairHashCount,
+                pairHashCapacity,
+                candidatePairs,
+                candidateCount,
+                overflowCount,
+                probeOverflowCount,
+                maxCandidatePairs);
+        }
     }
 }
 
@@ -5330,7 +5717,9 @@ bool computeFeatureBasedProximityContacts(
         deviceSecondPositions,
         workspace.indexedToolIndices,
         workspace.candidatePairs,
+        nullptr,
         workspace.candidateCount,
+        false,
         deviceProximityContacts,
         workspace.proximityContactCount,
         workspace.proximityOverflowCount,
@@ -5827,18 +6216,10 @@ bool computeFeatureBasedVertexTriangleContacts(
 // ============================================================================
 // computeHashPrefixSumProximityContacts (EXPERIMENTAL)
 // ----------------------------------------------------------------------------
-// Spatial-hash + prefix-sum broad cull -> reuse the FBP narrow kernel.
-// Pipeline:
-//   1. resetHashGridKernel                  clear the hash table + counters
-//   2. insertHashGridTrianglesKernel x2     hash-insert tissue, then tool
-//   3. computeHashPairsPerSlotKernel        pairsPerSlot = tissue x tool
-//   4. thrust::exclusive_scan               prefix-sum -> pairOffsets
-//   5. setHashRawTotalKernel                rawTotal = last offset + last count
-//   6. cudaMemset(pairHashKeys, 0xff)       clear dedup table
-//   7. generateHashPrefixSumCandidatePairs  thread-per-pair, dedup -> candidatePairs
-//   8. resetProximityCountersKernel
-//   9. featureBasedProximityKernel          the SAME narrow kernel as the dense path
-// Output is identical to computeFeatureBasedProximityContacts.
+// Spatial-hash broad phase using compact occupied buckets. The steady-state path
+// clears only touched pair-hash slots from the previous frame, inserts topology
+// into compact buckets, scans bucket pair counts with persistent CUB storage, and
+// generates only mixed occupied buckets before reusing the FBP narrow kernel.
 // ============================================================================
 bool computeHashPrefixSumProximityContacts(
     const TriangleIndexedSurface& firstSurface,
@@ -5881,17 +6262,46 @@ bool computeHashPrefixSumProximityContacts(
         return false;
     }
 
+    const std::uint64_t cellCount64 =
+        static_cast<std::uint64_t>(gridConfig.gridResolutionX) *
+        static_cast<std::uint64_t>(gridConfig.gridResolutionY) *
+        static_cast<std::uint64_t>(gridConfig.gridResolutionZ);
+    if (cellCount64 == 0 || cellCount64 > std::numeric_limits<std::uint32_t>::max())
+    {
+        diagnostic = "Hash path grid cell count out of range.";
+        return false;
+    }
+    const std::uint32_t cellCount = static_cast<std::uint32_t>(cellCount64);
+
     // Derive the hash table size (power of two). Heuristic: ~4 slots per input
     // triangle, so the table comfortably exceeds the number of occupied cells.
     std::uint32_t tableSize = hashConfig.hashTableSize;
     if (tableSize == 0)
     {
         const std::uint64_t guess = static_cast<std::uint64_t>(firstSurface.triangleCount + secondSurface.triangleCount) * 4ull;
-        tableSize = static_cast<std::uint32_t>(nextPowerOfTwo(static_cast<std::size_t>(std::max<std::uint64_t>(1024ull, guess))));
+        const std::size_t candidate = nextPowerOfTwo(static_cast<std::size_t>(std::max<std::uint64_t>(1024ull, guess)));
+        if (candidate > std::numeric_limits<std::uint32_t>::max())
+        {
+            diagnostic = "Hash path table size out of range.";
+            return false;
+        }
+        tableSize = static_cast<std::uint32_t>(candidate);
     }
     else
     {
-        tableSize = static_cast<std::uint32_t>(nextPowerOfTwo(tableSize));
+        const std::size_t candidate = nextPowerOfTwo(tableSize);
+        if (candidate > std::numeric_limits<std::uint32_t>::max())
+        {
+            diagnostic = "Hash path table size out of range.";
+            return false;
+        }
+        tableSize = static_cast<std::uint32_t>(candidate);
+    }
+    const std::uint32_t bucketCapacity = std::max(1u, std::min(tableSize, cellCount));
+    if (bucketCapacity > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    {
+        diagnostic = "Hash path bucket capacity exceeds CUB scan element limit.";
+        return false;
     }
     const std::uint64_t pairHashCount64 =
         static_cast<std::uint64_t>(nextPowerOfTwo(static_cast<std::size_t>(gridConfig.maxCandidatePairs) * 2u));
@@ -5900,12 +6310,17 @@ bool computeHashPrefixSumProximityContacts(
         diagnostic = "Hash path pair-hash table size out of range.";
         return false;
     }
+    const bool useCompactCandidatePairs =
+        firstSurface.triangleCount <= std::numeric_limits<std::uint16_t>::max() &&
+        secondSurface.triangleCount <= std::numeric_limits<std::uint16_t>::max();
+    const std::uint32_t maxProbe = std::max(1u, hashConfig.maxProbe);
 
     auto& ws = hashGridWorkspace();
     std::uint64_t newlyAllocatedBytes = 0;
     const auto allocStart = std::chrono::steady_clock::now();
     cudaError_t err = ws.ensure(
         tableSize,
+        bucketCapacity,
         gridConfig.maxTissueTrianglesPerCell,
         gridConfig.maxToolTrianglesPerCell,
         gridConfig.maxCandidatePairs,
@@ -5916,6 +6331,7 @@ bool computeHashPrefixSumProximityContacts(
         static_cast<std::size_t>(secondSurface.triangleCount) * 3u,
         firstSurface.devicePositions == nullptr ? firstSurface.vertexCount : 0u,
         secondSurface.devicePositions == nullptr ? secondSurface.vertexCount : 0u,
+        useCompactCandidatePairs,
         newlyAllocatedBytes);
     if (err != cudaSuccess)
     {
@@ -5972,72 +6388,437 @@ bool computeHashPrefixSumProximityContacts(
 
     constexpr std::uint32_t threads = 256;
     const std::uint32_t tableBlocks = (tableSize + threads - 1u) / threads;
+    const std::uint32_t bucketBlocks = (bucketCapacity + threads - 1u) / threads;
+    const std::uint32_t resetItems = std::max(tableSize, bucketCapacity);
+    const std::uint32_t resetBlocks = (resetItems + threads - 1u) / threads;
     const std::uint32_t firstBlocks = (firstSurface.triangleCount + threads - 1u) / threads;
     const std::uint32_t secondBlocks = (secondSurface.triangleCount + threads - 1u) / threads;
     constexpr std::uint32_t kGenBlocks = 1024;
+    const std::uint32_t pairHashCount = static_cast<std::uint32_t>(pairHashCount64);
+    const std::uint32_t pairHashClearBlocks =
+        std::max(1u, std::min(kGenBlocks, (pairHashCount + threads - 1u) / threads));
 
-    const bool needTiming = proximityConfig.readContactCounter;
-    if (needTiming) { err = ws.ensureEvents(); if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; } cudaEventRecord(ws.startEvent); }
+    const bool detailedProfiling = gridConfig.detailedProfiling;
+    const bool totalTiming = proximityConfig.readContactCounter && !detailedProfiling;
+    if (detailedProfiling || totalTiming)
+    {
+        err = ws.ensureEvents();
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            return false;
+        }
+    }
+    if (totalTiming)
+    {
+        err = cudaEventRecord(ws.startEvent);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            return false;
+        }
+    }
 
-    // 1. reset
-    resetHashGridKernel<<<tableBlocks, threads>>>(ws.cellKeys, ws.tissueCount, ws.toolCount, tableSize,
-        ws.rawCandidateCount, ws.candidateCount, ws.overflowCount, ws.probeOverflowCount, ws.occupiedSlotCount);
-    // 2. inserts
-    insertHashGridTrianglesKernel<<<firstBlocks, threads>>>(deviceFirstPositions, ws.firstIndices,
-        firstSurface.triangleCount, true, dc, tableSize, hashConfig.maxProbe,
-        ws.cellKeys, ws.tissueCount, ws.toolCount, ws.tissueIds, ws.toolIds,
-        ws.overflowCount, ws.probeOverflowCount, ws.occupiedSlotCount);
-    insertHashGridTrianglesKernel<<<secondBlocks, threads>>>(deviceSecondPositions, ws.secondIndices,
-        secondSurface.triangleCount, false, dc, tableSize, hashConfig.maxProbe,
-        ws.cellKeys, ws.tissueCount, ws.toolCount, ws.tissueIds, ws.toolIds,
-        ws.overflowCount, ws.probeOverflowCount, ws.occupiedSlotCount);
-    // 3. pairs per slot
-    computeHashPairsPerSlotKernel<<<tableBlocks, threads>>>(ws.tissueCount, ws.toolCount, tableSize,
-        gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell, ws.pairsPerSlot);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) { diagnostic = std::string("hash insert/pairs launch: ") + cudaGetErrorString(err); return false; }
+    double hashPairClearMs = 0.0;
+    double hashResetMs = 0.0;
+    double hashInsertTissueMs = 0.0;
+    double hashInsertToolMs = 0.0;
+    double hashCompactBucketsMs = 0.0;
+    double hashPairCountMs = 0.0;
+    double hashScanMs = 0.0;
+    double hashGeneratePairsMs = 0.0;
+    double hashProximityCounterClearMs = 0.0;
+    double fbpMs = 0.0;
+    std::uint32_t launchCount = 0;
+    std::uint32_t memsetCount = 0;
 
-    // 4. exclusive scan (prefix sum)
-    thrust::exclusive_scan(
-        thrust::device_pointer_cast(ws.pairsPerSlot),
-        thrust::device_pointer_cast(ws.pairsPerSlot + tableSize),
-        thrust::device_pointer_cast(ws.pairOffsets));
-    // 5. raw total
-    setHashRawTotalKernel<<<1, 1>>>(ws.pairOffsets, ws.pairsPerSlot, tableSize, ws.rawTotal);
-    // 6. clear dedup table
-    cudaMemset(ws.pairHashKeys, 0xff, static_cast<std::size_t>(pairHashCount64) * sizeof(unsigned long long));
-    // 7. generate unique candidate pairs (thread-per-raw-pair, grid-stride)
-    generateHashPrefixSumCandidatePairsKernel<<<kGenBlocks, threads>>>(
-        ws.cellKeys, ws.tissueCount, ws.toolCount, ws.tissueIds, ws.toolIds,
-        ws.pairOffsets, ws.rawTotal, tableSize,
-        gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell,
-        static_cast<std::uint32_t>(pairHashCount64), gridConfig.maxCandidatePairs,
-        ws.candidatePairs, ws.pairHashKeys, ws.rawCandidateCount, ws.candidateCount, ws.overflowCount);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) { diagnostic = std::string("hash generate launch: ") + cudaGetErrorString(err); return false; }
+    // Clear only the pair-hash slots touched by the previous frame. The first
+    // frame or a capacity growth still needs a full initialization.
+    if (useCompactCandidatePairs)
+    {
+        const bool fullPairHashClear = !ws.compactPairHashKeysInitialized;
+        err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashPairClearMs, [&]() {
+            ScopedNvtxRange range("hash clear compact touched pair slots", detailedProfiling);
+            if (!ws.compactPairHashKeysInitialized)
+            {
+                const cudaError_t memsetErr = cudaMemset(
+                    ws.compactPairHashKeys,
+                    0xff,
+                    static_cast<std::size_t>(pairHashCount) * sizeof(std::uint32_t));
+                if (memsetErr == cudaSuccess) ws.compactPairHashKeysInitialized = true;
+                return memsetErr;
+            }
+            clearTouchedPairHash32Kernel<<<pairHashClearBlocks, threads>>>(
+                ws.compactPairHashKeys,
+                ws.touchedPairHashSlots,
+                ws.touchedPairHashCount);
+            return cudaGetLastError();
+        });
+        if (fullPairHashClear) memsetCount += 1u;
+        else launchCount += 1u;
+    }
+    else
+    {
+        const bool fullPairHashClear = !ws.pairHashKeysInitialized;
+        err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashPairClearMs, [&]() {
+            ScopedNvtxRange range("hash clear touched pair slots", detailedProfiling);
+            if (!ws.pairHashKeysInitialized)
+            {
+                const cudaError_t memsetErr = cudaMemset(
+                    ws.pairHashKeys,
+                    0xff,
+                    static_cast<std::size_t>(pairHashCount) * sizeof(unsigned long long));
+                if (memsetErr == cudaSuccess) ws.pairHashKeysInitialized = true;
+                return memsetErr;
+            }
+            clearTouchedPairHash64Kernel<<<pairHashClearBlocks, threads>>>(
+                ws.pairHashKeys,
+                ws.touchedPairHashSlots,
+                ws.touchedPairHashCount);
+            return cudaGetLastError();
+        });
+        if (fullPairHashClear) memsetCount += 1u;
+        else launchCount += 1u;
+    }
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash pair-table clear: ") + cudaGetErrorString(err);
+        return false;
+    }
 
-    // 8. reset proximity counters
-    resetProximityCountersKernel<<<1, 1>>>(ws.proximityContactCount, ws.proximityOverflowCount,
-        ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount);
-    // 9. FBP narrow kernel (reused, grid-strides over the unique candidate pairs)
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashResetMs, [&]() {
+        ScopedNvtxRange range("hash reset compact grid", detailedProfiling);
+        resetCompactHashGridKernel<<<resetBlocks, threads>>>(
+            ws.cellKeys,
+            ws.slotBucketIds,
+            tableSize,
+            ws.tissueCount,
+            ws.toolCount,
+            ws.pairsPerBucket,
+            bucketCapacity,
+            ws.rawCandidateCount,
+            ws.candidateCount,
+            ws.overflowCount,
+            ws.probeOverflowCount,
+            ws.occupiedBucketCount,
+            ws.mixedBucketCount,
+            ws.touchedPairHashCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash reset launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashInsertTissueMs, [&]() {
+        ScopedNvtxRange range("hash mark tissue cells", detailedProfiling);
+        markCompactHashGridCellsKernel<<<firstBlocks, threads>>>(
+            deviceFirstPositions,
+            ws.firstIndices,
+            firstSurface.triangleCount,
+            dc,
+            tableSize,
+            maxProbe,
+            ws.cellKeys,
+            ws.probeOverflowCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash tissue cell mark launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashInsertToolMs, [&]() {
+        ScopedNvtxRange range("hash mark tool cells", detailedProfiling);
+        markCompactHashGridCellsKernel<<<secondBlocks, threads>>>(
+            deviceSecondPositions,
+            ws.secondIndices,
+            secondSurface.triangleCount,
+            dc,
+            tableSize,
+            maxProbe,
+            ws.cellKeys,
+            ws.probeOverflowCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash tool cell mark launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashCompactBucketsMs, [&]() {
+        ScopedNvtxRange range("hash compact occupied buckets", detailedProfiling);
+        compactHashGridSlotsKernel<<<tableBlocks, threads>>>(
+            ws.cellKeys,
+            ws.slotBucketIds,
+            ws.bucketCellIds,
+            tableSize,
+            bucketCapacity,
+            ws.occupiedBucketCount,
+            ws.overflowCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash bucket compaction launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashInsertTissueMs, [&]() {
+        ScopedNvtxRange range("hash fill tissue buckets", detailedProfiling);
+        fillCompactHashGridTrianglesKernel<<<firstBlocks, threads>>>(
+            deviceFirstPositions,
+            ws.firstIndices,
+            firstSurface.triangleCount,
+            true,
+            dc,
+            tableSize,
+            bucketCapacity,
+            maxProbe,
+            ws.cellKeys,
+            ws.slotBucketIds,
+            ws.tissueCount,
+            ws.toolCount,
+            ws.tissueIds,
+            ws.toolIds,
+            ws.mixedBucketIds,
+            ws.mixedBucketCount,
+            ws.overflowCount,
+            ws.probeOverflowCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash tissue bucket fill launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashInsertToolMs, [&]() {
+        ScopedNvtxRange range("hash fill tool buckets", detailedProfiling);
+        fillCompactHashGridTrianglesKernel<<<secondBlocks, threads>>>(
+            deviceSecondPositions,
+            ws.secondIndices,
+            secondSurface.triangleCount,
+            false,
+            dc,
+            tableSize,
+            bucketCapacity,
+            maxProbe,
+            ws.cellKeys,
+            ws.slotBucketIds,
+            ws.tissueCount,
+            ws.toolCount,
+            ws.tissueIds,
+            ws.toolIds,
+            ws.mixedBucketIds,
+            ws.mixedBucketCount,
+            ws.overflowCount,
+            ws.probeOverflowCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash tool bucket fill launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashPairCountMs, [&]() {
+        ScopedNvtxRange range("hash count mixed-bucket pairs", detailedProfiling);
+        computeCompactHashPairsPerBucketKernel<<<bucketBlocks, threads>>>(
+            ws.tissueCount,
+            ws.toolCount,
+            ws.mixedBucketIds,
+            ws.mixedBucketCount,
+            bucketCapacity,
+            gridConfig.maxTissueTrianglesPerCell,
+            gridConfig.maxToolTrianglesPerCell,
+            ws.pairsPerBucket,
+            ws.rawCandidateCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash pair count launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashScanMs, [&]() {
+        ScopedNvtxRange range("hash CUB exclusive scan", detailedProfiling);
+        cudaError_t scanErr = cub::DeviceScan::ExclusiveSum(
+            ws.scanTempStorage,
+            ws.scanTempStorageBytes,
+            ws.pairsPerBucket,
+            ws.pairOffsets,
+            static_cast<int>(bucketCapacity));
+        if (scanErr != cudaSuccess) return scanErr;
+        setCompactHashRawTotalKernel<<<1, 1>>>(
+            ws.pairOffsets,
+            ws.pairsPerBucket,
+            bucketCapacity,
+            ws.rawTotal);
+        return cudaGetLastError();
+    });
+    launchCount += 2u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash scan launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashGeneratePairsMs, [&]() {
+        ScopedNvtxRange range("hash generate mixed candidate pairs", detailedProfiling);
+        if (useCompactCandidatePairs)
+        {
+            generateMixedHashCandidatePairs32Kernel<<<kGenBlocks, threads>>>(
+                ws.tissueCount,
+                ws.toolCount,
+                ws.mixedBucketIds,
+                ws.mixedBucketCount,
+                ws.tissueIds,
+                ws.toolIds,
+                bucketCapacity,
+                gridConfig.maxTissueTrianglesPerCell,
+                gridConfig.maxToolTrianglesPerCell,
+                pairHashCount,
+                gridConfig.maxCandidatePairs,
+                ws.compactCandidatePairs,
+                ws.compactPairHashKeys,
+                ws.touchedPairHashSlots,
+                ws.touchedPairHashCount,
+                ws.candidateCount,
+                ws.probeOverflowCount,
+                ws.overflowCount);
+        }
+        else
+        {
+            generateMixedHashCandidatePairs64Kernel<<<kGenBlocks, threads>>>(
+                ws.tissueCount,
+                ws.toolCount,
+                ws.mixedBucketIds,
+                ws.mixedBucketCount,
+                ws.tissueIds,
+                ws.toolIds,
+                bucketCapacity,
+                gridConfig.maxTissueTrianglesPerCell,
+                gridConfig.maxToolTrianglesPerCell,
+                pairHashCount,
+                gridConfig.maxCandidatePairs,
+                ws.candidatePairs,
+                ws.pairHashKeys,
+                ws.touchedPairHashSlots,
+                ws.touchedPairHashCount,
+                ws.candidateCount,
+                ws.probeOverflowCount,
+                ws.overflowCount);
+        }
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash generate launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashProximityCounterClearMs, [&]() {
+        ScopedNvtxRange range("hash reset proximity counters", detailedProfiling);
+        resetProximityCountersKernel<<<1, 1>>>(
+            ws.proximityContactCount,
+            ws.proximityOverflowCount,
+            ws.proximityVfCount,
+            ws.proximityFvCount,
+            ws.proximityEeCount);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash proximity counter reset launch: ") + cudaGetErrorString(err);
+        return false;
+    }
+
     auto* deviceContacts = reinterpret_cast<DeviceProximityContact*>(ws.proximityContacts);
-    featureBasedProximityKernel<<<kGenBlocks, threads>>>(
-        deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices,
-        ws.candidatePairs, ws.candidateCount, deviceContacts,
-        ws.proximityContactCount, ws.proximityOverflowCount,
-        ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
-        proximityConfig.maxContacts, proximityConfig.contactDistance, proximityConfig.computeBarycentrics);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) { diagnostic = std::string("hash FBP launch: ") + cudaGetErrorString(err); return false; }
-
-    if (executionStats != nullptr) { executionStats->kernelLaunchCount += 8; executionStats->cudaMemsetCount += 1; }
+    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, fbpMs, [&]() {
+        ScopedNvtxRange range("hash FBP narrow phase", detailedProfiling);
+        featureBasedProximityKernel<<<kGenBlocks, threads>>>(
+            deviceFirstPositions,
+            ws.firstIndices,
+            deviceSecondPositions,
+            ws.secondIndices,
+            useCompactCandidatePairs ? nullptr : ws.candidatePairs,
+            useCompactCandidatePairs ? ws.compactCandidatePairs : nullptr,
+            ws.candidateCount,
+            useCompactCandidatePairs,
+            deviceContacts,
+            ws.proximityContactCount,
+            ws.proximityOverflowCount,
+            ws.proximityVfCount,
+            ws.proximityFvCount,
+            ws.proximityEeCount,
+            proximityConfig.maxContacts,
+            proximityConfig.contactDistance,
+            proximityConfig.computeBarycentrics);
+        return cudaGetLastError();
+    });
+    launchCount += 1u;
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("hash FBP launch: ") + cudaGetErrorString(err);
+        return false;
+    }
 
     float kernelMs = 0.0f;
-    if (needTiming) { cudaEventRecord(ws.endEvent); cudaEventSynchronize(ws.endEvent); cudaEventElapsedTime(&kernelMs, ws.startEvent, ws.endEvent); }
-    if (executionStats != nullptr) { executionStats->gpuKernelMilliseconds += kernelMs; executionStats->featureBasedProximityKernelMilliseconds += kernelMs; }
+    if (totalTiming)
+    {
+        err = cudaEventRecord(ws.endEvent);
+        if (err == cudaSuccess) err = cudaEventSynchronize(ws.endEvent);
+        if (err == cudaSuccess) err = cudaEventElapsedTime(&kernelMs, ws.startEvent, ws.endEvent);
+        if (err != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(err);
+            return false;
+        }
+    }
+
+    if (executionStats != nullptr)
+    {
+        const double detailedKernelMs =
+            hashPairClearMs +
+            hashResetMs +
+            hashInsertTissueMs +
+            hashInsertToolMs +
+            hashCompactBucketsMs +
+            hashPairCountMs +
+            hashScanMs +
+            hashGeneratePairsMs +
+            hashProximityCounterClearMs +
+            fbpMs;
+        executionStats->kernelLaunchCount += launchCount;
+        executionStats->cudaMemsetCount += memsetCount;
+        executionStats->gpuKernelMilliseconds += detailedProfiling ? detailedKernelMs : static_cast<double>(kernelMs);
+        executionStats->featureBasedProximityKernelMilliseconds += detailedProfiling ? fbpMs : 0.0;
+        executionStats->hashGridResetMilliseconds += hashResetMs;
+        executionStats->hashGridPairHashClearMilliseconds += hashPairClearMs;
+        executionStats->hashGridInsertTissueMilliseconds += hashInsertTissueMs;
+        executionStats->hashGridInsertToolMilliseconds += hashInsertToolMs;
+        executionStats->hashGridPairCountMilliseconds += hashCompactBucketsMs + hashPairCountMs;
+        executionStats->hashGridScanMilliseconds += hashScanMs;
+        executionStats->hashGridGeneratePairsMilliseconds += hashGeneratePairsMs;
+        executionStats->hashGridProximityCounterClearMilliseconds += hashProximityCounterClearMs;
+    }
 
     // Optional readback (validation/profiling, or when contacts must reach host).
-    std::uint32_t hostContactCount = 0, hostUnique = 0, hostRaw = 0, hostOverflow = 0, hostProbe = 0, hostOccupied = 0;
+    std::uint32_t hostContactCount = 0, hostUnique = 0, hostRaw = 0, hostOverflow = 0, hostProbe = 0, hostOccupied = 0, hostMixed = 0;
     std::uint32_t hostVf = 0, hostFv = 0, hostEe = 0;
     if (proximityConfig.readContactCounter || !proximityConfig.keepContactsOnDevice)
     {
@@ -6046,20 +6827,23 @@ bool computeHashPrefixSumProximityContacts(
         cudaMemcpyAsync(p + 1, ws.rawCandidateCount,     sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 2, ws.overflowCount,         sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 3, ws.probeOverflowCount,    sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
-        cudaMemcpyAsync(p + 4, ws.occupiedSlotCount,     sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(p + 4, ws.occupiedBucketCount,   sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 5, ws.proximityContactCount, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 6, ws.proximityVfCount,      sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 7, ws.proximityFvCount,      sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 8, ws.proximityEeCount,      sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(p + 9, ws.mixedBucketCount,      sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
         hostUnique = p[0]; hostRaw = p[1]; hostOverflow = p[2]; hostProbe = p[3]; hostOccupied = p[4];
-        hostContactCount = p[5]; hostVf = p[6]; hostFv = p[7]; hostEe = p[8];
+        hostContactCount = p[5]; hostVf = p[6]; hostFv = p[7]; hostEe = p[8]; hostMixed = p[9];
         if (executionStats != nullptr)
         {
-            executionStats->deviceToHostBytes += 9u * sizeof(std::uint32_t);
+            executionStats->deviceToHostBytes += 10u * sizeof(std::uint32_t);
             executionStats->rawCandidateCount += hostRaw;
             executionStats->uniqueCandidateCount += hostUnique;
+            executionStats->outputCandidateCount += hostUnique;
             executionStats->outputContactCount = hostContactCount;
+            executionStats->activeMixedCellCount += std::min(hostMixed, bucketCapacity);
             executionStats->vfContactCount += hostVf;
             executionStats->fvContactCount += hostFv;
             executionStats->eeContactCount += hostEe;
@@ -6110,8 +6894,10 @@ bool computeHashPrefixSumProximityContacts(
         }
     }
 
-    if (executionStats != nullptr) executionStats->gridCellCount =
-        gridConfig.gridResolutionX * gridConfig.gridResolutionY * gridConfig.gridResolutionZ;
+    if (executionStats != nullptr)
+    {
+        executionStats->gridCellCount = cellCount;
+    }
 
     diagnostic.clear();
     return true;

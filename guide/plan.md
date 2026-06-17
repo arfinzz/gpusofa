@@ -889,8 +889,52 @@ Standalone backend bench also bit-identical (488 = 488). Reports:
   still wins. This is for the both-large case.
 - Only the cross-model tri–tri FBP path is routed through the hash cull; the
   v-t (self + cross) kernels are unchanged.
-- Extending the hash + prefix-sum expansion to the v-t point-insert path, and
-  deriving table size from a measured occupancy histogram, are open follow-ups.
+
+### 5.19  Optimised hash broad cull (2026-06-17, ~2.5–3× faster kernel than dense)
+
+The §5.18 hash design was reworked with **seven optimizations**, all inside
+`cuda/GpuCollisionBackend.cu` (no new files; CUB is header-only):
+
+1. **Clear only touched dedup slots** (`clearTouchedPairHash{32,64}Kernel`) instead
+   of a full `cudaMemset` of the multi-million-slot pair-hash table every frame
+   (first frame / growth still does one full memset, guarded).
+2. **Compact bucket storage** — two-pass `markCompactHashGridCellsKernel` →
+   `compactHashGridSlotsKernel` assigns each occupied slot a dense bucket index;
+   per-bucket arrays scale with occupancy, not `tableSize`.
+3. **Generate only mixed buckets** — `fillCompactHashGridTrianglesKernel` builds a
+   `mixedBucketIds` list (buckets with both tissue and tool); the hash analogue of
+   Phase 15.
+4. **No per-pair binary search** — `generateMixedHashCandidatePairs{32,64}Kernel`
+   runs one block per mixed bucket and splits its `t×u` pairs by divide/modulo.
+5. **Persistent CUB scan** (`cub::DeviceScan::ExclusiveSum` with workspace temp)
+   replaces `thrust::exclusive_scan` (no per-frame Thrust alloc).
+6. **32-bit compact pair encoding** when both triangle counts ≤ 65535.
+7. **Per-stage hash profiling** — 8 `avg_narrow_hash_*_ms` summary keys.
+
+Kernel launches: 7 (dense) → **13** (optimised hash) — more, smaller kernels.
+
+**Measured (2026-06-17, large tissue + large tool, 14,368 elements, same-session,
+independently re-verified).** Trust the kernel time.
+
+```text
+                          narrow_kernel   FPS     contacts (VF/FV/EE)
+plain dense (Phase15 off) 2.126 ms        263.8   2354 (1119/428/807)
+optimised dense (Ph15 on) 1.787 ms        294.7   2354 (1119/428/807)
+earlier hash (2026-06-09) ~1.27 ms        ~405    2354  (prior build)
+optimised hash (this)     0.700 ms        408.1   2354 (1119/428/807)
+                          3.0x vs plain dense / 2.6x vs optimised dense / 1.8x vs earlier hash
+```
+
+A second same-session A/B reproduced 0.508 ms / 565 FPS for the optimised hash
+(dense 1.748 ms / 238 FPS). Standalone backend bench bit-identical
+(`hash = fbp = 8018`, unique 322,560 = 322,560, overflow 0). Full suite: every
+scene's contacts match the documented baseline, overflow 0. Report:
+`reports/hash_optimized_broadphase_20260617.md`.
+
+**Open follow-ups.** The CUB scan's `pairOffsets`/`rawTotal` now feed only the
+`rawPairCount` stat (the block-per-bucket generator needs no global offsets) — the
+scan could be dropped/folded. Route v-t through the hash cull; auto-tune table size
+from a measured occupancy histogram.
 
 ---
 

@@ -1,5 +1,9 @@
 # GPU Collision — Full Benchmark Suite (2026-06-09)
 
+> ℹ️ **Hash path optimised 2026-06-17** (~2.5–3× faster kernel than dense, contacts
+> unchanged). The hash A/B numbers in §1/§3 are the pre-optimization design; see
+> [hash_optimized_broadphase_20260617.md](hash_optimized_broadphase_20260617.md).
+
 **Branch:** `experiment/hash-prefixsum-broadphase`
 **Hardware:** NVIDIA GeForce GTX 1650 Ti (Turing sm_75), WSL2, SOFA 25.12.
 **Build:** `SofaGpuCollision/build-profile/libSofaGpuCollision.so` (this branch).

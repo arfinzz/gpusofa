@@ -197,6 +197,25 @@ Phase 15 win was localized (`generate_pairs` 300 µs → 7.9 µs). They are off 
 default because taking those intermediate timings requires syncs that perturb the
 very thing being measured; use them to *diagnose*, not to quote headline FPS.
 
+**Hash-path stage timers (added 2026-06-17).** When the optimised spatial-hash
+broad cull runs (`useHashPrefixSumGeneration=True`), eight extra keys attribute
+its kernel time stage-by-stage:
+
+| Key | Stage |
+|---|---|
+| `avg_narrow_hash_reset_ms` | clear cellKeys + per-bucket counts + counters |
+| `avg_narrow_hash_pair_hash_clear_ms` | clear only the dedup slots touched last frame |
+| `avg_narrow_hash_insert_tissue_ms` | mark + fill tissue triangles into buckets |
+| `avg_narrow_hash_insert_tool_ms` | mark + fill tool triangles into buckets |
+| `avg_narrow_hash_pair_count_ms` | `pairsPerBucket = tissue×tool` over mixed buckets |
+| `avg_narrow_hash_scan_ms` | CUB exclusive scan (feeds the `rawPairCount` stat) |
+| `avg_narrow_hash_generate_pairs_ms` | block-per-bucket candidate generation + dedup |
+| `avg_narrow_hash_proximity_counter_clear_ms` | zero the five contact counters |
+
+They sum to roughly the hash broad cull's kernel time and are how the
+2.5–3× speedup was confirmed to come from balanced small stages (no single
+dominant stage). See `reports/hash_optimized_broadphase_20260617.md`.
+
 ---
 
 ## 9. How to read an A/B comparison correctly

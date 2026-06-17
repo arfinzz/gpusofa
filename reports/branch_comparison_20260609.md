@@ -1,5 +1,10 @@
 # Branch comparison — dense (feature) vs hash (experiment), small & large scenes
 
+> ℹ️ **Hash numbers updated 2026-06-17.** The hash path was later optimised to
+> ~2.5–3× faster kernel than dense (was the ~12% margin shown here). The
+> *contacts* are unchanged. For current hash-vs-dense performance see
+> [hash_optimized_broadphase_20260617.md](hash_optimized_broadphase_20260617.md).
+
 **Date:** 2026-06-09
 **Hardware:** NVIDIA GeForce GTX 1650 Ti (Turing sm_75), WSL2, SOFA 25.12.
 **Build:** `SofaGpuCollision/build-profile/libSofaGpuCollision.so` (merged `main`).

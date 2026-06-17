@@ -199,7 +199,7 @@ needed):
 | `large_tissue_blade.py` | GPU dense-grid FBP, large mesh (~79,520 elements) | fast ~146 FPS / validation ~114 FPS, **8018** contacts (5397/880/1741) |
 | `self_collision_vertex_triangle.py` | **Phase 12 v-t self-collision** | 1300–2100 FPS, **2700 VertexFace** contacts |
 | `cross_model_vertex_triangle.py` | **Phase 12 v-t cross-model** | 1500–4200 FPS, **254 VertexFace** contacts |
-| `hash_prefixsum_large.py` | **Experimental hash + prefix-sum broad cull** (large tissue + large tool, ~14,368 elements) | dense ~344 / hash ~384 FPS, **2354** contacts (identical dense vs hash) |
+| `hash_prefixsum_large.py` | **Optimised hash broad cull** (large tissue + large tool, ~14,368 elements; reworked 2026-06-17) | hash kernel **~0.5–0.7 ms vs dense ~1.8–2.1 ms (2.5–3× faster)**, **2354** contacts (identical dense vs hash) |
 
 Common scene helpers in `testscenes/dense_collision_benchmark_common.py`:
 
@@ -292,7 +292,7 @@ These all default sensibly. Set them only to override.
 | `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction via a separate full-grid scan — **regressed**, superseded by `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` |
 | `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed). Mutually exclusive with tool-active-cell generation |
 | `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` | **1** | **Phase 15 — DEFAULT ON (guide/plan.md §5.15).** Generate candidate pairs over tool-occupied (mixed) cells only — list built during the tool insert, no separate scan. **Measured 4.3× FPS (221 → 943) and 38× faster generation (300 → 7.9 µs) on one-tissue, 1.08× on large-tissue, contact counts bit-identical, never a regression.** Set to 0 only to A/B against the old all-cells path |
-| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; measured +11.8 % FPS / −15 % narrow wall, contacts bit-identical. Requires FBP on. See `reports/hash_prefixsum_broadphase_experiment_20260609.md` |
+| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms), contacts bit-identical. Requires FBP on. See `reports/hash_optimized_broadphase_20260617.md` |
 | `SOFA_HASH_TABLE_SIZE` | **0** | Hash table slot count for the above. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 
 ### 6.4  Feature-based proximity (Phase 11+12)

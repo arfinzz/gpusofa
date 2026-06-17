@@ -89,6 +89,9 @@ void GpuPipelineBenchmarkController::ensureOutputReady()
                "narrow_generate_pairs_ms,narrow_candidate_readback_ms,narrow_sort_unique_ms,narrow_exact_contact_ms,"
                "narrow_sort_unique_host_ms,narrow_contact_count_readback_ms,narrow_contact_download_ms,"
                "narrow_sofa_output_publish_ms,"
+               "narrow_hash_reset_ms,narrow_hash_pair_hash_clear_ms,narrow_hash_insert_tissue_ms,"
+               "narrow_hash_insert_tool_ms,narrow_hash_pair_count_ms,narrow_hash_scan_ms,"
+               "narrow_hash_generate_pairs_ms,narrow_hash_proximity_counter_clear_ms,"
                "host_to_device_bytes,device_to_host_bytes,device_allocation_bytes,kernel_launch_count,cuda_memset_count,"
                "workspace_resize_count,broad_gpu_used,narrow_gpu_used,"
                "broad_input_primitive_count,broad_output_pair_count,narrow_input_primitive_count,"
@@ -142,6 +145,14 @@ void GpuPipelineBenchmarkController::flushRows()
             << row.narrowContactCountReadbackMs << ','
             << row.narrowContactDownloadMs << ','
             << row.narrowSofaOutputPublishMs << ','
+            << row.narrowHashResetMs << ','
+            << row.narrowHashPairHashClearMs << ','
+            << row.narrowHashInsertTissueMs << ','
+            << row.narrowHashInsertToolMs << ','
+            << row.narrowHashPairCountMs << ','
+            << row.narrowHashScanMs << ','
+            << row.narrowHashGeneratePairsMs << ','
+            << row.narrowHashProximityCounterClearMs << ','
             << row.hostToDeviceBytes << ','
             << row.deviceToHostBytes << ','
             << row.deviceAllocationBytes << ','
@@ -271,6 +282,14 @@ void GpuPipelineBenchmarkController::writeSummary()
     summary << "avg_narrow_contact_count_readback_ms=" << (m_measuredNarrowContactCountReadbackMs / m_measuredCount) << '\n';
     summary << "avg_narrow_contact_download_ms=" << (m_measuredNarrowContactDownloadMs / m_measuredCount) << '\n';
     summary << "avg_narrow_sofa_output_publish_ms=" << (m_measuredNarrowSofaOutputPublishMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_reset_ms=" << (m_measuredNarrowHashResetMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_pair_hash_clear_ms=" << (m_measuredNarrowHashPairHashClearMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_insert_tissue_ms=" << (m_measuredNarrowHashInsertTissueMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_insert_tool_ms=" << (m_measuredNarrowHashInsertToolMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_pair_count_ms=" << (m_measuredNarrowHashPairCountMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_scan_ms=" << (m_measuredNarrowHashScanMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_generate_pairs_ms=" << (m_measuredNarrowHashGeneratePairsMs / m_measuredCount) << '\n';
+    summary << "avg_narrow_hash_proximity_counter_clear_ms=" << (m_measuredNarrowHashProximityCounterClearMs / m_measuredCount) << '\n';
     summary << "avg_host_to_device_bytes=" << (m_measuredHostToDeviceBytes / static_cast<std::uint64_t>(m_measuredCount)) << '\n';
     summary << "avg_device_to_host_bytes=" << (m_measuredDeviceToHostBytes / static_cast<std::uint64_t>(m_measuredCount)) << '\n';
     summary << "avg_device_allocation_bytes=" << (m_measuredDeviceAllocationBytes / static_cast<std::uint64_t>(m_measuredCount)) << '\n';
@@ -356,6 +375,14 @@ void GpuPipelineBenchmarkController::onAnimateEnd()
     row.narrowContactCountReadbackMs = stepSnapshot.narrowPhase.denseGridContactCountReadbackMilliseconds;
     row.narrowContactDownloadMs = stepSnapshot.narrowPhase.denseGridContactDownloadMilliseconds;
     row.narrowSofaOutputPublishMs = stepSnapshot.narrowPhase.sofaDetectionOutputPublishMilliseconds;
+    row.narrowHashResetMs = stepSnapshot.narrowPhase.hashGridResetMilliseconds;
+    row.narrowHashPairHashClearMs = stepSnapshot.narrowPhase.hashGridPairHashClearMilliseconds;
+    row.narrowHashInsertTissueMs = stepSnapshot.narrowPhase.hashGridInsertTissueMilliseconds;
+    row.narrowHashInsertToolMs = stepSnapshot.narrowPhase.hashGridInsertToolMilliseconds;
+    row.narrowHashPairCountMs = stepSnapshot.narrowPhase.hashGridPairCountMilliseconds;
+    row.narrowHashScanMs = stepSnapshot.narrowPhase.hashGridScanMilliseconds;
+    row.narrowHashGeneratePairsMs = stepSnapshot.narrowPhase.hashGridGeneratePairsMilliseconds;
+    row.narrowHashProximityCounterClearMs = stepSnapshot.narrowPhase.hashGridProximityCounterClearMilliseconds;
     row.hostToDeviceBytes =
         stepSnapshot.broadPhase.hostToDeviceBytes + stepSnapshot.narrowPhase.hostToDeviceBytes;
     row.deviceToHostBytes =
@@ -419,6 +446,14 @@ void GpuPipelineBenchmarkController::onAnimateEnd()
         m_measuredNarrowContactCountReadbackMs += row.narrowContactCountReadbackMs;
         m_measuredNarrowContactDownloadMs += row.narrowContactDownloadMs;
         m_measuredNarrowSofaOutputPublishMs += row.narrowSofaOutputPublishMs;
+        m_measuredNarrowHashResetMs += row.narrowHashResetMs;
+        m_measuredNarrowHashPairHashClearMs += row.narrowHashPairHashClearMs;
+        m_measuredNarrowHashInsertTissueMs += row.narrowHashInsertTissueMs;
+        m_measuredNarrowHashInsertToolMs += row.narrowHashInsertToolMs;
+        m_measuredNarrowHashPairCountMs += row.narrowHashPairCountMs;
+        m_measuredNarrowHashScanMs += row.narrowHashScanMs;
+        m_measuredNarrowHashGeneratePairsMs += row.narrowHashGeneratePairsMs;
+        m_measuredNarrowHashProximityCounterClearMs += row.narrowHashProximityCounterClearMs;
         m_measuredHostToDeviceBytes += row.hostToDeviceBytes;
         m_measuredDeviceToHostBytes += row.deviceToHostBytes;
         m_measuredDeviceAllocationBytes += row.deviceAllocationBytes;

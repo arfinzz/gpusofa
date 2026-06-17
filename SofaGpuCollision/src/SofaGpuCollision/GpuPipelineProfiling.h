@@ -30,6 +30,14 @@ struct StageSnapshot
     double denseGridContactCountReadbackMilliseconds { 0.0 };
     double denseGridContactDownloadMilliseconds { 0.0 };
     double sofaDetectionOutputPublishMilliseconds { 0.0 };
+    double hashGridResetMilliseconds { 0.0 };
+    double hashGridPairHashClearMilliseconds { 0.0 };
+    double hashGridInsertTissueMilliseconds { 0.0 };
+    double hashGridInsertToolMilliseconds { 0.0 };
+    double hashGridPairCountMilliseconds { 0.0 };
+    double hashGridScanMilliseconds { 0.0 };
+    double hashGridGeneratePairsMilliseconds { 0.0 };
+    double hashGridProximityCounterClearMilliseconds { 0.0 };
     // FBP-specific (2026-05-24 profiling reshape)
     double featureBasedProximityKernelMilliseconds { 0.0 };
     double hostSynchronizationMilliseconds { 0.0 };  // derived: max(0, wall - kernel) when finalized

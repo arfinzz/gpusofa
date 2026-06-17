@@ -140,6 +140,14 @@ void accumulateBackendStats(profiling::StageSnapshot& stageSnapshot, const backe
     stageSnapshot.denseGridExactContactMilliseconds += stats.denseGridExactContactMilliseconds;
     stageSnapshot.denseGridContactCountReadbackMilliseconds += stats.denseGridContactCountReadbackMilliseconds;
     stageSnapshot.denseGridContactDownloadMilliseconds += stats.denseGridContactDownloadMilliseconds;
+    stageSnapshot.hashGridResetMilliseconds += stats.hashGridResetMilliseconds;
+    stageSnapshot.hashGridPairHashClearMilliseconds += stats.hashGridPairHashClearMilliseconds;
+    stageSnapshot.hashGridInsertTissueMilliseconds += stats.hashGridInsertTissueMilliseconds;
+    stageSnapshot.hashGridInsertToolMilliseconds += stats.hashGridInsertToolMilliseconds;
+    stageSnapshot.hashGridPairCountMilliseconds += stats.hashGridPairCountMilliseconds;
+    stageSnapshot.hashGridScanMilliseconds += stats.hashGridScanMilliseconds;
+    stageSnapshot.hashGridGeneratePairsMilliseconds += stats.hashGridGeneratePairsMilliseconds;
+    stageSnapshot.hashGridProximityCounterClearMilliseconds += stats.hashGridProximityCounterClearMilliseconds;
     stageSnapshot.featureBasedProximityKernelMilliseconds += stats.featureBasedProximityKernelMilliseconds;
     stageSnapshot.vfContactCount += stats.vfContactCount;
     stageSnapshot.fvContactCount += stats.fvContactCount;

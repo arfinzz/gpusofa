@@ -91,19 +91,31 @@ the dense-grid path.)
 | 5 | `resetProximityCountersKernel` (2239) | narrow, all FBP paths | `<<<1, 1>>>` | a single thread zeros 5 counters | counters → 0 |
 | 6 | `featureBasedProximityKernel` (2080) | narrow, **tri-tri** | `<<<1024, 256>>>`, grid-strided | one **candidate pair** | triangle pair → ≤1 `ProximityContact` (6 VF + 9 EE tests) |
 | 7 | `featureBasedVertexTriangleProximityKernel` (2323) | narrow, **vertex-triangle** | `<<<1024, 256>>>`, grid-strided | one **(point, triangle) pair** | pair → ≤1 `ProximityContact` (closest-point-on-triangle) |
-| H1 | `resetHashGridKernel` (2607) | broad, **hash** (experiment) | `<<<ceil(table/256), 256>>>` | one **hash slot** | slots → emptied (`0xffffffff`) |
-| H2 | `insertHashGridTrianglesKernel` (2637) | broad, hash | `<<<ceil(triCount/256), 256>>>` | one **triangle** | triangle → open-addressing `atomicCAS` into slots |
-| H3 | `computeHashPairsPerSlotKernel` (2703) | broad, hash | `<<<ceil(table/256), 256>>>` | one **hash slot** | slot → `pairsPerSlot = tissue×tool` |
-| H4 | `thrust::exclusive_scan` (library) | broad, hash | (Thrust-chosen) | prefix-sum over `pairsPerSlot` | per-slot counts → global `pairOffsets` |
-| H5 | `setHashRawTotalKernel` (2719) | broad, hash | `<<<1, 1>>>` | one thread | offsets → `rawTotal` (grand total of pairs) |
-| H6 | `generateHashPrefixSumCandidatePairsKernel` (2746) | broad, hash | `<<<1024, 256>>>`, grid-strided | one **raw candidate pair** | binary-search `(slot,localPair)` → deduped candidate pair |
+| H1 | `clearTouchedPairHash{32,64}Kernel` | broad, **hash** (optimised 2026-06-17) | `<<<…, 256>>>`, grid-strided | one **touched dedup slot** | resets only the slots used last frame (not the whole table) |
+| H2 | `resetCompactHashGridKernel` | broad, hash | `<<<ceil(table/256), 256>>>` | one **hash slot** | cellKeys/bucket counts/counters → 0 |
+| H3 | `markCompactHashGridCellsKernel` (×2: tissue, tool) | broad, hash | `<<<ceil(triCount/256), 256>>>` | one **triangle** | `atomicCAS`-claim a slot for each occupied cell |
+| H4 | `compactHashGridSlotsKernel` | broad, hash | `<<<ceil(table/256), 256>>>` | one **hash slot** | occupied slot → dense **bucket index** `0..occupiedBuckets` |
+| H5 | `fillCompactHashGridTrianglesKernel` (×2) | broad, hash | `<<<ceil(triCount/256), 256>>>` | one **triangle** | append id to its compact bucket; build `mixedBucketIds` |
+| H6 | `computeCompactHashPairsPerBucketKernel` | broad, hash | `<<<…, 256>>>` | one **mixed bucket** | `pairsPerBucket = tissue×tool` |
+| H7 | `cub::DeviceScan::ExclusiveSum` (persistent temp) | broad, hash | (CUB-chosen) | prefix-sum | per-bucket counts → offsets (feeds only the `rawPairCount` stat now) |
+| H8 | `setCompactHashRawTotalKernel` | broad, hash | `<<<1, 1>>>` | one thread | offsets → `rawTotal` (stat) |
+| H9 | `generateMixedHashCandidatePairs{32,64}Kernel` | broad, hash | `<<<1024, 256>>>` | one **block per mixed bucket** | divide/modulo (no binary search) → deduped candidate pair (32-bit when ids ≤ 65535) |
 | 6 | `featureBasedProximityKernel` (2080) | narrow, hash | `<<<1024, 256>>>`, grid-strided | one **candidate pair** | **same kernel as the dense tri-tri path** |
 
 > **Why the hash path produces bit-identical contacts to the dense path:** it
-> changes only *how candidate pairs are stored and generated* (rows H1–H6
+> changes only *how candidate pairs are stored and generated* (rows H1–H9
 > replace rows 1–4). The set of candidate pairs it emits is the same, and it
 > hands them to the **same** `featureBasedProximityKernel` (row 6). Different
-> broad cull, identical narrow phase ⇒ identical contacts.
+> broad cull, identical narrow phase ⇒ identical contacts. (Verified: same 2354
+> contacts as dense on the large scene, overflow 0 — see
+> [reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md).)
+>
+> **2026-06-17 optimization:** the hash cull was reworked for ~2.5–3× faster
+> kernel vs dense (was the ~8-launch prefix-sum design). Key changes: clear only
+> *touched* dedup slots (no full memset), **compact** bucket storage (mark →
+> compact → fill), generate only **mixed** buckets, **one block per bucket** (no
+> per-pair binary search), persistent **CUB** scan, and **32-bit** pair encoding
+> when triangle ids fit in 16 bits.
 
 ---
 
@@ -115,13 +127,15 @@ Measured as `avg_kernel_launch_count` in the benchmark summaries (excludes the
 | Path | Kernel launches / frame | The sequence |
 |---|---:|---|
 | **Tri-tri FBP, dense grid** (default) | **7** | reset → insert tissue → insert tool → generate pairs → reset counters → FBP narrow → (counter readback is a copy, not a kernel) |
-| **Tri-tri FBP, hash + prefix-sum** (experiment) | **8** | reset → insert A → insert B → pairs-per-slot → **scan** → raw-total → generate pairs → reset counters → FBP narrow *(the scan is the “+1” vs dense)* |
+| **Tri-tri FBP, optimised hash** | **13** | clear-touched → reset → mark cells ×2 → compact buckets → fill ×2 → count pairs → CUB scan → raw-total → generate (mixed buckets) → reset counters → FBP narrow |
 | **Vertex-triangle** (self or cross) | **6** | reset → insert triangles → insert points → generate pairs → reset counters → v-t narrow |
 
-The "+1" for the hash path is the `thrust::exclusive_scan`. That single extra
-launch is what the prefix-sum work-expansion costs, and in the both-large regime
-it more than pays for itself (see
-[reports/branch_comparison_20260609.md](../reports/branch_comparison_20260609.md)).
+The optimised hash path launches **more, smaller** kernels (13 vs the dense 7),
+but each does far less work — the per-frame full memset, the Thrust allocation,
+and the per-pair binary search are gone — so its kernel time is **2.5–3× lower**
+than the dense grid on a large tissue (see
+[reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md)).
+Launch count is a poor proxy for cost here; trust the measured kernel time.
 
 ---
 
@@ -325,28 +339,29 @@ output. Default-on (`useToolActiveCellGeneration`).
 
 ---
 
-## 8. The hash + prefix-sum broad cull, step by step (experiment)
+## 8. The optimised hash broad cull, step by step
 
-This is the alternative broad cull (rows H1–H6 of §2), default-off, for the
-**both-large** regime. Pipeline in `computeHashPrefixSumProximityContacts`
-(`.cu` ~5983–6029):
+This is the alternative broad cull (rows H1–H9 of §2), default-off, for the
+**large-tissue** regime. Pipeline in `computeHashPrefixSumProximityContacts`
+(reworked 2026-06-17 for ~2.5–3× faster kernel than dense):
 
-1. **`resetHashGridKernel`** — one thread per slot sets `cellKeys[slot] = 0xffffffff` (empty), zeros counts.
-2. **`insertHashGridTrianglesKernel` ×2** (mesh A then mesh B) — one thread per triangle. For each cell the triangle's inflated AABB overlaps, it `atomicCAS`-claims a slot for that cell id (linear probing on collision), then `atomicAdd`s into that slot's tissue/tool bucket. Only occupied cells ever consume a slot.
-3. **`computeHashPairsPerSlotKernel`** — one thread per slot writes `pairsPerSlot = min(tissue,cap) × min(tool,cap)` (the number of candidate pairs that slot will produce).
-4. **`thrust::exclusive_scan`** — turns the per-slot counts into global start offsets `pairOffsets` (slot *k*'s pairs occupy `[pairOffsets[k], pairOffsets[k]+pairsPerSlot[k])`). *This is the one extra kernel vs the dense path.*
-5. **`setHashRawTotalKernel`** — one thread computes `rawTotal = pairOffsets[T-1] + pairsPerSlot[T-1]`, the grand total of candidate pairs.
-6. `cudaMemset` clears the dedup hash table.
-7. **`generateHashPrefixSumCandidatePairsKernel`** — launches one thread per *raw pair index* `i ∈ [0, rawTotal)`, grid-strided. Each thread **binary-searches** `pairOffsets` to find which slot owns `i` and the local pair index within it, decodes that into `(tissueId, toolId)`, and `atomicCAS`-dedups it into the candidate array. **Perfect load balance** — every thread does exactly one pair's worth of work, no per-cell serial inner loop.
-8. **`resetProximityCountersKernel`** — `<<<1,1>>>`.
-9. **`featureBasedProximityKernel`** — the *same* narrow kernel as the dense path, over the *same* candidate pairs ⇒ the *same* contacts.
+1. **`clearTouchedPairHash{32,64}Kernel`** — resets only the dedup slots *touched last frame* (recorded in `touchedPairHashSlots`). First frame / capacity growth does one full `cudaMemset` instead (guarded). *Avoids memsetting the whole multi-million-slot dedup table every frame.*
+2. **`resetCompactHashGridKernel`** — zeros `cellKeys`, per-bucket counts, and all counters.
+3. **`markCompactHashGridCellsKernel` ×2** (mesh A then B) — one thread per triangle; for each overlapped cell, `atomicCAS`-claims a hash slot for that cell id (linear probing). This pass only *marks which cells exist* — no bucket fill yet.
+4. **`compactHashGridSlotsKernel`** — one thread per slot; each occupied slot grabs a dense **bucket index** `0..occupiedBuckets` (`atomicAdd`). *Compact storage: per-bucket arrays are sized to occupancy, not the whole table.*
+5. **`fillCompactHashGridTrianglesKernel` ×2** — now insert triangle ids into their compact buckets; when a bucket first holds **both** tissue and tool it is appended to `mixedBucketIds`. (Tissue fill finishes before tool fill, so "mixed" is exact.)
+6. **`computeCompactHashPairsPerBucketKernel`** — one thread per **mixed** bucket writes `pairsPerBucket = min(tissue,cap) × min(tool,cap)`.
+7. **`cub::DeviceScan::ExclusiveSum`** (persistent temp storage) + **`setCompactHashRawTotalKernel`** — prefix-sum over `pairsPerBucket`. *Now feeds only the `rawPairCount` statistic* (the generator below no longer needs global offsets).
+8. **`generateMixedHashCandidatePairs{32,64}Kernel`** — **one block per mixed bucket**; the block's threads split that bucket's `tissue×tool` local pairs via plain `localPair/u`, `localPair%u` (**no binary search**), `atomicCAS`-dedup into the candidate array, and record each claimed slot into `touchedPairHashSlots` for next frame's clear. Uses **32-bit** packing when both triangle counts ≤ 65535.
+9. **`resetProximityCountersKernel`** → **`featureBasedProximityKernel`** — the *same* narrow kernel as the dense path, over the *same* candidate pairs ⇒ the *same* contacts.
 
-Why it can win: the dense grid pays to reset and scan all 32,768 fixed cells and
-load-balances poorly (block-per-cell), while the hash table only materializes
-occupied slots and the prefix sum gives every thread exactly one pair. Why it's
-off by default: in the small-tool regime the Phase 15 active-cell path is already
-~8 µs, so the scan is pure overhead there. Numbers:
-[reports/branch_comparison_20260609.md](../reports/branch_comparison_20260609.md).
+Why it wins on a large tissue: the dense grid resets/scans all 32,768 fixed cells
+and load-balances poorly; the optimised hash touches only occupied buckets, clears
+only touched dedup slots, generates only mixed buckets, and does no per-pair binary
+search. Measured **0.5–0.7 ms kernel vs ~1.8–2.1 ms dense**, identical contacts.
+Why still off by default: in the small-tool regime the Phase-15 active-cell dense
+path is already ~8 µs, so the hash build stages aren't worth it. Numbers:
+[reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md).
 
 ---
 
@@ -355,7 +370,7 @@ off by default: in the small-tool regime the Phase 15 active-cell path is alread
 | Scene flags (on `GpuCollisionNarrowPhase`) | Path | Broad-cull kernels | Narrow kernel |
 |---|---|---|---|
 | `useFeatureBasedProximity=True` (default broad cull) | tri-tri FBP, dense | reset, insert×2, generate(active) | `featureBasedProximityKernel` |
-| `+ useHashPrefixSumGeneration=True` | tri-tri FBP, hash | resetHash, insertHash×2, pairsPerSlot, scan, rawTotal, generateHash | `featureBasedProximityKernel` (same) |
+| `+ useHashPrefixSumGeneration=True` | tri-tri FBP, optimised hash | clear-touched, resetCompact, markCells×2, compactSlots, fill×2, pairsPerBucket, CUB scan, rawTotal, generateMixed | `featureBasedProximityKernel` (same) |
 | `+ useVertexTriangleProximity=True`, self-collision pair | v-t self | reset, insertTris, insertPoints, generate | `featureBasedVertexTriangleProximityKernel` |
 | `+ useVertexTriangleProximity=True`, point-model vs tri-model | v-t cross | reset, insertTris, insertPoints, generate | `featureBasedVertexTriangleProximityKernel` |
 

@@ -60,6 +60,14 @@ struct BackendExecutionStats
     double denseGridExactContactMilliseconds { 0.0 };
     double denseGridContactCountReadbackMilliseconds { 0.0 };
     double denseGridContactDownloadMilliseconds { 0.0 };
+    double hashGridResetMilliseconds { 0.0 };
+    double hashGridPairHashClearMilliseconds { 0.0 };
+    double hashGridInsertTissueMilliseconds { 0.0 };
+    double hashGridInsertToolMilliseconds { 0.0 };
+    double hashGridPairCountMilliseconds { 0.0 };
+    double hashGridScanMilliseconds { 0.0 };
+    double hashGridGeneratePairsMilliseconds { 0.0 };
+    double hashGridProximityCounterClearMilliseconds { 0.0 };
     double featureBasedProximityKernelMilliseconds { 0.0 };  // FBP narrow pass time (separate from exact-contact)
     std::uint64_t hostToDeviceBytes { 0 };
     std::uint64_t deviceToHostBytes { 0 };
@@ -258,7 +266,7 @@ struct HashPrefixSumConfig
 struct HashPrefixSumStats
 {
     std::uint32_t hashTableSize { 0 };
-    std::uint32_t occupiedSlotCount { 0 };       // hash slots that ended up non-empty
+    std::uint32_t occupiedSlotCount { 0 };       // compact occupied cell buckets
     std::uint32_t rawPairCount { 0 };            // total pairs before dedup (the prefix-sum total)
     std::uint32_t uniquePairCount { 0 };         // after dedup
     std::uint32_t hashProbeOverflowCount { 0 };  // insertions that exceeded maxProbe

@@ -1,5 +1,12 @@
 # Spatial-Hash + Prefix-Sum Broad Cull — Experiment Report
 
+> ⚠️ **Superseded 2026-06-17.** This documents the *original* hash design
+> (~8 launches, `thrust::exclusive_scan`, per-pair binary search, full per-frame
+> dedup memset). It was reworked into the **optimised hash cull** — see
+> [hash_optimized_broadphase_20260617.md](hash_optimized_broadphase_20260617.md)
+> (~2.5–3× faster kernel than dense). Contacts are identical in both designs;
+> only the design (§2/§3) and perf (§4) below are out of date.
+
 **Branch:** `experiment/hash-prefixsum-broadphase` (additive, opt-in, default-off)
 **Date:** 2026-06-09
 **Status:** Working, correctness-verified, faster than the dense grid in the large+large regime.
