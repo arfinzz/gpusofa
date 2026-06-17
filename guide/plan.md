@@ -931,10 +931,37 @@ A second same-session A/B reproduced 0.508 ms / 565 FPS for the optimised hash
 scene's contacts match the documented baseline, overflow 0. Report:
 `reports/hash_optimized_broadphase_20260617.md`.
 
-**Open follow-ups.** The CUB scan's `pairOffsets`/`rawTotal` now feed only the
-`rawPairCount` stat (the block-per-bucket generator needs no global offsets) — the
-scan could be dropped/folded. Route v-t through the hash cull; auto-tune table size
-from a measured occupancy histogram.
+### 5.20  Three more hash optimizations + FBP kernel profiling (2026-06-17b)
+
+A second optimization round on the hash path, all verified bit-identical
+(`reports/hash_micro_optimizations_20260617.md`):
+
+1. **Dropped the vestigial CUB scan** (the §5.19 follow-up): `pairOffsets`/`rawTotal`
+   were unused by the block-per-bucket generator; `rawCandidateCount` already holds
+   the raw total. Removed the per-frame scan + `setCompactHashRawTotalKernel` + the
+   `ensure()` temp alloc. **Launches 13 → 11.**
+2. **Cheap AABB pre-reject in `featureBasedProximityKernel`**: a conservative
+   squared-box-gap test before the 15 closest-feature tests; skips far same-cell
+   pairs (a cell is ~4× the contact distance). Exact ⇒ bit-identical. Helps the
+   dense FBP path too (shared kernel).
+3. **CUDA Graphs**: the whole 11-kernel sequence is captured once into a
+   `cudaGraphExec` and replayed each steady-state frame (`launchAll` helper +
+   capture/replay state on `HashGridWorkspace`; first-frame/resize handled; safe
+   fallback to direct launch). **Default ON**, `SOFA_HASH_CUDA_GRAPH=0` to disable.
+
+Measured (large+large, same-session, contacts identical 2354, overflow 0):
+`#2+#3` hash kernel **0.700 → 0.410 ms (−41 %)**; `#1` graphs **0.359 → 0.333 ms
+(−7 % kernel) / 625 → 688 FPS (+10 %)**. Cumulative this round ~2× faster kernel
+again (~0.33–0.38 ms), on top of §5.19's 2.5–3×. Full suite + backend bench
+bit-identical with graphs on.
+
+**Nsight Compute on `featureBasedProximityKernel`** (the narrow kernel): compute
+SOL ~27 %, **DRAM ~9 %**, occupancy ~44 %, **79 registers/thread → 3 blocks/SM**.
+It is **register/occupancy-limited, NOT memory-bound** — so the next narrow-phase
+win is **reducing register pressure / raising occupancy** (`__launch_bounds__`,
+splitting the EE pass, shrinking live state), *not* memory-layout changes (SoA /
+shared-mem caching would not help). Open: route v-t through the hash cull;
+occupancy work on the FBP kernel.
 
 ---
 

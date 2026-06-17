@@ -96,26 +96,28 @@ the dense-grid path.)
 | H3 | `markCompactHashGridCellsKernel` (×2: tissue, tool) | broad, hash | `<<<ceil(triCount/256), 256>>>` | one **triangle** | `atomicCAS`-claim a slot for each occupied cell |
 | H4 | `compactHashGridSlotsKernel` | broad, hash | `<<<ceil(table/256), 256>>>` | one **hash slot** | occupied slot → dense **bucket index** `0..occupiedBuckets` |
 | H5 | `fillCompactHashGridTrianglesKernel` (×2) | broad, hash | `<<<ceil(triCount/256), 256>>>` | one **triangle** | append id to its compact bucket; build `mixedBucketIds` |
-| H6 | `computeCompactHashPairsPerBucketKernel` | broad, hash | `<<<…, 256>>>` | one **mixed bucket** | `pairsPerBucket = tissue×tool` |
-| H7 | `cub::DeviceScan::ExclusiveSum` (persistent temp) | broad, hash | (CUB-chosen) | prefix-sum | per-bucket counts → offsets (feeds only the `rawPairCount` stat now) |
-| H8 | `setCompactHashRawTotalKernel` | broad, hash | `<<<1, 1>>>` | one thread | offsets → `rawTotal` (stat) |
-| H9 | `generateMixedHashCandidatePairs{32,64}Kernel` | broad, hash | `<<<1024, 256>>>` | one **block per mixed bucket** | divide/modulo (no binary search) → deduped candidate pair (32-bit when ids ≤ 65535) |
-| 6 | `featureBasedProximityKernel` (2080) | narrow, hash | `<<<1024, 256>>>`, grid-strided | one **candidate pair** | **same kernel as the dense tri-tri path** |
+| H6 | `computeCompactHashPairsPerBucketKernel` | broad, hash | `<<<…, 256>>>` | one **mixed bucket** | `pairsPerBucket = tissue×tool`; accumulates the raw-pair-count stat |
+| H7 | `generateMixedHashCandidatePairs{32,64}Kernel` | broad, hash | `<<<1024, 256>>>` | one **block per mixed bucket** | divide/modulo (no binary search) → deduped candidate pair (32-bit when ids ≤ 65535) |
+| 6 | `featureBasedProximityKernel` (2080) | narrow, hash | `<<<1024, 256>>>`, grid-strided | one **candidate pair** | **same kernel as the dense tri-tri path** (now with a cheap AABB pre-reject) |
 
 > **Why the hash path produces bit-identical contacts to the dense path:** it
-> changes only *how candidate pairs are stored and generated* (rows H1–H9
+> changes only *how candidate pairs are stored and generated* (rows H1–H7
 > replace rows 1–4). The set of candidate pairs it emits is the same, and it
 > hands them to the **same** `featureBasedProximityKernel` (row 6). Different
 > broad cull, identical narrow phase ⇒ identical contacts. (Verified: same 2354
-> contacts as dense on the large scene, overflow 0 — see
-> [reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md).)
+> contacts as dense on the large scene, overflow 0.)
 >
-> **2026-06-17 optimization:** the hash cull was reworked for ~2.5–3× faster
-> kernel vs dense (was the ~8-launch prefix-sum design). Key changes: clear only
-> *touched* dedup slots (no full memset), **compact** bucket storage (mark →
-> compact → fill), generate only **mixed** buckets, **one block per bucket** (no
-> per-pair binary search), persistent **CUB** scan, and **32-bit** pair encoding
-> when triangle ids fit in 16 bits.
+> **2026-06-17 optimizations (two rounds):** the hash cull was reworked for
+> ~2.5–3× faster kernel vs dense — clear only *touched* dedup slots (no full
+> memset), **compact** bucket storage (mark → compact → fill), generate only
+> **mixed** buckets, **one block per bucket** (no binary search), **32-bit** pair
+> encoding. Then a second round (see
+> [reports/hash_micro_optimizations_20260617.md](../reports/hash_micro_optimizations_20260617.md)):
+> **dropped the now-vestigial CUB scan** (13→11 launches), added a **cheap AABB
+> pre-reject** in the FBP kernel, and wrapped the whole 11-kernel sequence in a
+> **CUDA Graph** (captured once, replayed each frame — default on,
+> `SOFA_HASH_CUDA_GRAPH=0` to disable). Together ~2× faster kernel again
+> (~0.33 ms), still bit-identical.
 
 ---
 
@@ -127,7 +129,7 @@ Measured as `avg_kernel_launch_count` in the benchmark summaries (excludes the
 | Path | Kernel launches / frame | The sequence |
 |---|---:|---|
 | **Tri-tri FBP, dense grid** (default) | **7** | reset → insert tissue → insert tool → generate pairs → reset counters → FBP narrow → (counter readback is a copy, not a kernel) |
-| **Tri-tri FBP, optimised hash** | **13** | clear-touched → reset → mark cells ×2 → compact buckets → fill ×2 → count pairs → CUB scan → raw-total → generate (mixed buckets) → reset counters → FBP narrow |
+| **Tri-tri FBP, optimised hash** | **11** | clear-touched → reset → mark cells ×2 → compact buckets → fill ×2 → count pairs → generate (mixed buckets) → reset counters → FBP narrow. *On steady-state frames all 11 are replayed as one **CUDA Graph** (default on).* |
 | **Vertex-triangle** (self or cross) | **6** | reset → insert triangles → insert points → generate pairs → reset counters → v-t narrow |
 
 The optimised hash path launches **more, smaller** kernels (13 vs the dense 7),

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -2125,6 +2126,32 @@ __global__ void featureBasedProximityKernel(
     const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
     const float3 bV[3] = { tb.p0, tb.p1, tb.p2 };
 
+    // Cheap conservative AABB pre-reject (2026-06-17): if the two triangles'
+    // axis-aligned boxes are separated by more than contactDistance, their
+    // closest features cannot be within contactDistance, so skip the 15
+    // closest-feature tests. The squared box gap is exact and never drops a real
+    // contact (the triangles are contained in their boxes), so output is
+    // bit-identical — this only avoids wasted math on far same-cell pairs.
+    {
+        float3 aMin = aV[0], aMax = aV[0];
+        float3 bMin = bV[0], bMax = bV[0];
+        #pragma unroll
+        for (int k = 1; k < 3; ++k)
+        {
+            aMin = make_float3(fminf(aMin.x, aV[k].x), fminf(aMin.y, aV[k].y), fminf(aMin.z, aV[k].z));
+            aMax = make_float3(fmaxf(aMax.x, aV[k].x), fmaxf(aMax.y, aV[k].y), fmaxf(aMax.z, aV[k].z));
+            bMin = make_float3(fminf(bMin.x, bV[k].x), fminf(bMin.y, bV[k].y), fminf(bMin.z, bV[k].z));
+            bMax = make_float3(fmaxf(bMax.x, bV[k].x), fmaxf(bMax.y, bV[k].y), fmaxf(bMax.z, bV[k].z));
+        }
+        const float gx = fmaxf(0.0f, fmaxf(aMin.x - bMax.x, bMin.x - aMax.x));
+        const float gy = fmaxf(0.0f, fmaxf(aMin.y - bMax.y, bMin.y - aMax.y));
+        const float gz = fmaxf(0.0f, fmaxf(aMin.z - bMax.z, bMin.z - aMax.z));
+        if (gx * gx + gy * gy + gz * gz > distThreshSq)
+        {
+            continue;
+        }
+    }
+
     float bestDistSq = INFINITY;
     int bestKind = 0;
     int bestI = 0;
@@ -2515,6 +2542,22 @@ struct HashGridWorkspace
     bool pairHashKeysInitialized { false };
     bool compactPairHashKeysInitialized { false };
     bool useCompactCandidatePairs { false };
+    // CUDA Graph state (Optimization 2026-06-17c). The per-frame kernel sequence
+    // is captured once into graphExec and replayed each steady-state frame to cut
+    // per-launch CPU overhead (the broad cull is now ~11 sub-10us kernels).
+    cudaStream_t captureStream { nullptr };
+    cudaGraphExec_t graphExec { nullptr };
+    bool graphInstantiated { false };
+    // Capture signature: if any of these change, the graph is rebuilt.
+    std::uint32_t gSigTableSize { 0 };
+    std::uint32_t gSigBucketCap { 0 };
+    std::uint32_t gSigFirstTri { ~0u };
+    std::uint32_t gSigSecondTri { ~0u };
+    std::uint32_t gSigMaxContacts { 0 };
+    std::uint32_t gSigPairHash { 0 };
+    bool gSigUseCompact { false };
+    bool gSigComputeBary { false };
+    float gSigContactDist { -1.0f };
 
     ~HashGridWorkspace() { release(); }
 
@@ -2537,6 +2580,9 @@ struct HashGridWorkspace
         cudaFree(scanTempStorage);
         cudaFreeHost(countersHostPinned);
         if (eventsReady) { cudaEventDestroy(startEvent); cudaEventDestroy(endEvent); }
+        if (graphExec != nullptr) { cudaGraphExecDestroy(graphExec); graphExec = nullptr; }
+        if (captureStream != nullptr) { cudaStreamDestroy(captureStream); captureStream = nullptr; }
+        graphInstantiated = false;
         cellKeys = nullptr; slotBucketIds = nullptr; bucketCellIds = nullptr;
         tissueCount = nullptr; toolCount = nullptr;
         tissueIds = nullptr; toolIds = nullptr; mixedBucketIds = nullptr;
@@ -2623,27 +2669,10 @@ struct HashGridWorkspace
         if (err == cudaSuccess) err = ensureDeviceArray(secondIndices, secondIndexCapacity, secondIndexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && firstVertexCount > 0) err = ensureDeviceArray(firstPositions, firstPositionCapacity, firstVertexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && secondVertexCount > 0) err = ensureDeviceArray(secondPositions, secondPositionCapacity, secondVertexCount, newlyAllocatedBytes);
-        if (err == cudaSuccess && bucketCapacity > 0)
-        {
-            std::size_t requiredTempBytes = 0;
-            err = cub::DeviceScan::ExclusiveSum(
-                nullptr,
-                requiredTempBytes,
-                pairsPerBucket,
-                pairOffsets,
-                static_cast<int>(bucketCapacity));
-            if (err == cudaSuccess && requiredTempBytes > scanTempStorageBytes)
-            {
-                cudaFree(scanTempStorage);
-                scanTempStorage = nullptr;
-                err = cudaMalloc(&scanTempStorage, requiredTempBytes);
-                if (err == cudaSuccess)
-                {
-                    scanTempStorageBytes = requiredTempBytes;
-                    newlyAllocatedBytes += static_cast<std::uint64_t>(requiredTempBytes);
-                }
-            }
-        }
+        // (Optimization 2026-06-17b) CUB exclusive-scan temp storage is no longer
+        // allocated: the per-frame scan was dropped (its offsets are unused by the
+        // block-per-bucket generator). pairOffsets/rawTotal/scanTempStorage remain
+        // declared but inert; the raw-pair total comes from rawCandidateCount.
         const std::size_t contactCount = maxContacts;
         if (err == cudaSuccess && (proximityContacts == nullptr || contactCapacity < contactCount))
         {
@@ -6432,6 +6461,121 @@ bool computeHashPrefixSumProximityContacts(
     std::uint32_t launchCount = 0;
     std::uint32_t memsetCount = 0;
 
+    auto* deviceContacts = reinterpret_cast<DeviceProximityContact*>(ws.proximityContacts);
+
+    // (Optimization 2026-06-17c) The whole per-frame kernel sequence, on stream s.
+    // Used for (a) direct execution and (b) CUDA-graph capture. Must stay in sync
+    // with the detailed-profiling sequence below (the contact-parity tests catch
+    // drift). fullClear=true does a one-time full dedup-table memset (first frame
+    // / after a resize); otherwise only the previous frame's touched slots are
+    // cleared.
+    auto launchAll = [&](cudaStream_t s, bool fullClear)
+    {
+        if (useCompactCandidatePairs)
+        {
+            if (fullClear) { cudaMemsetAsync(ws.compactPairHashKeys, 0xff, static_cast<std::size_t>(pairHashCount) * sizeof(std::uint32_t), s); ws.compactPairHashKeysInitialized = true; }
+            else clearTouchedPairHash32Kernel<<<pairHashClearBlocks, threads, 0, s>>>(ws.compactPairHashKeys, ws.touchedPairHashSlots, ws.touchedPairHashCount);
+        }
+        else
+        {
+            if (fullClear) { cudaMemsetAsync(ws.pairHashKeys, 0xff, static_cast<std::size_t>(pairHashCount) * sizeof(unsigned long long), s); ws.pairHashKeysInitialized = true; }
+            else clearTouchedPairHash64Kernel<<<pairHashClearBlocks, threads, 0, s>>>(ws.pairHashKeys, ws.touchedPairHashSlots, ws.touchedPairHashCount);
+        }
+        resetCompactHashGridKernel<<<resetBlocks, threads, 0, s>>>(ws.cellKeys, ws.slotBucketIds, tableSize, ws.tissueCount, ws.toolCount, ws.pairsPerBucket, bucketCapacity, ws.rawCandidateCount, ws.candidateCount, ws.overflowCount, ws.probeOverflowCount, ws.occupiedBucketCount, ws.mixedBucketCount, ws.touchedPairHashCount);
+        markCompactHashGridCellsKernel<<<firstBlocks, threads, 0, s>>>(deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, dc, tableSize, maxProbe, ws.cellKeys, ws.probeOverflowCount);
+        markCompactHashGridCellsKernel<<<secondBlocks, threads, 0, s>>>(deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, dc, tableSize, maxProbe, ws.cellKeys, ws.probeOverflowCount);
+        compactHashGridSlotsKernel<<<tableBlocks, threads, 0, s>>>(ws.cellKeys, ws.slotBucketIds, ws.bucketCellIds, tableSize, bucketCapacity, ws.occupiedBucketCount, ws.overflowCount);
+        fillCompactHashGridTrianglesKernel<<<firstBlocks, threads, 0, s>>>(deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, true, dc, tableSize, bucketCapacity, maxProbe, ws.cellKeys, ws.slotBucketIds, ws.tissueCount, ws.toolCount, ws.tissueIds, ws.toolIds, ws.mixedBucketIds, ws.mixedBucketCount, ws.overflowCount, ws.probeOverflowCount);
+        fillCompactHashGridTrianglesKernel<<<secondBlocks, threads, 0, s>>>(deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, false, dc, tableSize, bucketCapacity, maxProbe, ws.cellKeys, ws.slotBucketIds, ws.tissueCount, ws.toolCount, ws.tissueIds, ws.toolIds, ws.mixedBucketIds, ws.mixedBucketCount, ws.overflowCount, ws.probeOverflowCount);
+        computeCompactHashPairsPerBucketKernel<<<bucketBlocks, threads, 0, s>>>(ws.tissueCount, ws.toolCount, ws.mixedBucketIds, ws.mixedBucketCount, bucketCapacity, gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell, ws.pairsPerBucket, ws.rawCandidateCount);
+        if (useCompactCandidatePairs)
+            generateMixedHashCandidatePairs32Kernel<<<kGenBlocks, threads, 0, s>>>(ws.tissueCount, ws.toolCount, ws.mixedBucketIds, ws.mixedBucketCount, ws.tissueIds, ws.toolIds, bucketCapacity, gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell, pairHashCount, gridConfig.maxCandidatePairs, ws.compactCandidatePairs, ws.compactPairHashKeys, ws.touchedPairHashSlots, ws.touchedPairHashCount, ws.candidateCount, ws.probeOverflowCount, ws.overflowCount);
+        else
+            generateMixedHashCandidatePairs64Kernel<<<kGenBlocks, threads, 0, s>>>(ws.tissueCount, ws.toolCount, ws.mixedBucketIds, ws.mixedBucketCount, ws.tissueIds, ws.toolIds, bucketCapacity, gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell, pairHashCount, gridConfig.maxCandidatePairs, ws.candidatePairs, ws.pairHashKeys, ws.touchedPairHashSlots, ws.touchedPairHashCount, ws.candidateCount, ws.probeOverflowCount, ws.overflowCount);
+        resetProximityCountersKernel<<<1, 1, 0, s>>>(ws.proximityContactCount, ws.proximityOverflowCount, ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount);
+        featureBasedProximityKernel<<<kGenBlocks, threads, 0, s>>>(deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices, useCompactCandidatePairs ? nullptr : ws.candidatePairs, useCompactCandidatePairs ? ws.compactCandidatePairs : nullptr, ws.candidateCount, useCompactCandidatePairs, deviceContacts, ws.proximityContactCount, ws.proximityOverflowCount, ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount, proximityConfig.maxContacts, proximityConfig.contactDistance, proximityConfig.computeBarycentrics);
+    };
+
+    // CUDA-graph fast path (DEFAULT ON; disable with SOFA_HASH_CUDA_GRAPH=0).
+    // Captures the steady-state sequence once and replays it, cutting per-launch
+    // overhead (verified 2026-06-17: bit-identical contacts, ~-7% kernel / +10%
+    // FPS on the large hash scene). Disabled under detailed profiling (which needs
+    // per-stage events). Falls back safely to the direct sequence on any failure.
+    static const int kGraphMode = []{ const char* e = std::getenv("SOFA_HASH_CUDA_GRAPH"); return e ? std::atoi(e) : 1; }();
+    const bool kGraphsEnabled = (kGraphMode != 0);
+    bool ranViaGraph = false;
+    if (kGraphsEnabled && !detailedProfiling)
+    {
+        const bool firstFrame = !(useCompactCandidatePairs ? ws.compactPairHashKeysInitialized : ws.pairHashKeysInitialized);
+        const bool sigChanged =
+            ws.gSigTableSize != tableSize || ws.gSigBucketCap != bucketCapacity ||
+            ws.gSigFirstTri != firstSurface.triangleCount || ws.gSigSecondTri != secondSurface.triangleCount ||
+            ws.gSigMaxContacts != proximityConfig.maxContacts || ws.gSigPairHash != pairHashCount ||
+            ws.gSigUseCompact != useCompactCandidatePairs || ws.gSigComputeBary != proximityConfig.computeBarycentrics ||
+            ws.gSigContactDist != proximityConfig.contactDistance;
+        if (newlyAllocatedBytes > 0 || sigChanged) ws.graphInstantiated = false;
+
+        if (firstFrame)
+        {
+            launchAll(0, /*fullClear=*/true);
+            ws.graphInstantiated = false;  // re-capture next (steady) frame
+            ranViaGraph = true;
+        }
+        else
+        {
+            if (ws.captureStream == nullptr) cudaStreamCreate(&ws.captureStream);
+            if (!ws.graphInstantiated && ws.captureStream != nullptr)
+            {
+                cudaGraph_t graph = nullptr;
+                cudaError_t capErr = cudaStreamBeginCapture(ws.captureStream, cudaStreamCaptureModeThreadLocal);
+                if (capErr == cudaSuccess)
+                {
+                    launchAll(ws.captureStream, /*fullClear=*/false);
+                    capErr = cudaStreamEndCapture(ws.captureStream, &graph);
+                }
+                if (capErr == cudaSuccess && graph != nullptr)
+                {
+                    if (ws.graphExec != nullptr) { cudaGraphExecDestroy(ws.graphExec); ws.graphExec = nullptr; }
+#if CUDART_VERSION >= 12000
+                    capErr = cudaGraphInstantiate(&ws.graphExec, graph, 0ull);
+#else
+                    capErr = cudaGraphInstantiate(&ws.graphExec, graph, nullptr, nullptr, 0);
+#endif
+                    cudaGraphDestroy(graph);
+                    if (capErr == cudaSuccess)
+                    {
+                        ws.graphInstantiated = true;
+                        ws.gSigTableSize = tableSize; ws.gSigBucketCap = bucketCapacity;
+                        ws.gSigFirstTri = firstSurface.triangleCount; ws.gSigSecondTri = secondSurface.triangleCount;
+                        ws.gSigMaxContacts = proximityConfig.maxContacts; ws.gSigPairHash = pairHashCount;
+                        ws.gSigUseCompact = useCompactCandidatePairs; ws.gSigComputeBary = proximityConfig.computeBarycentrics;
+                        ws.gSigContactDist = proximityConfig.contactDistance;
+                    }
+                }
+                else
+                {
+                    cudaGetLastError();  // clear any capture error
+                }
+            }
+            if (ws.graphInstantiated)
+            {
+                err = cudaGraphLaunch(ws.graphExec, 0);
+                ranViaGraph = (err == cudaSuccess);
+            }
+            if (!ranViaGraph)
+            {
+                launchAll(0, /*fullClear=*/false);  // safe fallback
+                ranViaGraph = true;
+            }
+        }
+        launchCount += 11u;
+        if (firstFrame) memsetCount += 1u;
+        err = cudaGetLastError();
+        if (err != cudaSuccess) { diagnostic = std::string("hash graph path: ") + cudaGetErrorString(err); return false; }
+    }
+
+    if (!ranViaGraph)
+    {
     // Clear only the pair-hash slots touched by the previous frame. The first
     // frame or a capacity growth still needs a full initialization.
     if (useCompactCandidatePairs)
@@ -6652,28 +6796,14 @@ bool computeHashPrefixSumProximityContacts(
         return false;
     }
 
-    err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashScanMs, [&]() {
-        ScopedNvtxRange range("hash CUB exclusive scan", detailedProfiling);
-        cudaError_t scanErr = cub::DeviceScan::ExclusiveSum(
-            ws.scanTempStorage,
-            ws.scanTempStorageBytes,
-            ws.pairsPerBucket,
-            ws.pairOffsets,
-            static_cast<int>(bucketCapacity));
-        if (scanErr != cudaSuccess) return scanErr;
-        setCompactHashRawTotalKernel<<<1, 1>>>(
-            ws.pairOffsets,
-            ws.pairsPerBucket,
-            bucketCapacity,
-            ws.rawTotal);
-        return cudaGetLastError();
-    });
-    launchCount += 2u;
-    if (err != cudaSuccess)
-    {
-        diagnostic = std::string("hash scan launch: ") + cudaGetErrorString(err);
-        return false;
-    }
+    // (Optimization 2026-06-17b) The exclusive scan over pairsPerBucket and
+    // setCompactHashRawTotalKernel were removed: their pairOffsets/rawTotal
+    // outputs are unused now that generateMixedHashCandidatePairs* is
+    // block-per-bucket (no global offsets needed). The raw-pair-count statistic
+    // is already accumulated into rawCandidateCount by
+    // computeCompactHashPairsPerBucketKernel. Saves 2 launches/frame; the
+    // candidate set and contacts are bit-identical.
+    hashScanMs = 0.0;
 
     err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, hashGeneratePairsMs, [&]() {
         ScopedNvtxRange range("hash generate mixed candidate pairs", detailedProfiling);
@@ -6747,7 +6877,6 @@ bool computeHashPrefixSumProximityContacts(
         return false;
     }
 
-    auto* deviceContacts = reinterpret_cast<DeviceProximityContact*>(ws.proximityContacts);
     err = runCudaOperation(detailedProfiling, ws.startEvent, ws.endEvent, fbpMs, [&]() {
         ScopedNvtxRange range("hash FBP narrow phase", detailedProfiling);
         featureBasedProximityKernel<<<kGenBlocks, threads>>>(
@@ -6776,6 +6905,7 @@ bool computeHashPrefixSumProximityContacts(
         diagnostic = std::string("hash FBP launch: ") + cudaGetErrorString(err);
         return false;
     }
+    }  // end if (!ranViaGraph): direct/detailed sequence
 
     float kernelMs = 0.0f;
     if (totalTiming)
