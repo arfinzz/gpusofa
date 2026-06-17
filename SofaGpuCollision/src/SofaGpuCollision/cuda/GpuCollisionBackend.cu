@@ -1,6 +1,5 @@
 #include <SofaGpuCollision/GpuCollisionBackend.h>
 
-#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
@@ -2484,8 +2483,6 @@ struct HashGridWorkspace
     std::uint32_t* toolIds { nullptr };
     std::uint32_t* mixedBucketIds { nullptr };
     std::uint32_t* pairsPerBucket { nullptr };
-    std::uint32_t* pairOffsets { nullptr };
-    std::uint32_t* rawTotal { nullptr };
     std::uint64_t* candidatePairs { nullptr };
     std::uint32_t* compactCandidatePairs { nullptr };
     unsigned long long* pairHashKeys { nullptr };
@@ -2509,7 +2506,6 @@ struct HashGridWorkspace
     BackendTriangleVertex* firstPositions { nullptr };   // used only for host-input fallback
     BackendTriangleVertex* secondPositions { nullptr };
     std::uint32_t* countersHostPinned { nullptr };  // 10 uint32, pinned
-    void* scanTempStorage { nullptr };
 
     std::size_t cellKeysCapacity { 0 };
     std::size_t slotBucketIdCapacity { 0 };
@@ -2518,7 +2514,6 @@ struct HashGridWorkspace
     std::size_t toolCountCapacity { 0 };
     std::size_t mixedBucketIdCapacity { 0 };
     std::size_t pairsPerBucketCapacity { 0 };
-    std::size_t pairOffsetsCapacity { 0 };
     std::size_t tissueIdCapacity { 0 };
     std::size_t toolIdCapacity { 0 };
     std::size_t candidateCapacity { 0 };
@@ -2531,7 +2526,6 @@ struct HashGridWorkspace
     std::size_t secondIndexCapacity { 0 };
     std::size_t firstPositionCapacity { 0 };
     std::size_t secondPositionCapacity { 0 };
-    std::size_t scanTempStorageBytes { 0 };
     std::uint64_t firstSurfaceId { 0 };
     std::uint64_t secondSurfaceId { 0 };
     std::uint64_t firstTopologyVersion { ~0ull };
@@ -2566,7 +2560,7 @@ struct HashGridWorkspace
         cudaFree(cellKeys); cudaFree(slotBucketIds); cudaFree(bucketCellIds);
         cudaFree(tissueCount); cudaFree(toolCount);
         cudaFree(tissueIds); cudaFree(toolIds); cudaFree(mixedBucketIds);
-        cudaFree(pairsPerBucket); cudaFree(pairOffsets); cudaFree(rawTotal);
+        cudaFree(pairsPerBucket);
         cudaFree(candidatePairs); cudaFree(compactCandidatePairs);
         cudaFree(pairHashKeys); cudaFree(compactPairHashKeys); cudaFree(touchedPairHashSlots);
         cudaFree(candidateCount); cudaFree(rawCandidateCount);
@@ -2577,7 +2571,6 @@ struct HashGridWorkspace
         cudaFree(proximityVfCount); cudaFree(proximityFvCount); cudaFree(proximityEeCount);
         cudaFree(firstIndices); cudaFree(secondIndices);
         cudaFree(firstPositions); cudaFree(secondPositions);
-        cudaFree(scanTempStorage);
         cudaFreeHost(countersHostPinned);
         if (eventsReady) { cudaEventDestroy(startEvent); cudaEventDestroy(endEvent); }
         if (graphExec != nullptr) { cudaGraphExecDestroy(graphExec); graphExec = nullptr; }
@@ -2586,7 +2579,7 @@ struct HashGridWorkspace
         cellKeys = nullptr; slotBucketIds = nullptr; bucketCellIds = nullptr;
         tissueCount = nullptr; toolCount = nullptr;
         tissueIds = nullptr; toolIds = nullptr; mixedBucketIds = nullptr;
-        pairsPerBucket = nullptr; pairOffsets = nullptr; rawTotal = nullptr;
+        pairsPerBucket = nullptr;
         candidatePairs = nullptr; compactCandidatePairs = nullptr;
         pairHashKeys = nullptr; compactPairHashKeys = nullptr; touchedPairHashSlots = nullptr;
         candidateCount = nullptr; rawCandidateCount = nullptr;
@@ -2597,7 +2590,6 @@ struct HashGridWorkspace
         proximityVfCount = nullptr; proximityFvCount = nullptr; proximityEeCount = nullptr;
         firstIndices = nullptr; secondIndices = nullptr;
         firstPositions = nullptr; secondPositions = nullptr;
-        scanTempStorage = nullptr;
         countersHostPinned = nullptr;
         startEvent = nullptr; endEvent = nullptr; eventsReady = false;
         tissueIdCapacity = 0; toolIdCapacity = 0;
@@ -2608,8 +2600,7 @@ struct HashGridWorkspace
         firstPositionCapacity = 0; secondPositionCapacity = 0;
         cellKeysCapacity = 0; slotBucketIdCapacity = 0; bucketCellIdCapacity = 0;
         tissueCountCapacity = 0; toolCountCapacity = 0;
-        mixedBucketIdCapacity = 0; pairsPerBucketCapacity = 0; pairOffsetsCapacity = 0;
-        scanTempStorageBytes = 0;
+        mixedBucketIdCapacity = 0; pairsPerBucketCapacity = 0;
         firstSurfaceId = 0; secondSurfaceId = 0;
         firstTopologyVersion = ~0ull; secondTopologyVersion = ~0ull;
         pairHashKeysInitialized = false; compactPairHashKeysInitialized = false;
@@ -2649,7 +2640,6 @@ struct HashGridWorkspace
         if (err == cudaSuccess) err = ensureDeviceArray(toolCount, toolCountCapacity, bucketCapacity, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(mixedBucketIds, mixedBucketIdCapacity, bucketCapacity, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(pairsPerBucket, pairsPerBucketCapacity, bucketCapacity, newlyAllocatedBytes);
-        if (err == cudaSuccess) err = ensureDeviceArray(pairOffsets, pairOffsetsCapacity, bucketCapacity, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(tissueIds, tissueIdCapacity, bucketCapacity * maxTissuePerCell, newlyAllocatedBytes);
         if (err == cudaSuccess) err = ensureDeviceArray(toolIds, toolIdCapacity, bucketCapacity * maxToolPerCell, newlyAllocatedBytes);
         if (err == cudaSuccess && !compactPairs) err = ensureDeviceArray(candidatePairs, candidateCapacity, maxCandidatePairs, newlyAllocatedBytes);
@@ -2669,10 +2659,12 @@ struct HashGridWorkspace
         if (err == cudaSuccess) err = ensureDeviceArray(secondIndices, secondIndexCapacity, secondIndexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && firstVertexCount > 0) err = ensureDeviceArray(firstPositions, firstPositionCapacity, firstVertexCount, newlyAllocatedBytes);
         if (err == cudaSuccess && secondVertexCount > 0) err = ensureDeviceArray(secondPositions, secondPositionCapacity, secondVertexCount, newlyAllocatedBytes);
-        // (Optimization 2026-06-17b) CUB exclusive-scan temp storage is no longer
-        // allocated: the per-frame scan was dropped (its offsets are unused by the
-        // block-per-bucket generator). pairOffsets/rawTotal/scanTempStorage remain
-        // declared but inert; the raw-pair total comes from rawCandidateCount.
+        // (Optimization 2026-06-17b) The per-frame CUB exclusive-scan was dropped:
+        // its pairOffsets are unused by the block-per-bucket generator, and the
+        // raw-pair total is accumulated into rawCandidateCount by
+        // computeCompactHashPairsPerBucketKernel. The scan's pairOffsets/rawTotal
+        // buffers, the scanTempStorage temp, and setCompactHashRawTotalKernel were
+        // all removed (2026-06-17b cleanup); no CUB dependency remains.
         const std::size_t contactCount = maxContacts;
         if (err == cudaSuccess && (proximityContacts == nullptr || contactCapacity < contactCount))
         {
@@ -2681,7 +2673,6 @@ struct HashGridWorkspace
             err = cudaMalloc(&p, contactCount * contactElementBytes);
             if (err == cudaSuccess) { proximityContacts = p; contactCapacity = contactCount; newlyAllocatedBytes += contactCount * contactElementBytes; }
         }
-        if (err == cudaSuccess && rawTotal == nullptr)              err = cudaMallocTracked(rawTotal, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && candidateCount == nullptr)        err = cudaMallocTracked(candidateCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && rawCandidateCount == nullptr)     err = cudaMallocTracked(rawCandidateCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && overflowCount == nullptr)         err = cudaMallocTracked(overflowCount, 1, newlyAllocatedBytes);
@@ -2959,6 +2950,9 @@ __global__ void computeCompactHashPairsPerBucketKernel(
     std::uint32_t* pairsPerBucket,
     std::uint32_t* rawCandidateCount)
 {
+    // pairsPerBucket is still written per bucket, but since the CUB scan was
+    // dropped (2026-06-17b) nothing reads it downstream; only the accumulated
+    // raw-pair total (rawCandidateCount, via atomicAdd below) is consumed.
     const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= bucketCapacity) return;
     const std::uint32_t mixedCount = min(*mixedBucketCount, bucketCapacity);
@@ -2975,20 +2969,6 @@ __global__ void computeCompactHashPairsPerBucketKernel(
     if (pairs > 0u)
     {
         atomicAdd(rawCandidateCount, pairs);
-    }
-}
-
-__global__ void setCompactHashRawTotalKernel(
-    const std::uint32_t* pairOffsets,
-    const std::uint32_t* pairsPerBucket,
-    const std::uint32_t bucketCapacity,
-    std::uint32_t* rawTotal)
-{
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-    {
-        const std::uint32_t total =
-            bucketCapacity == 0u ? 0u : pairOffsets[bucketCapacity - 1u] + pairsPerBucket[bucketCapacity - 1u];
-        *rawTotal = total;
     }
 }
 
