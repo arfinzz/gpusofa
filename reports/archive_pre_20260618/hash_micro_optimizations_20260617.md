@@ -23,7 +23,10 @@ But the candidate generator is now **block-per-bucket** (one block per mixed
 bucket, divide/modulo indexing) and needs **no global offsets**, and the raw-pair
 total is already accumulated by `computeCompactHashPairsPerBucketKernel` into
 `rawCandidateCount`. So the scan was pure dead work. Removed it (and the CUB
-temp-storage allocation in `ensure()`). **Launches 13 → 11.**
+temp-storage allocation in `ensure()`). A follow-up cleanup then deleted the dead
+`setCompactHashRawTotalKernel` definition, the inert `pairOffsets`/`rawTotal`/
+`scanTempStorage` workspace buffers, and the now-unused `<cub/cub.cuh>` include, so
+**no CUB dependency remains**. **Launches 13 → 11.**
 
 ### #2 — Cheap AABB pre-reject in the FBP narrow kernel
 `featureBasedProximityKernel` previously ran all **15 closest-feature tests**

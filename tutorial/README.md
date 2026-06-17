@@ -34,10 +34,17 @@ thread count) — use it as a reference, not a bedtime read.
 | [11_profiling.md](11_profiling.md) | How timing works and what every number in the CSV means | 15 min |
 | [12_glossary.md](12_glossary.md) | Every term, defined in one place | reference |
 | [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md) | **Reference.** Every kernel, its inputs/outputs, the data structures, kernel counts, and exactly how threads are allocated | reference |
+| [14_optimizations.md](14_optimizations.md) | **Every optimization** explained easy + hard, with mermaid diagrams — the dense grid, Phase 15, the whole spatial-hash rework, CUDA graphs, **and the ones that were tried and *failed*** (so you don't retry them) | 30 min |
+| [15_profiling_and_tuning.md](15_profiling_and_tuning.md) | How to **find a kernel's bottleneck** with Nsight (compute/memory/latency, stall reasons) and why FPS lies — the method behind every win and dead end | 20 min |
 
 > Companion outside the tutorial: [reports/README_metrics_explained.md](../reports/README_metrics_explained.md)
-> defines every number the benchmarks print (FPS, kernel time, contact counts, …)
-> and how each is calculated.
+> defines every number the benchmarks print (FPS, kernel time, contact counts, …);
+> the current measured numbers + full optimization history live in
+> [reports/performance_and_optimizations_20260618.md](../reports/performance_and_optimizations_20260618.md).
+
+> **Diagrams:** files 00, 14, and 15 use `mermaid` flow diagrams — they render as
+> real flowcharts on GitHub, VS Code, and most markdown viewers (plain-text
+> fallback boxes are kept elsewhere).
 
 ## The one-sentence summary
 

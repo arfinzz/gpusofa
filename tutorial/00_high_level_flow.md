@@ -160,14 +160,42 @@ absolute FPS as a fuzzy guide. Every number in the CSV is defined in
 
 ---
 
+## The same picture as a flow diagram
+
+```mermaid
+flowchart TD
+    SC["Scene (.py): tissue mesh + tool mesh<br/>positions already on the GPU"] --> BP{"Broad phase<br/>objects near?"}
+    BP -- no --> DONE([done])
+    BP -- yes --> BC["Broad CULL on GPU<br/>bucket triangles in space → candidate pairs"]
+    BC --> NP["Narrow phase on GPU<br/>1 thread per pair → exact closest-feature math"]
+    NP --> CT["Contacts in GPU memory<br/>(barycentrics + normal + depth)"]
+    CT --> CSV["CPU writes a timing line to CSV<br/>— and never waited for the GPU"]
+
+    BC -. "default: dense grid + Phase 15" .-> D1[ ]
+    BC -. "opt-in for big tissues: spatial hash<br/>(~4× faster, see tutorial 14)" .-> D2[ ]
+    style BC fill:#dff,stroke:#0aa
+    style NP fill:#fdd,stroke:#a00
+```
+
+The **blue** box (broad cull) is where most of this project's optimization effort
+went — so successfully that the **red** box (narrow phase) is now the slowest part.
+The whole story of how each box got fast (and the things we tried that *didn't*
+work) is in **[14_optimizations.md](14_optimizations.md)**; how we *find* the
+bottleneck is in **[15_profiling_and_tuning.md](15_profiling_and_tuning.md)**.
+
 ## Where to go next
 
-- Want the *why-it's-built-this-way* lesson, in order? Start at
+- New and want the *why-it's-built-this-way* lesson, in order? Start at
   [01_foundations.md](01_foundations.md) and read through.
-- Want the *exact* kernels, data structures, and thread counts? Jump to
+- Want **every optimization** explained (easy + hard, including the failed ones)?
+  [14_optimizations.md](14_optimizations.md).
+- Want the *exact* kernels, data structures, and thread counts?
   [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md).
+- Want to know how to **profile and tune** a kernel yourself?
+  [15_profiling_and_tuning.md](15_profiling_and_tuning.md).
 - Want the canonical engineering reference (not a tutorial)? See
-  `guide/architecture.md`.
+  `guide/architecture.md`; current measured numbers are in
+  `reports/performance_and_optimizations_20260618.md`.
 
 > **One sentence to remember:** *lay a grid over space, keep only triangle pairs
 > that share a box, then let thousands of GPU threads each resolve one pair —

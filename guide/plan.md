@@ -6,8 +6,11 @@ paragraph, the measured outcome, and (where rejected) an explanation of the
 alternative that was considered. New work appends; finished phases stay so
 their rationale remains discoverable.
 
-Last refreshed: 2026-06-09 (full-suite re-benchmark + experimental hash +
-prefix-sum broad cull, §5.18).
+Last refreshed: **2026-06-18**. Since 2026-06-09 the hash cull was optimised and
+merged to `main` (§5.19), three more hash opts + CUDA graphs landed (§5.20), and an
+FBP-kernel occupancy optimization was attempted and reverted as a measured regression
+(§5.21). Current numbers + the full optimization/failed-methods history:
+`reports/performance_and_optimizations_20260618.md`.
 
 ---
 
@@ -42,7 +45,7 @@ the narrow-pass kernel and the host-side dispatch. **Phase 15 (§5.15)
 collapsed the candidate-generation kernel from ~300 µs to ~8 µs, making it
 no longer the bottleneck.**
 
-**2026-06-09 re-benchmark (`reports/benchmark_suite_20260609.md`).** The full
+**2026-06-09 re-benchmark (`reports/archive_pre_20260618/benchmark_suite_20260609.md`).** The full
 suite was re-run on the same hardware. Contact counts are **bit-identical** to
 the numbers above on every scene (56 EE small, 8018 large, 2700 VF self,
 254 VF cross). Narrow-phase wall and kernel times are **at or better than**
@@ -881,8 +884,8 @@ hash+prefix-sum  384.1   1.695 ms     1.254 ms       2354 (1119/428/807)
 ```
 
 Standalone backend bench also bit-identical (488 = 488). Reports:
-`reports/hash_prefixsum_broadphase_experiment_20260609.md` (design) and
-`reports/benchmark_suite_20260609.md` (suite).
+`reports/archive_pre_20260618/hash_prefixsum_broadphase_experiment_20260609.md` (design) and
+`reports/archive_pre_20260618/benchmark_suite_20260609.md` (suite).
 
 **Scope / caveats.**
 - Regime-specific: for small-tool/large-tissue the Phase 15 path is cheaper and
@@ -907,11 +910,14 @@ The §5.18 hash design was reworked with **seven optimizations**, all inside
 4. **No per-pair binary search** — `generateMixedHashCandidatePairs{32,64}Kernel`
    runs one block per mixed bucket and splits its `t×u` pairs by divide/modulo.
 5. **Persistent CUB scan** (`cub::DeviceScan::ExclusiveSum` with workspace temp)
-   replaces `thrust::exclusive_scan` (no per-frame Thrust alloc).
+   replaces `thrust::exclusive_scan` (no per-frame Thrust alloc). *(Later removed
+   entirely — see §5.20: the block-per-bucket generator needs no offsets and the
+   raw total is an `atomicAdd`. No CUB dependency remains.)*
 6. **32-bit compact pair encoding** when both triangle counts ≤ 65535.
 7. **Per-stage hash profiling** — 8 `avg_narrow_hash_*_ms` summary keys.
 
 Kernel launches: 7 (dense) → **13** (optimised hash) — more, smaller kernels.
+(Later reduced to **11** by dropping the scan; see §5.20.)
 
 **Measured (2026-06-17, large tissue + large tool, 14,368 elements, same-session,
 independently re-verified).** Trust the kernel time.
@@ -929,17 +935,21 @@ A second same-session A/B reproduced 0.508 ms / 565 FPS for the optimised hash
 (dense 1.748 ms / 238 FPS). Standalone backend bench bit-identical
 (`hash = fbp = 8018`, unique 322,560 = 322,560, overflow 0). Full suite: every
 scene's contacts match the documented baseline, overflow 0. Report:
-`reports/hash_optimized_broadphase_20260617.md`.
+`reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md`.
 
 ### 5.20  Three more hash optimizations + FBP kernel profiling (2026-06-17b)
 
 A second optimization round on the hash path, all verified bit-identical
-(`reports/hash_micro_optimizations_20260617.md`):
+(`reports/archive_pre_20260618/hash_micro_optimizations_20260617.md`):
 
 1. **Dropped the vestigial CUB scan** (the §5.19 follow-up): `pairOffsets`/`rawTotal`
    were unused by the block-per-bucket generator; `rawCandidateCount` already holds
-   the raw total. Removed the per-frame scan + `setCompactHashRawTotalKernel` + the
-   `ensure()` temp alloc. **Launches 13 → 11.**
+   the raw total (one `atomicAdd` in `computeCompactHashPairsPerBucketKernel`).
+   Removed the per-frame scan + `setCompactHashRawTotalKernel` + the `ensure()` temp
+   alloc; the follow-up cleanup also deleted the dead `setCompactHashRawTotalKernel`
+   definition, the inert `pairOffsets`/`rawTotal`/`scanTempStorage` buffers, and the
+   now-unused `<cub/cub.cuh>` include — **no CUB dependency remains**. **Launches
+   13 → 11.**
 2. **Cheap AABB pre-reject in `featureBasedProximityKernel`**: a conservative
    squared-box-gap test before the 15 closest-feature tests; skips far same-cell
    pairs (a cell is ~4× the contact distance). Exact ⇒ bit-identical. Helps the
@@ -955,13 +965,36 @@ Measured (large+large, same-session, contacts identical 2354, overflow 0):
 again (~0.33–0.38 ms), on top of §5.19's 2.5–3×. Full suite + backend bench
 bit-identical with graphs on.
 
-**Nsight Compute on `featureBasedProximityKernel`** (the narrow kernel): compute
-SOL ~27 %, **DRAM ~9 %**, occupancy ~44 %, **79 registers/thread → 3 blocks/SM**.
-It is **register/occupancy-limited, NOT memory-bound** — so the next narrow-phase
-win is **reducing register pressure / raising occupancy** (`__launch_bounds__`,
-splitting the EE pass, shrinking live state), *not* memory-layout changes (SoA /
-shared-mem caching would not help). Open: route v-t through the hash cull;
-occupancy work on the FBP kernel.
+**Nsight Compute on `featureBasedProximityKernel`** (the narrow kernel, the dominant
+GPU cost now): ~207 µs for the 322,560-pair workload, compute SOL ~27 %, DRAM ~9 %,
+occupancy ~44 %, 79 registers/thread → 3 blocks/SM. *Initial reading was
+"occupancy-limited"; §5.21 disproved that.*
+
+### 5.21  FBP occupancy optimization — ATTEMPTED, MEASURED REGRESSION, REVERTED (2026-06-18)
+
+Tried to raise FBP occupancy: `__launch_bounds__(256,4)` + register-state reduction
+(track-min during the 15 tests, reconstruct the winner's points/barys once;
+bit-identical) + `__ldg` read-only loads. Got registers **79→64**, occupancy
+**44→65 %** — but the kernel got **~7-10 % SLOWER (210→225 µs)**, not faster.
+Isolated: removing `__ldg` didn't change it. **All reverted.**
+
+**Corrected diagnosis (the deep stall profile):** dominant stalls are
+**`long_scoreboard` (~2.4, memory load latency) + `lg_throttle` (~1.85, load/store
+unit saturated)**, then `wait` (~1.88, math latency). The kernel is
+**LSU-throughput-bound and latency-bound on scattered vertex gathers — NOT
+occupancy-bound.** Adding warps just contends harder for the saturated LSU. The
+earlier scene-level FPS "gains" were pure thermal (the v-t scenes, which don't use
+this kernel, also jumped +55-80 % that run). **The real lever is REDUCING LOAD COUNT,
+not occupancy:** pack each triangle's 3 vertices contiguously once per frame so the
+narrow kernel does coalesced 128-bit loads reused across a triangle's many candidate
+pairs (a pre-pass kernel + buffers + CUDA-graph integration — scoped, not yet done).
+
+**Methods that DO NOT work (do not retry)** — full table in
+`reports/performance_and_optimizations_20260618.md` §6: FBP `__launch_bounds__` /
+register-reduction / `__ldg` (LSU-bound, regression); `compactActiveCells` (scanned
+all cells, regressed → replaced by Phase 15); `batchTriangleInsert` (breaks
+tissue-before-tool ordering); warp-aggregated atomics (atomics not the bottleneck,
+<2 %). Known perf-neutral leftover: `pairsPerBucket` is write-only after the scan drop.
 
 ---
 

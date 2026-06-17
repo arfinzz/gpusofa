@@ -5,9 +5,14 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: 2026-06-09 (added the experimental spatial-hash + prefix-sum
-broad-cull Data flags, §5.18 in plan.md; built on the 2026-05-25 Phase 12
-cross-model architecture).
+Last refreshed: **2026-06-18**. The hash broad cull is now optimised + merged to
+`main` (compact buckets, no binary search, dropped scan, CUDA graphs — ~4× faster
+kernel than the optimised dense grid on a large tissue, bit-identical contacts), and
+the `featureBasedProximityKernel` narrow phase is now the dominant GPU cost (a
+load-throughput-bound kernel; an occupancy optimization was tried and reverted —
+plan.md §5.21). **Current measured numbers + the full optimization history live in
+`reports/performance_and_optimizations_20260618.md`** (earlier dated reports are under
+`reports/archive_pre_20260618/`).
 
 ---
 
@@ -242,7 +247,7 @@ output-mode switches and the dense-grid configuration.
 | `compactActiveCells` | **false** | Experimental: compact mixed cells via a separate full-grid scan. Regressed on GTX 1650 Ti, superseded by `useToolActiveCellGeneration` |
 | `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed; mutually exclusive with `useToolActiveCellGeneration` |
 | `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
-| `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms on 12.8k+1.6k tris; compact buckets, mixed-bucket gen, no binary search, touched-slot clear, CUB scan, 32-bit pairs). See `reports/hash_optimized_broadphase_20260617.md`. Requires `useFeatureBasedProximity=true` |
+| `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms on 12.8k+1.6k tris; compact buckets, mixed-bucket gen, no binary search, touched-slot clear, CUB scan, 32-bit pairs). See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md`. Requires `useFeatureBasedProximity=true` |
 | `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |

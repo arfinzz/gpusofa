@@ -33,6 +33,10 @@ the CUDA toolkit (no build-system change).
 | 7 | **Hash-stage profiling** | 8 new CUDA-event timers (`hashGrid{Reset,PairHashClear,InsertTissue,InsertTool,PairCount,Scan,GeneratePairs,ProximityCounterClear}Milliseconds`) flow `BackendExecutionStats → StageSnapshot → controller`, emitted as `avg_narrow_hash_*_ms` summary keys. | Per-stage attribution of the hash broad cull (used to confirm no single stage dominates). |
 
 ### Resulting kernel sequence (13 launches vs the old 8, vs dense 7)
+> **Update (2026-06-17b):** the **CUB scan** + `setCompactHashRawTotal` shown below
+> were later removed (their offsets are unused by the block-per-bucket generator),
+> dropping this to **11 launches**. See §5.
+
 `clear-touched-pair-hash` → `resetCompactHashGrid` → `markCompactHashGridCells`
 (tissue) → `markCompactHashGridCells` (tool) → `compactHashGridSlots` →
 `fillCompactHashGridTriangles` (tissue) → `fillCompactHashGridTriangles` (tool) →
@@ -108,14 +112,24 @@ the dense path, so these changes cost the default surgical scene nothing.
 
 ---
 
-## 5. Possible follow-ups (not bugs)
+## 5. Follow-ups
 
-- **Drop the scan on the critical path.** `pairOffsets`/`rawTotal` from the CUB
-  scan now feed *only* the `rawPairCount` statistic — the block-per-bucket
-  generator no longer needs global offsets (`kGenBlocks` is a fixed 1024). The
-  scan + `setCompactHashRawTotal` (2 launches, ~0.13 ms) could be dropped, or the
-  raw total folded into the pairs-per-bucket kernel via one `atomicAdd`, if the
-  stat isn't needed in production.
+- **Drop the scan on the critical path — DONE (2026-06-17b).** The CUB
+  `ExclusiveSum` + `setCompactHashRawTotalKernel` (2 launches, ~0.13 ms) have been
+  removed: the block-per-bucket generator (`kGenBlocks` fixed at 1024) needs no
+  global offsets, and the raw-pair-count statistic is now folded into
+  `computeCompactHashPairsPerBucketKernel` via a single `atomicAdd` into
+  `rawCandidateCount`. The cleanup also removed the now-inert `pairOffsets` /
+  `rawTotal` / `scanTempStorage` workspace buffers and the (now-unused)
+  `<cub/cub.cuh>` include — **no CUB dependency remains**. **Launches 13 → 11**;
+  contacts bit-identical (2354 / hash = fbp = 8018, overflow 0), re-verified by the
+  3-mode A/B (`hash_opt` 0.349 ms / 514 FPS, launches 11) and the standalone bench.
+  Documented in
+  [hash_micro_optimizations_20260617.md](hash_micro_optimizations_20260617.md) §1
+  (#3) and `guide/plan.md` §5.20.
+
+### Still open
+
 - **Route the v-t paths through the optimized hash cull** (currently tri-tri FBP only).
 - **Auto-tune the hash table size** from a measured occupancy histogram instead of
   the fixed `4×triangles` heuristic.

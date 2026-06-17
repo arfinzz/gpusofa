@@ -292,7 +292,7 @@ These all default sensibly. Set them only to override.
 | `SOFA_COMPACT_ACTIVE_CELLS` | 0 | Experimental active-cell compaction via a separate full-grid scan — **regressed**, superseded by `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` |
 | `SOFA_BATCH_TRIANGLE_INSERT` | 0 | Experimental fused tissue+tool insertion (regressed). Mutually exclusive with tool-active-cell generation |
 | `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION` | **1** | **Phase 15 — DEFAULT ON (guide/plan.md §5.15).** Generate candidate pairs over tool-occupied (mixed) cells only — list built during the tool insert, no separate scan. **Measured 4.3× FPS (221 → 943) and 38× faster generation (300 → 7.9 µs) on one-tissue, 1.08× on large-tissue, contact counts bit-identical, never a regression.** Set to 0 only to A/B against the old all-cells path |
-| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms), contacts bit-identical. Requires FBP on. See `reports/hash_optimized_broadphase_20260617.md` |
+| `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms), contacts bit-identical. Requires FBP on. See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md` |
 | `SOFA_HASH_TABLE_SIZE` | **0** | Hash table slot count for the above. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `SOFA_HASH_CUDA_GRAPH` | **1** | **DEFAULT ON (guide/plan.md §5.20).** Replay the hash broad cull's 11-kernel sequence as a captured CUDA Graph each steady-state frame (verified bit-identical, ~−7 % kernel / +10 % FPS). Set to 0 to launch the kernels individually (e.g. to A/B, or under detailed profiling, where it is auto-disabled). Only affects the `useHashPrefixSumGeneration` path |
 
@@ -472,7 +472,7 @@ wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_full_benchmark_suit
 
 Runs small, large, v-t self, v-t cross, and the hash A/B — each in fast-path
 and validation legs — into `output/benchmark_logs/full_suite_<stamp>/<leg>/`.
-The 2026-06-09 run is reported in `reports/benchmark_suite_20260609.md`.
+The 2026-06-09 run is reported in `reports/archive_pre_20260618/benchmark_suite_20260609.md`.
 
 > **Cold-clock caveat.** The *first* leg in a fresh process is contaminated by
 > CUDA-context init + GPU clock ramp (the 1650 Ti idles at a low clock). For a
@@ -491,7 +491,7 @@ then hash + prefix-sum (`=1`). Contact counts MUST match between legs (2354,
 1119 VF / 428 FV / 807 EE); the FPS / narrow-wall delta is the payoff
 (measured +11.8 % FPS, −15 % narrow wall on 2026-06-09). This path is
 **default-off and opt-in**; the dense grid is untouched. Design + numbers:
-`reports/hash_prefixsum_broadphase_experiment_20260609.md`.
+`reports/archive_pre_20260618/hash_prefixsum_broadphase_experiment_20260609.md`.
 
 ---
 
