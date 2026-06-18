@@ -1,4 +1,4 @@
-# 05 — Phase 2: Narrow-Phase Data Preparation (Zero-Copy)
+# 05 — Zero-copy data preparation (handing the mesh to the GPU)
 
 The broad phase handed us one pair: `(tissue, blade)`. The narrow phase now has
 to feed that geometry to the CUDA kernels. The clever part is that it does this
@@ -61,7 +61,7 @@ For our scene, `m_pendingPairs = [(tissue, blade)]` after this.
 4. **Records** the timing.
 
 This file covers steps 1 and 2 (the data prep). Step 3 (the kernels) is files
-07–09. Step 4 (timing) is file 11.
+07–09. Step 4 (timing) is file 14.
 
 ---
 
@@ -213,7 +213,7 @@ This guarantees a unique ID per object (two different objects have different
 addresses). It's used for two things:
 
 1. The device-index cache above (don't re-upload the same model's indices).
-2. Self-collision detection in the v-t path (file 09): if both surfaces have
+2. Self-collision detection in the v-t path (file 11): if both surfaces have
    the *same* surfaceId, they're the same mesh, and the kernel enables
    "own-corner exclusion."
 

@@ -1,4 +1,4 @@
-# 09 — Vertex-Triangle Paths (Self-Collision & Cross-Model)
+# 11 — Vertex-triangle paths (self-collision & cross-model)
 
 Files 06–08 traced the **triangle-triangle** path: two triangle meshes, dense
 grid, 15 feature tests per pair. This file covers two *variants* that reuse all
@@ -10,7 +10,7 @@ Both are real, wired, and tested. They're controlled by the
 
 ---
 
-## 9.1 Why a vertex-triangle path at all?
+## 11.1 Why a vertex-triangle path at all?
 
 Two surgical use cases the triangle-triangle path doesn't cover well:
 
@@ -30,14 +30,14 @@ than triangle-triangle — it's just *one* closest-point-on-triangle test per
 
 ---
 
-## 9.2 The shared machinery
+## 11.2 The shared machinery
 
 The vertex-triangle path reuses almost everything from files 06–08:
 
 - The **dense grid** — same cells, same insertion, same candidate generation
-  (including the active-cell optimization from file 06 §6.8 / file 07 §7.4).
+  (including the active-cell optimization from file 06 §6.8 / file 09 §9.4).
 - The **closest-point-on-triangle math** (`closestPointOnTriangleBary`, Ericson
-  5.1.5) — the exact same function from file 08.
+  5.1.5) — the exact same function from file 10.
 - The **workspace**, the **over-launch + grid-stride** narrow kernel, the
   **sync bypass**.
 
@@ -51,7 +51,7 @@ What's different:
 
 ---
 
-## 9.3 Inserting points into the grid — `insertIndexedPointsKernel`
+## 11.3 Inserting points into the grid — `insertIndexedPointsKernel`
 
 A point has no extent, so its "bounding box" is just a tiny cube of size
 `2 × contactDistance` centered on the point:
@@ -85,9 +85,9 @@ The candidate-generation kernel then pairs them up exactly as before, producing
 
 ---
 
-## 9.4 The narrow kernel — `featureBasedVertexTriangleProximityKernel`
+## 11.4 The narrow kernel — `featureBasedVertexTriangleProximityKernel`
 
-Like the tri-tri kernel (file 07 §7.6), this one **grid-strides** over all
+Like the tri-tri kernel (file 09 §9.6), this one **grid-strides** over all
 `(triangle, vertex)` candidate pairs — a fixed grid is launched and each thread
 loops over `idx, idx+stride, …` so the kernel is correct even when there are
 more pairs than launched threads:
@@ -124,18 +124,18 @@ for (uint32_t idx = blockIdx.x*blockDim.x + threadIdx.x; idx < pairCount; idx +=
 }
 ```
 
-It's the same closest-point math from file 08, but run *once* (point vs face)
+It's the same closest-point math from file 10, but run *once* (point vs face)
 instead of 15 times. That's why the vertex-triangle kernel is about 2× cheaper
 than the triangle-triangle kernel and uses only 32 registers per thread vs 68
 (measured in `reports/gpu_collision_phase11_12_kernel_profile_20260525.md`).
 
 (The grid-stride here is the same Phase 17 fix as the tri-tri kernel — without
 it, a large self-collision scene with more than ~262,144 candidate pairs would
-silently drop the overflow. See file 07 §7.6.)
+silently drop the overflow. See file 09 §9.6.)
 
 ---
 
-## 9.5 Self-collision and "own-corner exclusion"
+## 11.5 Self-collision and "own-corner exclusion"
 
 Here's a problem unique to self-collision. If you test a mesh against *itself*,
 then vertex 500 will be tested against the triangles that *contain* vertex 500.
@@ -174,7 +174,7 @@ exclusion off. This is why unique surface IDs matter.
 
 ---
 
-## 9.6 Self-collision dispatch (SOFA side)
+## 11.6 Self-collision dispatch (SOFA side)
 
 How does the narrow phase decide to run the vertex-triangle self-collision path?
 Recall from file 04 that the broad phase emits a `(cm, cm)` pair when a model
@@ -215,7 +215,7 @@ distance-zero self-hits.
 
 ---
 
-## 9.7 Cross-model dispatch (point cloud vs different mesh)
+## 11.7 Cross-model dispatch (point cloud vs different mesh)
 
 The other variant: a separate `CudaPointCollisionModel` (a point cloud
 component) against a `CudaTriangleCollisionModel` (the tissue). The broad phase
@@ -260,7 +260,7 @@ tissue triangles.
 
 ---
 
-## 9.8 Optional CPU publication
+## 11.8 Optional CPU publication
 
 For all the FBP paths, if you set `copyContactsToHost=True`, the contacts are
 downloaded and published into SOFA's `DetectionOutput` so a CPU response
@@ -283,7 +283,7 @@ there.
 
 ---
 
-## 9.9 The four paths, side by side
+## 11.9 The four paths, side by side
 
 The narrow phase picks exactly one path per pair, based on the flags and the
 model types:
@@ -300,7 +300,7 @@ differ only in what's inserted and which narrow kernel runs.
 
 ---
 
-## 9.10 Summary
+## 11.10 Summary
 
 ```text
 Vertex-triangle = treat one side as loose points, not triangles.
@@ -314,4 +314,4 @@ Measured: self-collision 1385 FPS, cross-model 1968 FPS.
 ```
 
 Next: why the benchmark is so fast — the synchronization bypass and what
-happens at frame end. Go to [10_phase4_sync_and_output.md](10_phase4_sync_and_output.md).
+happens at frame end. Go to [12_sync_and_output.md](12_sync_and_output.md).

@@ -1,4 +1,4 @@
-# 08 — The Geometry Math (Closest Features & Barycentrics)
+# 10 — The geometry math (closest features & barycentrics)
 
 Kernel 7 (`featureBasedProximityKernel`) is where the actual collision geometry
 is computed. This file explains that geometry from scratch: what a "feature" is,
@@ -8,7 +8,7 @@ are named after its sections, 5.1.5 and 5.1.9).
 
 ---
 
-## 8.1 Why not just "do the triangles intersect?"
+## 10.1 Why not just "do the triangles intersect?"
 
 The old approach (the legacy exact-contact kernel) answered a yes/no question:
 "do these two triangles cross each other?" using the Separating Axis Theorem
@@ -30,7 +30,7 @@ The SAT yes/no test gives none of these cleanly, and it has no notion of
 
 ---
 
-## 8.2 What is a "feature"?
+## 10.2 What is a "feature"?
 
 A triangle has three kinds of features:
 
@@ -60,7 +60,7 @@ emits a contact for the winning feature pair.
 
 ---
 
-## 8.3 Barycentric coordinates (the key idea)
+## 10.3 Barycentric coordinates (the key idea)
 
 This concept trips up beginners, so let's go slow.
 
@@ -101,7 +101,7 @@ would read the weights directly from device memory.)
 
 ---
 
-## 8.4 Closest point on a triangle to a point (Ericson 5.1.5)
+## 10.4 Closest point on a triangle to a point (Ericson 5.1.5)
 
 This is the core of the Vertex-Face test. Given a point P and a triangle
 (A, B, C), find the point on the triangle closest to P, expressed in
@@ -173,7 +173,7 @@ cheaper.)
 
 ---
 
-## 8.5 Closest points between two segments (Ericson 5.1.9)
+## 10.5 Closest points between two segments (Ericson 5.1.9)
 
 This is the core of the Edge-Edge test. Given two line segments (edges)
 P1→Q1 and P2→Q2, find the closest point on each. The device function:
@@ -223,7 +223,7 @@ For an edge, the barycentric weights are just the two endpoints blended by `s`
 
 ---
 
-## 8.6 Putting the 15 tests together
+## 10.6 Putting the 15 tests together
 
 The kernel runs all 15 tests, each updating a running "best" if it finds a
 closer feature pair:
@@ -245,7 +245,7 @@ if (bestDistSq > contactDistance*contactDistance) return;   // 0.0009 threshold
 ```
 
 (This shows the logic for *one* candidate pair. In the real kernel this body sits
-inside a grid-stride loop — file 07 §7.6 — so the early-out is a `continue` to
+inside a grid-stride loop — file 09 §9.6 — so the early-out is a `continue` to
 the next pair, not a `return` from the whole thread.)
 
 The winning `bestKind` is recorded as the contact's `featureKind`
@@ -265,7 +265,7 @@ geometry is behaving as expected.
 
 ---
 
-## 8.7 The output: `DeviceProximityContact`
+## 10.7 The output: `DeviceProximityContact`
 
 When a contact survives the distance test, the kernel writes this record:
 
@@ -292,7 +292,7 @@ buffer.
 
 ---
 
-## 8.8 Why this is "smooth" (and why that matters)
+## 10.8 Why this is "smooth" (and why that matters)
 
 A subtle but important property: as the geometry moves slightly, the FBP result
 changes *smoothly*. If the blade slides a tiny bit, the closest point glides
@@ -307,7 +307,7 @@ project adopted feature-based proximity for surgical simulation.
 
 ---
 
-## 8.9 Summary
+## 10.9 Summary
 
 ```text
 A "feature" = a vertex, edge, or face of a triangle.
@@ -322,4 +322,4 @@ Smoothness (vs SAT's discontinuities) is why it's good for physics.
 ```
 
 Next: the two specialized paths built on this same math — self-collision and
-point-cloud-vs-mesh. Go to [09_vertex_triangle.md](09_vertex_triangle.md).
+point-cloud-vs-mesh. Go to [11_vertex_triangle.md](11_vertex_triangle.md).

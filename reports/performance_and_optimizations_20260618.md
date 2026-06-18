@@ -162,7 +162,7 @@ graph LR
   `for (i = tid; i < count; i += gridDim.x*blockDim.x)` — no CPU↔GPU round‑trip to read
   the count. *In‑loop early‑outs must `continue`, never `return`* (a `return` would drop
   a thread's remaining strided work — the Phase‑17 bug).
-- Full per‑kernel reference: `tutorial/13_kernels_and_data_structures_reference.md`.
+- Full per‑kernel reference: `tutorial/17_kernels_reference.md`.
 
 ---
 

@@ -260,7 +260,7 @@ default:
 1. **All-cells scan (the original, now the fallback).** Visit *every* one of the
    32,768 cells, check each for mixed tissue+tool content. The blade only
    touches ~30 cells, so ~32,738 cells are visited for nothing. This is the
-   single most expensive kernel in the original pipeline (~300 µs — file 07).
+   single most expensive kernel in the original pipeline (~300 µs — file 09).
 
 2. **Tool-active-cell scan (Phase 15, the default since 2026-05-25).** Notice the
    asymmetry: the *tissue* is huge (covers thousands of cells), but the *tool*
@@ -272,7 +272,7 @@ default:
    the blade insert** (kernel 4). When the first blade triangle lands in a cell
    that already contains tissue, that cell's ID is appended to an "active list."
    No separate scan pass is needed — the list is a side effect of an insert
-   that already runs. (Details and the correctness argument are in file 07 §7.4
+   that already runs. (Details and the correctness argument are in file 09 §9.4
    and `guide/plan.md` §5.15.)
 
    Result: candidate generation visits ~30 cells instead of 32,768. On the
@@ -336,5 +336,11 @@ Duplicate pairs are removed with a GPU hash table.
 Result: ~624 unique candidate pairs instead of 153,600 brute-force checks.
 ```
 
-Now you understand the structure. Next we walk the seven CUDA kernels that
-build and use it. Go to [07_phase3_kernels.md](07_phase3_kernels.md).
+Now you understand the **default** broad cull. Before we walk the CUDA kernels,
+there's an **alternative** broad cull built for big meshes — a *spatial hash* that
+materialises only the occupied cells — and a full, honest answer to "what kind of
+hashing is this?". Go to [07_the_hash_broad_cull.md](07_the_hash_broad_cull.md).
+
+(If you only care about the default surgical path you *can* skip 07–08 and jump
+straight to the kernels in [09_the_kernels.md](09_the_kernels.md) — but the hash is
+where the ~4× large-scene speedup lives, so it's worth the detour.)

@@ -305,7 +305,7 @@ In SOFA the standard record is called a `DetectionOutput` and it carries two
 points (one on each object), a normal direction, and a distance value.
 
 This project produces a richer record on the GPU called a `ProximityContact`
-(it also carries barycentric weights — file 08), but it can convert down to a
+(it also carries barycentric weights — file 10), but it can convert down to a
 SOFA `DetectionOutput` when needed.
 
 ---

@@ -1,4 +1,4 @@
-# 03 — Phase 0: Setup (Before the Clock Starts)
+# 03 — Setup & the zero-copy data path (before the clock starts)
 
 Everything in files 04–10 happens *every frame*. This file is different: it
 describes the one-time setup that happens **once**, at scene load, before the
@@ -239,4 +239,4 @@ up front. The per-frame loop that follows is almost pure compute with no
 memory traffic. That's the design.
 
 Next: the first actual per-frame step, the broad phase. Go to
-[04_phase1_broad_phase.md](04_phase1_broad_phase.md).
+[04_broad_phase.md](04_broad_phase.md).

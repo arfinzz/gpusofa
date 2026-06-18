@@ -1,4 +1,4 @@
-# 10 — Phase 4: The Sync Bypass & Frame End
+# 12 — The sync bypass & frame end (the speed secret)
 
 The kernels are launched. Now comes the step that makes or breaks the
 benchmark's speed: what the CPU does *after* launching them. This file explains
@@ -6,7 +6,7 @@ why doing **nothing** is the fast answer, and what the alternatives cost.
 
 ---
 
-## 10.1 The naive expectation
+## 12.1 The naive expectation
 
 A beginner's mental model of the frame is:
 
@@ -23,7 +23,7 @@ CPU does its next-frame setup. The two never overlap. You've serialized them.
 
 ---
 
-## 10.2 What actually happens (the fast path)
+## 12.2 What actually happens (the fast path)
 
 In detection-only mode (`copyContactsToHost=False`,
 `readCountersWhenContactsStayOnDevice=False`), the narrow phase does this:
@@ -60,13 +60,13 @@ The FBP math kernel runs ~17 µs *on the GPU*, but it overlaps the next frame's
 CPU work, so it never adds to the wall time the CPU observes. The ~940 FPS
 number comes from this overlap. (Before the Phase 15 active-cell generation, the
 same path was ~775 FPS — the difference is the candidate-generation kernel
-dropping from ~300 µs to ~8 µs, see file 06 §6.8 and file 07 §7.4.)
+dropping from ~300 µs to ~8 µs, see file 06 §6.8 and file 09 §9.4.)
 
 ---
 
-## 10.3 Why the over-launch + grid-stride is essential here
+## 12.3 Why the over-launch + grid-stride is essential here
 
-Recall from file 07 §7.6 that the FBP kernel launches a **fixed grid** and
+Recall from file 09 §9.6 that the FBP kernel launches a **fixed grid** and
 grid-strides over the candidate pairs, reading the pair count *from GPU memory*.
 The reason connects directly to the sync bypass.
 
@@ -80,13 +80,13 @@ By launching a fixed, generous grid and letting the kernel read the count itself
 and grid-stride over the work, the CPU never needs to know the count. No
 readback, no sync, no stall. This is the design choice that took the FBP path
 from 109 FPS (with the readback) to ~940 FPS (without it, and with the
-active-cell generation of file 07 §7.4). The grid-stride loop is also what keeps
+active-cell generation of file 09 §9.4). The grid-stride loop is also what keeps
 the kernel *correct* when a large scene has more pairs than launched threads
-(file 07 §7.6).
+(file 09 §9.6).
 
 ---
 
-## 10.4 The data-transfer scorecard
+## 12.4 The data-transfer scorecard
 
 In the fast path, tally the bytes crossing PCIe for the *whole frame*:
 
@@ -103,7 +103,7 @@ pure GPU compute with zero memory traffic across the bus.
 
 ---
 
-## 10.5 When you DO want the results — the readback modes
+## 12.5 When you DO want the results — the readback modes
 
 Detection-only is great for benchmarking, but a real simulation eventually needs
 the contacts. There are three escalating levels of "give me the data," each
@@ -151,7 +151,7 @@ to set both.
 
 ---
 
-## 10.6 The frame ends
+## 12.6 The frame ends
 
 After the narrow phase returns (having launched the kernels and, in fast mode,
 not waited), control goes back up to SOFA:
@@ -160,7 +160,7 @@ not waited), control goes back up to SOFA:
 CollisionPipeline::computeCollisionResponse()   → no-op (no ContactManager)
 DefaultAnimationLoop finishes the step
 GpuPipelineBenchmarkController's "AnimateEnd" handler fires:
-    → records this frame's timings (file 11)
+    → records this frame's timings (file 14)
     → every 20 frames, flushes the CSV to disk
 The frame is over. The clock ticks to the next frame.
 ```
@@ -171,7 +171,7 @@ stream ordering guarantees the operations run in the order they were queued.
 
 ---
 
-## 10.7 Putting the whole frame together
+## 12.7 Putting the whole frame together
 
 Here's the complete frame for the one-tissue/one-blade FBP fast path:
 
@@ -213,7 +213,7 @@ Frame rate: ~940 per second.
 
 ---
 
-## 10.8 Summary
+## 12.8 Summary
 
 ```text
 The fast path launches kernels and DOES NOT WAIT (no sync, no readback).
@@ -224,5 +224,6 @@ Three opt-in readback levels (counters / sampled / full publication) trade FPS
   for getting data back to the CPU — used only when you actually need it.
 ```
 
-The last thing to understand is how the stopwatch itself works — what every
-number in the benchmark CSV means. Go to [11_profiling.md](11_profiling.md).
+That completes the per-frame story. Part IV is about **running and measuring** it:
+first the catalogue of every scene and every kind of run. Go to
+[13_scenes_and_runs.md](13_scenes_and_runs.md).

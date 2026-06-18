@@ -1,100 +1,88 @@
-# GPU SOFA Collision — Beginner Tutorial
+# GPU SOFA Collision — the complete tutorial
 
-This tutorial explains, from the ground up, exactly what happens when you run
-the GPU collision benchmark in this project. It assumes **no prior knowledge**
-of SOFA, GPUs, or CUDA. Every claim is grounded in the actual code in this
-repository — file names and function names are given so you can open them and
-follow along.
+This tutorial explains, from the ground up, **exactly** what this project does and how —
+assuming **no prior knowledge** of SOFA, GPUs, or CUDA. Every claim is grounded in the
+real code (file and function names are given). It is the gentle, example-driven
+companion to `guide/architecture.md` (the terse reference).
 
-If you have already read `guide/architecture.md`, this tutorial is the gentle,
-example-driven companion to it. The guide is a reference; this is a lesson.
+It reflects the **current** state of the project: the dense grid *and* the optimised
+spatial-hash broad cull, the four narrow-phase paths, CUDA graphs, the profiling story,
+and the optimizations that worked **and the ones that failed**.
 
 ## How to read this
 
-**New here? Read [00_high_level_flow.md](00_high_level_flow.md) first** — it's the
-easy, no-jargon big picture of the whole system on one page. Then read the rest
-in order; each builds on the previous. The final file,
-[13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md),
-is the complete engineering lookup table (every kernel, data structure, and
-thread count) — use it as a reference, not a bedtime read.
+Read **[00_high_level_flow.md](00_high_level_flow.md) first** — the whole system on one
+page, no jargon. Then follow the order below; each chapter builds on the previous. Two
+chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 
-| File | What you'll learn | Time |
+### Part I — Orientation
+| # | Chapter | What you'll learn |
 |---|---|---|
-| [00_high_level_flow.md](00_high_level_flow.md) | **Start here.** The whole system in plain words, one frame top to bottom | 10 min |
-| [01_foundations.md](01_foundations.md) | What SOFA is, what a mesh is, CPU vs GPU, the CUDA words you need | 15 min |
-| [02_the_scene.md](02_the_scene.md) | Line-by-line tour of the benchmark scene file | 15 min |
-| [03_phase0_setup.md](03_phase0_setup.md) | What happens before the clock starts: plugin load, GPU memory, caches | 15 min |
-| [04_phase1_broad_phase.md](04_phase1_broad_phase.md) | The broad phase — finding which objects *might* touch | 10 min |
-| [05_phase2_narrow_prep.md](05_phase2_narrow_prep.md) | Preparing data for the GPU without copying anything (zero-copy) | 15 min |
-| [06_the_dense_grid.md](06_the_dense_grid.md) | The core data structure, with a fully worked numeric example | 20 min |
-| [07_phase3_kernels.md](07_phase3_kernels.md) | The seven CUDA kernels that do the actual work | 25 min |
-| [08_the_math.md](08_the_math.md) | The geometry: closest points, barycentrics, VF and EE tests | 20 min |
-| [09_vertex_triangle.md](09_vertex_triangle.md) | Self-collision and point-cloud-vs-mesh paths | 15 min |
-| [10_phase4_sync_and_output.md](10_phase4_sync_and_output.md) | Why the benchmark is so fast: the synchronization bypass | 10 min |
-| [11_profiling.md](11_profiling.md) | How timing works and what every number in the CSV means | 15 min |
-| [12_glossary.md](12_glossary.md) | Every term, defined in one place | reference |
-| [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md) | **Reference.** Every kernel, its inputs/outputs, the data structures, kernel counts, and exactly how threads are allocated | reference |
-| [14_optimizations.md](14_optimizations.md) | **Every optimization** explained easy + hard, with mermaid diagrams — the dense grid, Phase 15, the whole spatial-hash rework, CUDA graphs, **and the ones that were tried and *failed*** (so you don't retry them) | 30 min |
-| [15_profiling_and_tuning.md](15_profiling_and_tuning.md) | How to **find a kernel's bottleneck** with Nsight (compute/memory/latency, stall reasons) and why FPS lies — the method behind every win and dead end | 20 min |
+| 00 | [The high-level flow](00_high_level_flow.md) | **Start here.** The whole system in plain words, one frame top to bottom (+ a flow diagram) |
+| 01 | [Foundations](01_foundations.md) | What SOFA is, what a mesh is, CPU vs GPU, the CUDA words you need |
+| 02 | [The scene files](02_the_scene.md) | Line-by-line tour of a benchmark scene |
+| 03 | [Setup & the zero-copy data path](03_setup_and_data_path.md) | Before the clock starts: plugin load, GPU memory, the topology cache |
 
-> Companion outside the tutorial: [reports/README_metrics_explained.md](../reports/README_metrics_explained.md)
-> defines every number the benchmarks print (FPS, kernel time, contact counts, …);
-> the current measured numbers + full optimization history live in
-> [reports/performance_and_optimizations_20260618.md](../reports/performance_and_optimizations_20260618.md).
+### Part II — The broad cull (finding candidate pairs)
+| # | Chapter | What you'll learn |
+|---|---|---|
+| 04 | [The broad phase](04_broad_phase.md) | Finding which *objects* might touch (the cheap first pass) |
+| 05 | [Zero-copy data prep](05_zero_copy_prep.md) | Handing mesh data to the GPU without copying anything |
+| 06 | [The dense grid (+ optimised dense, Phase 15)](06_the_dense_grid.md) | The default broad cull, with a fully worked numeric example and the tool-active-cell optimization |
+| 07 | [The spatial-hash broad cull + the hashing in detail](07_the_hash_broad_cull.md) | The alternative for big tissues — and **exactly what kind of hashing** it uses (open addressing, MurmurHash, atomicCAS, linear probing) |
+| 08 | [Optimising the hash](08_optimising_the_hash.md) | The six tricks (compact buckets, no binary search, touched-clear, 32-bit pairs, scan drop) **+ CUDA graphs** that make it ~4× faster than dense |
 
-> **Diagrams:** files 00, 14, and 15 use `mermaid` flow diagrams — they render as
-> real flowcharts on GitHub, VS Code, and most markdown viewers (plain-text
-> fallback boxes are kept elsewhere).
+### Part III — The narrow phase (exact contacts)
+| # | Chapter | What you'll learn |
+|---|---|---|
+| 09 | [The kernels](09_the_kernels.md) | The CUDA kernels that build the grid and resolve contacts |
+| 10 | [The narrow-phase math](10_the_math.md) | Closest points, barycentrics, the VF / FV / EE feature tests |
+| 11 | [Vertex-triangle paths](11_vertex_triangle.md) | Self-collision and point-cloud-vs-mesh |
+| 12 | [Sync & output: the speed secret](12_sync_and_output.md) | Why it's so fast: detection-only, never wait for the GPU |
+
+### Part IV — Running, measuring, optimizing
+| # | Chapter | What you'll learn |
+|---|---|---|
+| 13 | [Every scene & every run](13_scenes_and_runs.md) | All five scenes, fast vs validation, the dense↔hash A/B runs, what each measures |
+| 14 | [Benchmark metrics](14_benchmark_metrics.md) | How timing works and what every CSV number means |
+| 15 | [Profiling & tuning](15_profiling_and_tuning.md) | Finding a kernel's bottleneck with Nsight (compute/memory/latency, stall reasons) and why FPS lies |
+| 16 | [Optimizations & dead ends](16_optimizations_and_dead_ends.md) | **Every optimization** easy + hard with diagrams — *and the ones that were tried and failed*, so you don't retry them |
+
+### References (look up, don't read end-to-end)
+| # | Chapter | What it is |
+|---|---|---|
+| 17 | [Kernels & data-structures reference](17_kernels_reference.md) | Every kernel, its inputs/outputs, data structures, kernel counts, exact thread allocation |
+| 18 | [Glossary](18_glossary.md) | Every term, defined in one place |
+
+> **Companion documents (outside the tutorial):**
+> [reports/README_metrics_explained.md](../reports/README_metrics_explained.md) defines
+> every benchmark number; the current measured results + full optimization history are in
+> [reports/performance_and_optimizations_20260618.md](../reports/performance_and_optimizations_20260618.md);
+> `guide/architecture.md` and `guide/plan.md` are the terse engineering references.
+
+> **Diagrams.** Chapters 00, 07, 08, 13, 15, 16 use ```mermaid``` blocks — they render as
+> real flowcharts on GitHub, VS Code, and most markdown viewers. Other chapters use
+> plain-text diagrams that render anywhere.
 
 ## The one-sentence summary
 
-> The project takes the slowest part of a surgical simulation — figuring out
-> when a surgical tool touches tissue — and moves it onto the graphics card,
-> where thousands of tiny processors check all the triangles at once instead
-> of one CPU checking them one at a time.
+> The project takes the slowest part of a surgical simulation — figuring out when a
+> surgical tool touches tissue — and moves it onto the graphics card, where thousands of
+> tiny processors check all the triangles at once instead of one CPU checking them one
+> at a time.
 
-## The mental picture you should hold
+## The mental picture to hold
 
 ```text
-        A SOFA SCENE (described in a Python file)
-        ┌─────────────────────────────────────────┐
-        │  Tissue  (a sheet of 12,800 triangles)   │
-        │  Blade   (a box of 12 triangles)         │
-        │                                          │
-        │  + instructions: "detect collisions      │
-        │     on the GPU, don't bother responding" │
-        └─────────────────────────────────────────┘
-                          │
-                          │  every frame (every 5 ms of simulated time)
+        A SOFA SCENE (a Python file): tissue mesh + tool mesh, on the GPU
+                          │  every frame (5 ms of simulated time)
                           ▼
-        ┌─────────────────────────────────────────┐
-        │  BROAD PHASE  — which objects are near?   │  (cheap)
-        │  NARROW PHASE — exactly which triangles   │  (the GPU work)
-        │                 are touching, and where?  │
-        └─────────────────────────────────────────┘
-                          │
+        BROAD PHASE   — which objects are near?            (cheap CPU)
+        BROAD CULL    — which triangle PAIRS might touch?  (GPU: dense grid OR hash)
+        NARROW PHASE  — do they actually touch, and where? (GPU: the heavy math)
                           ▼
-        Contacts (kept on the GPU, never copied back to the CPU)
-        + a stopwatch reading written to a CSV file
+        Contacts (kept on the GPU, never copied back) + a CSV timing line
 ```
 
-Everything in this tutorial is an expansion of that picture.
-
-## A note on "phases"
-
-The word "phase" is used two different ways in this project, and it's worth
-clearing up now so you don't get confused:
-
-1. **Execution phases** (Phase 0, 1, 2, 3, 4) — the steps that run *every
-   frame* while the simulation is going. This tutorial is organized around
-   these.
-
-2. **Project phases** (Phase 11, Phase 12, etc.) — the chronological
-   milestones of *building* the software, recorded in `guide/plan.md`. These
-   are the history of the project, not the runtime steps.
-
-When this tutorial says "Phase 3," it means the third runtime step (the CUDA
-kernels). When `guide/plan.md` says "Phase 11," it means the eleventh thing
-the developers built (feature-based proximity).
-
-Now go to [01_foundations.md](01_foundations.md).
+Everything in this tutorial expands one box of that picture. Start with
+[00_high_level_flow.md](00_high_level_flow.md).

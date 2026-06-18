@@ -1,4 +1,4 @@
-# 13 — Kernels & Data Structures: the complete reference
+# 17 — Kernels & data structures: the complete reference
 
 This is the **engineering reference** for the GPU collision plugin. Where the
 rest of the tutorial *explains*, this file *enumerates*: every CUDA kernel that
@@ -12,7 +12,7 @@ Everything here is grounded in
 given so you can open the source and read along; they may drift by a few lines
 as the file changes, but the function/kernel names are stable.
 
-If you have not read [07_phase3_kernels.md](07_phase3_kernels.md) yet, read it
+If you have not read [09_the_kernels.md](09_the_kernels.md) yet, read it
 first — it teaches the *idea* of each kernel with pictures. This file is the
 dense lookup table you come back to.
 
@@ -27,7 +27,7 @@ per scene with flags), but they **all share the same broad cull machinery** — 
 uniform grid of cells, into which triangles are bucketed, from which candidate
 pairs are emitted. The narrow kernel then runs one thread per candidate pair.
 The whole thing is designed so the **CPU never waits for the GPU** (see
-[10_phase4_sync_and_output.md](10_phase4_sync_and_output.md)).
+[12_sync_and_output.md](12_sync_and_output.md)).
 
 ```text
                  INPUT: two triangle meshes (or a point cloud + a mesh),
@@ -112,7 +112,7 @@ the dense-grid path.)
 > memset), **compact** bucket storage (mark → compact → fill), generate only
 > **mixed** buckets, **one block per bucket** (no binary search), **32-bit** pair
 > encoding. Then a second round (see
-> [reports/hash_micro_optimizations_20260617.md](../reports/hash_micro_optimizations_20260617.md)):
+> [reports/archive_pre_20260618/hash_micro_optimizations_20260617.md](../reports/archive_pre_20260618/hash_micro_optimizations_20260617.md)):
 > **dropped the now-vestigial CUB scan** (13→11 launches), added a **cheap AABB
 > pre-reject** in the FBP kernel, and wrapped the whole 11-kernel sequence in a
 > **CUDA Graph** (captured once, replayed each frame — default on,
@@ -136,7 +136,7 @@ The optimised hash path launches **more, smaller** kernels (13 vs the dense 7),
 but each does far less work — the per-frame full memset, the Thrust allocation,
 and the per-pair binary search are gone — so its kernel time is **2.5–3× lower**
 than the dense grid on a large tissue (see
-[reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md)).
+[reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md](../reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md)).
 Launch count is a poor proxy for cost here; trust the measured kernel time.
 
 ---
@@ -285,7 +285,7 @@ closest to a face of B; `FaceVertex` = a vertex of B closest to a face of A;
 `EdgeEdge` = the closest points lie on an edge of each. The barycentrics are
 always written in `(a0,a1,a2,b0,b1,b2)` order; unused weights are zero. This is
 exactly what a constraint solver needs to apply a response without re-deriving
-the geometry. The math behind it is in [08_the_math.md](08_the_math.md).
+the geometry. The math behind it is in [10_the_math.md](10_the_math.md).
 
 ---
 
@@ -305,7 +305,7 @@ grid exactly: `blocks = ceil(count / 256)`.
 ### 7.2 Over-launched grid-stride kernels (size known only on the GPU)
 The candidate-pair count is computed *on the GPU* during generation. Reading it
 back to size the narrow launch would force a CPU↔GPU sync and kill the
-[no-wait fast path](10_phase4_sync_and_output.md). So instead the narrow kernel
+[no-wait fast path](12_sync_and_output.md). So instead the narrow kernel
 launches a **fixed** `<<<1024, 256>>>` = **262,144 threads** and each thread
 grid-strides:
 
@@ -363,7 +363,7 @@ only touched dedup slots, generates only mixed buckets, and does no per-pair bin
 search. Measured **0.5–0.7 ms kernel vs ~1.8–2.1 ms dense**, identical contacts.
 Why still off by default: in the small-tool regime the Phase-15 active-cell dense
 path is already ~8 µs, so the hash build stages aren't worth it. Numbers:
-[reports/hash_optimized_broadphase_20260617.md](../reports/hash_optimized_broadphase_20260617.md).
+[reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md](../reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md).
 
 ---
 
@@ -379,8 +379,8 @@ path is already ~8 µs, so the hash build stages aren't worth it. Numbers:
 ---
 
 ### See also
-- [07_phase3_kernels.md](07_phase3_kernels.md) — the kernels with pictures and intuition.
-- [08_the_math.md](08_the_math.md) — the VF/FV/EE closest-feature geometry.
+- [09_the_kernels.md](09_the_kernels.md) — the kernels with pictures and intuition.
+- [10_the_math.md](10_the_math.md) — the VF/FV/EE closest-feature geometry.
 - [06_the_dense_grid.md](06_the_dense_grid.md) — the grid data structure with a worked numeric example.
 - [00_high_level_flow.md](00_high_level_flow.md) — the easy top-to-bottom story.
 - `guide/architecture.md` — the canonical reference doc.

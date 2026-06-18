@@ -39,7 +39,7 @@ Each frame, the collision narrow phase is measured **two different ways at once*
 1. **Wall time** — a CPU stopwatch (`std::chrono`) around the call to
    `endNarrowPhase`. This is *orchestration* time: how long the CPU spent
    issuing the work. Because the fast path issues GPU kernels **without waiting**
-   for them (see [tutorial/10](../tutorial/10_phase4_sync_and_output.md)), this
+   for them (see [tutorial/10](../tutorial/12_sync_and_output.md)), this
    wall time does **not** include the GPU actually finishing — it's mostly the
    cost of setting up and launching.
 
@@ -111,7 +111,7 @@ as `—` / not read, because reading them would force a CPU↔GPU sync.
   VF = a vertex of mesh A nearest a face of mesh B; FV = the reverse; EE = the
   closest points lie on an edge of each. The narrow kernel runs 6 VF + 9 EE tests
   per triangle pair and keeps the single closest. (Full geometry:
-  [tutorial/08](../tutorial/08_the_math.md).) The three always sum to the total.
+  [tutorial/08](../tutorial/10_the_math.md).) The three always sum to the total.
 - **These counts are the correctness fingerprint.** Two runs of the *same*
   geometry must produce *identical* VF/FV/EE numbers. That's how we prove the
   hash broad cull is equivalent to the dense one (same `2354 = 1119/428/807`) and
@@ -182,8 +182,8 @@ have materialized all `32,768` cells regardless.
 
 Seeing `0 / 0` here is the evidence for the zero-copy claim: the collision runs
 entirely on the simulation's existing GPU buffers, copying nothing each frame.
-(Detail: [tutorial/05](../tutorial/05_phase2_narrow_prep.md) and
-[tutorial/10](../tutorial/10_phase4_sync_and_output.md).)
+(Detail: [tutorial/05](../tutorial/05_zero_copy_prep.md) and
+[tutorial/10](../tutorial/12_sync_and_output.md).)
 
 ---
 
@@ -252,5 +252,5 @@ When a report shows two legs (e.g. `dense` vs `hash`, or `today` vs
 - **Kernel time vs wall time** — GPU-clock measurement of the kernel vs CPU-clock measurement of orchestration. Trust kernel time.
 
 For the deeper, tutorial-style version of all of this, see
-[tutorial/11_profiling.md](../tutorial/11_profiling.md) and the new
+[tutorial/14_benchmark_metrics.md](../tutorial/14_benchmark_metrics.md) and the new
 [tutorial/00_high_level_flow.md](../tutorial/00_high_level_flow.md).

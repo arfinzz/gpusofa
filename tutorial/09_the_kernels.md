@@ -1,10 +1,10 @@
-# 07 — Phase 3: The CUDA Kernel Cascade
+# 09 — The CUDA kernel cascade (building the grid & resolving contacts)
 
 This is the GPU's actual work. The narrow phase dispatches to a backend function
 in `cuda/GpuCollisionBackend.cu`, which launches a sequence of kernels. We'll
 trace the **feature-based proximity (FBP)** path, which runs 7 kernel launches +
 1 `cudaMemset`. (The legacy exact-contact path is the same minus the last two
-launches; the vertex-triangle paths are file 09.)
+launches; the vertex-triangle paths are file 11.)
 
 Remember from file 01: a kernel launch runs thousands of threads in parallel,
 and it's **non-blocking** — the CPU fires it and moves on.
@@ -23,13 +23,13 @@ The 7 operations, in order:
 
 (Operation 5 is `generateActive...` when `useToolActiveCellGeneration` is on,
 which is the default. With it off, the same slot runs the all-cells
-`generateDenseGridUniqueCandidatePairsKernel` instead — see §7.4.)
+`generateDenseGridUniqueCandidatePairsKernel` instead — see §9.4.)
 
 Let's take them one at a time.
 
 ---
 
-## 7.1 Kernel 1 — `resetDenseGridKernel`
+## 9.1 Kernel 1 — `resetDenseGridKernel`
 
 **Job:** wipe the grid clean so this frame starts fresh. Last frame's triangle
 counts must be zeroed.
@@ -58,7 +58,7 @@ about **2.5 microseconds** — basically free.
 
 ---
 
-## 7.2 Operation 2 — `cudaMemset` on the hash table
+## 9.2 Operation 2 — `cudaMemset` on the hash table
 
 **Job:** clear the deduplication hash table to "all empty."
 
@@ -80,7 +80,7 @@ max candidate count keeps it sparse so hash collisions are rare.
 
 ---
 
-## 7.3 Kernels 3 & 4 — `insertIndexedTrianglesKernel`
+## 9.3 Kernels 3 & 4 — `insertIndexedTrianglesKernel`
 
 **Job:** put every triangle into the cells it overlaps (the process from file
 06). Run once for tissue, once for the blade.
@@ -173,7 +173,7 @@ empty cells.
 
 ---
 
-## 7.4 Kernel 5 — candidate generation (active-cell, by default)
+## 9.4 Kernel 5 — candidate generation (active-cell, by default)
 
 **Job:** for each mixed cell, form candidate pairs and deduplicate them.
 
@@ -191,7 +191,7 @@ This kernel has two variants, and which one runs depends on
 **Default launch shape:** a fixed 1,024 blocks, 256 threads each. The kernel
 reads the active-cell count *from GPU memory* and grid-strides over it, so the
 CPU never needs to know how many active cells there are (no readback, no sync —
-same idea as the over-launch in §7.6).
+same idea as the over-launch in §9.6).
 
 ```cpp
 generateActiveDenseGridUniqueCandidatePairsKernel<<<1024, 256>>>(grid,
@@ -248,7 +248,7 @@ A/B; `guide/plan.md` §5.15).
 
 > **A correctness note from the field.** When this optimization was added, a
 > large-scene A/B (a subdivided blade producing 322,560 candidate pairs)
-> revealed a *separate* latent bug in kernel 7 — see §7.6. The active-cell
+> revealed a *separate* latent bug in kernel 7 — see §9.6. The active-cell
 > change was correct; it just exposed something else.
 
 ### Encoding a pair into one number
@@ -316,7 +316,7 @@ After this kernel: `candidatePairs` holds the ~624 unique pairs, and
 
 ---
 
-## 7.5 Kernel 6 — `resetProximityCountersKernel`
+## 9.5 Kernel 6 — `resetProximityCountersKernel`
 
 **Job:** zero the contact output counters before the math kernel writes to them.
 
@@ -334,12 +334,12 @@ __global__ void resetProximityCountersKernel(contactCount, overflowCount,
 ```
 
 `vfCount`, `fvCount`, `eeCount` track how many contacts of each *feature type*
-were found (Vertex-Face, Face-Vertex, Edge-Edge — explained in file 08).
+were found (Vertex-Face, Face-Vertex, Edge-Edge — explained in file 10).
 Trivial cost.
 
 ---
 
-## 7.6 Kernel 7 — `featureBasedProximityKernel` (the math)
+## 9.6 Kernel 7 — `featureBasedProximityKernel` (the math)
 
 **Job:** for each candidate pair, compute the exact closest geometry and emit a
 contact if they're within `contactDistance`. This is the mathematical core; file
@@ -376,7 +376,7 @@ This is a **grid-stride loop**, and it does two jobs at once:
    `pairCount` from GPU memory and only the threads with `idx < pairCount` do
    work. The CPU never learns the count, so there's no readback and no stall.
    This is what took the FBP path from 109 FPS (with the readback) to ~940 FPS
-   (without) — together with the active-cell generation of §7.4.
+   (without) — together with the active-cell generation of §9.4.
 
 2. **Correctness at any scale.** This is the important part, and it was a real
    bug for a while. The grid is a fixed 1,024 blocks × 256 = 262,144 threads.
@@ -400,7 +400,7 @@ const std::uint32_t bIdx = pair & 0xffffffff;   // blade triangle ID
 const DeviceTriangle ta = indexedTriangleAt(firstPositions, firstIndices, aIdx);
 const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
 
-// 6 vertex-face tests + 9 edge-edge tests (file 08), keep the closest
+// 6 vertex-face tests + 9 edge-edge tests (file 10), keep the closest
 // ... find bestDistSq, bestKind, bestPoints, bestBarycentrics ...
 
 if (bestDistSq > contactDistance * contactDistance) continue;   // too far → next pair
@@ -421,7 +421,7 @@ rather than exiting.
 
 ---
 
-## 7.7 The whole cascade, with timings
+## 9.7 The whole cascade, with timings
 
 Putting it together for the one-tissue/one-blade FBP run (validation mode,
 where the kernel time is actually measured), **with the default active-cell
@@ -457,7 +457,7 @@ validation run that does sync, so the per-kernel times are observable.)
 
 ---
 
-## 7.8 Summary of Phase 3
+## 9.8 Summary of Phase 3
 
 ```text
 The backend launches 7 GPU operations, all non-blocking:
@@ -473,4 +473,4 @@ Result: ~624 contacts' worth of geometry evaluated, contacts written to VRAM.
 
 The one piece we deferred is *what the math kernel actually computes* — the
 closest-feature geometry and barycentric weights. That's the next file. Go to
-[08_the_math.md](08_the_math.md).
+[10_the_math.md](10_the_math.md).

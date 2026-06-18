@@ -1,4 +1,4 @@
-# 14 — Every optimization, explained (the ones that worked *and* the ones that didn't)
+# 16 — Every optimization, explained (the ones that worked *and* the ones that didn't)
 
 This is the exhaustive tour of **how this project got fast**, and just as
 importantly, **what we tried that did NOT work** — so nobody burns a day
@@ -48,7 +48,7 @@ biggest reason the benchmark hits hundreds-to-thousands of FPS.
 > `narrow_wall` measures only *orchestration* (kernel launches), not GPU
 > completion; GPU compute overlaps the next frame. Readback is opt-in
 > (`proximityReadContactCounter`, ~one sync/frame) only for validation. See
-> [10_phase4_sync_and_output.md](10_phase4_sync_and_output.md).
+> [12_sync_and_output.md](12_sync_and_output.md).
 
 ### A2 — Zero-copy (read the simulation's own GPU memory)
 **Easy:** The tissue's vertex positions already live on the GPU (SOFA put them
@@ -304,4 +304,4 @@ fix is to **reduce the number of loads**, not add warps:
 
 Full current numbers + every scene: `reports/performance_and_optimizations_20260618.md`.
 The kernel/data-structure reference (launch shapes, thread allocation):
-[13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md).
+[17_kernels_reference.md](17_kernels_reference.md).

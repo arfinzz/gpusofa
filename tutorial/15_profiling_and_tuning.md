@@ -1,10 +1,10 @@
 # 15 — Profiling & tuning: how we decide what to optimize
 
-[11_profiling.md](11_profiling.md) explains the per-frame **benchmark CSV** (FPS,
+[14_benchmark_metrics.md](14_benchmark_metrics.md) explains the per-frame **benchmark CSV** (FPS,
 kernel time, contact counts). This file goes one level deeper: **how to find the
 real bottleneck inside a kernel** with Nsight, and how to read it so you optimize
 the right thing — the exact process that produced the wins *and* the dead ends in
-[14_optimizations.md](14_optimizations.md).
+[16_optimizations_and_dead_ends.md](16_optimizations_and_dead_ends.md).
 
 ---
 
@@ -84,7 +84,7 @@ flowchart TD
 **Current FBP kernel stalls:** `long_scoreboard 2.4` + **`lg_throttle 1.85`** +
 `wait 1.88`. The `lg_throttle` (red box) is the killer insight: the **load/store
 unit is saturated**, so adding warps makes contention *worse*. That's exactly why
-the occupancy "optimization" regressed ([14 §F1](14_optimizations.md)). The fix
+the occupancy "optimization" regressed ([14 §F1](16_optimizations_and_dead_ends.md)). The fix
 the data points to is **fewer loads** (pack triangles), not more warps.
 
 ---
@@ -140,3 +140,7 @@ scripts/run_report_bench_wsl.sh
 Metric definitions: [reports/README_metrics_explained.md](../reports/README_metrics_explained.md).
 The current numbers + the full bottleneck analysis:
 `reports/performance_and_optimizations_20260618.md`.
+
+Next: armed with how to *find* a bottleneck, here is the catalogue of every optimization
+we actually applied — and the ones that were tried and **failed**, so you don't retry
+them. Go to [16_optimizations_and_dead_ends.md](16_optimizations_and_dead_ends.md).

@@ -1,4 +1,4 @@
-# 12 — Glossary & Cheat-Sheet
+# 18 — Glossary & cheat-sheet
 
 Every term used in this tutorial, defined in one place. Skim it once, then come
 back when a word trips you up.
@@ -333,7 +333,7 @@ and closest-points-between-segments, implemented as device functions.
 
 For comparison, the **large-tissue/subdivided-blade** scene: 79,520 collision
 elements, ~322,560 candidate pairs, 8,018 contacts (5397 VF / 880 FV / 1741 EE),
-~116 FPS. This scene is what exercises the grid-stride loop (file 07 §7.6).
+~116 FPS. This scene is what exercises the grid-stride loop (file 09 §9.6).
 
 ---
 

@@ -1,4 +1,4 @@
-# 04 — Phase 1: The Broad Phase
+# 04 — The broad phase (which objects are near?)
 
 The clock ticks. `DefaultAnimationLoop::step()` runs, and it calls
 `CollisionPipeline::computeCollisionDetection()`, which calls your broad phase.
@@ -125,7 +125,7 @@ phase emits a pair where *both sides are the same model* — `(cm, cm)`. This is
 how an object gets checked against itself (think tissue folding onto itself).
 
 Our benchmark uses `selfCollision=False`, so this doesn't fire here. But it's
-the trigger for the vertex-triangle self-collision path in file 09 — remember
+the trigger for the vertex-triangle self-collision path in file 11 — remember
 this line.
 
 ---
@@ -159,4 +159,4 @@ GPU:    none used in this scene (culling is off)
 The broad phase handed the narrow phase a single pair. Now the narrow phase has
 to do the real work: take that pair and find the exact contacts. But first it
 has to get the triangle data ready for the GPU — without copying it. That's
-Phase 2. Go to [05_phase2_narrow_prep.md](05_phase2_narrow_prep.md).
+Phase 2. Go to [05_zero_copy_prep.md](05_zero_copy_prep.md).

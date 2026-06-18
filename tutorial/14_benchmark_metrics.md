@@ -1,4 +1,4 @@
-# 11 — Profiling: How the Stopwatch Works
+# 14 — Benchmark metrics: how the stopwatch works
 
 The whole point of the benchmark is to *measure* speed. This file explains how
 the timing is captured and what every number in the output means. Two files do
@@ -10,7 +10,7 @@ the work:
 
 ---
 
-## 11.1 The two clocks: wall time vs kernel time
+## 14.1 The two clocks: wall time vs kernel time
 
 There are two fundamentally different ways to measure GPU work, and confusing
 them is the #1 beginner mistake.
@@ -28,7 +28,7 @@ stageSnapshot.wallMilliseconds =
         std::chrono::steady_clock::now() - phaseStart).count();
 ```
 
-**Important:** because the CPU doesn't wait for the GPU (file 10), wall time
+**Important:** because the CPU doesn't wait for the GPU (file 12), wall time
 measures *CPU orchestration only*. It does NOT include the GPU compute that
 overlaps the next frame. In the fast path, `narrow_wall_ms ≈ 0.56` is the cost
 of extracting surfaces, building config, and issuing launches — not the kernels.
@@ -69,7 +69,7 @@ the CPU orchestration is lean.
 
 ---
 
-## 11.2 The accumulator — `GpuPipelineProfiling`
+## 14.2 The accumulator — `GpuPipelineProfiling`
 
 Each frame, the broad phase and narrow phase each fill a `StageSnapshot` (a
 struct of ~50 numbers — timings, byte counts, contact counts) and hand it to:
@@ -87,7 +87,7 @@ cheap insurance).
 
 ---
 
-## 11.3 The controller — writing the CSV and summary
+## 14.3 The controller — writing the CSV and summary
 
 `GpuPipelineBenchmarkController` is a SOFA component that listens for animation
 events:
@@ -126,7 +126,7 @@ For a run labeled `gpu_one_tissue_one_blade_dense_grid_benchmark`, you get:
 
 ---
 
-## 11.4 The summary fields, decoded
+## 14.4 The summary fields, decoded
 
 Open a `_summary.txt` and here's what each line means. (Run
 `scripts/peek_fbp_summary.sh <run-dir>` to print the headline ones.)
@@ -175,7 +175,7 @@ Note: with the default active-cell generation, the unique-candidate and contact
 counts are **identical** to the all-cells path — the optimization changes which
 cells are scanned, not which pairs survive. If a code change makes these numbers
 drift between the flag on/off, that's the correctness alarm bell (it's how the
-Phase 17 grid-stride bug was caught — file 07 §7.6).
+Phase 17 grid-stride bug was caught — file 09 §9.6).
 
 The contact-count fields are **0 in the fast path** because counters aren't read
 back. You only see real values in validation mode
@@ -183,7 +183,7 @@ back. You only see real values in validation mode
 
 ---
 
-## 11.5 Reading a real summary
+## 14.5 Reading a real summary
 
 Here's an annotated excerpt from the verified fast-path run (active-cell
 generation default-on):
@@ -205,7 +205,7 @@ And the validation run that actually counts contacts:
 ```text
 avg_fps=475.1                       ← slower: one sync per frame
 avg_narrow_output_contact_count=56  ← 56 contacts found
-avg_narrow_ee_contact_count=56      ← all of them edge-edge (file 08 explains why)
+avg_narrow_ee_contact_count=56      ← all of them edge-edge (file 10 explains why)
 avg_narrow_vf_contact_count=0
 avg_device_to_host_bytes=64         ← the counter readback
 ```
@@ -216,7 +216,7 @@ fast path keeps everything on the device.
 
 ---
 
-## 11.6 Nsight — the deep profiler
+## 14.6 Nsight — the deep profiler
 
 For per-kernel internals (occupancy, memory throughput, register usage), the CSV
 isn't enough; you need NVIDIA's **Nsight Compute**. The script
@@ -243,7 +243,7 @@ each kernel take that long?" (Nsight).
 
 ---
 
-## 11.7 Why measure this way at all?
+## 14.7 Why measure this way at all?
 
 The deepest lesson of the profiling design: **the thing you measure changes the
 thing you measure.** Asking the GPU for results (a readback) forces a sync, which
@@ -261,7 +261,7 @@ FPS, when the production path is actually ~940.
 
 ---
 
-## 11.8 Summary
+## 14.8 Summary
 
 ```text
 Wall time (chrono) = CPU orchestration; doesn't include overlapping GPU work.
@@ -274,5 +274,6 @@ Contact counts only appear in validation mode (readback on).
 Nsight Compute answers the "why" that the CSV can't.
 ```
 
-That completes the per-frame story. The last file is a glossary you can come
-back to. Go to [12_glossary.md](12_glossary.md).
+Now you can read a CSV line. Next: how to find *why* a kernel is slow — using
+Nsight, stall reasons, and why FPS lies. Go to
+[15_profiling_and_tuning.md](15_profiling_and_tuning.md).

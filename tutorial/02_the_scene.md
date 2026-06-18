@@ -283,7 +283,7 @@ Each object has exactly three components — this trio is the whole story:
    pointer later.
 
 - `selfCollision=False` — don't check the tissue against itself. (Setting this
-  `True` is how you'd trigger the self-collision path in file 09.)
+  `True` is how you'd trigger the self-collision path in file 11.)
 
 ---
 
@@ -322,4 +322,4 @@ for this scene:
 
 The next files walk through each of those steps in detail. We start before the
 clock even ticks — the one-time setup. Go to
-[03_phase0_setup.md](03_phase0_setup.md).
+[03_setup_and_data_path.md](03_setup_and_data_path.md).

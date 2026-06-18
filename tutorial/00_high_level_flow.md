@@ -80,7 +80,7 @@ the "level file." Tour of one such file:
 Before looking at triangles, SOFA asks a coarser question: do the two *objects'*
 bounding boxes even overlap? If the tool is across the room from the tissue,
 stop here. This is the classic "broad phase."
-Details: [04_phase1_broad_phase.md](04_phase1_broad_phase.md).
+Details: [04_broad_phase.md](04_broad_phase.md).
 
 ### 3. Broad cull — candidate triangle pairs
 Here's the clever part. Imagine laying an egg-carton **grid** of boxes over the
@@ -95,9 +95,11 @@ comparisons down to a few thousand real ones.
 - A neat optimization (Phase 15): in surgery the tool is small and only touches
   ~30 boxes, so we only bother generating pairs from *those* boxes — a 4×
   speedup. Same file.
-- An **alternative** grid for when *both* meshes are big — a spatial **hash** +
-  prefix-sum — lives behind an off-by-default switch and is explained in
-  [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md) §8.
+- An **alternative** grid for when *both* meshes are big — a spatial **hash**
+  that materialises only occupied cells — lives behind an off-by-default switch.
+  The idea *and exactly what kind of hashing it uses* is
+  [07_the_hash_broad_cull.md](07_the_hash_broad_cull.md); the six tricks + CUDA
+  graphs that make it ~4× faster are [08_optimising_the_hash.md](08_optimising_the_hash.md).
 
 ### 4. Narrow phase — exact contacts
 Now the GPU does the real geometry. It launches one **thread** (tiny worker) per
@@ -108,10 +110,10 @@ direction. If they're within the contact distance, the thread writes a
 pairs are resolved simultaneously.
 
 - The geometry math (closest points, barycentric weights):
-  [08_the_math.md](08_the_math.md).
-- The kernels that do it, with pictures: [07_phase3_kernels.md](07_phase3_kernels.md).
+  [10_the_math.md](10_the_math.md).
+- The kernels that do it, with pictures: [09_the_kernels.md](09_the_kernels.md).
 - A second flavor handles **points vs triangles** (self-collision and
-  point-cloud tools): [09_vertex_triangle.md](09_vertex_triangle.md).
+  point-cloud tools): [11_vertex_triangle.md](11_vertex_triangle.md).
 
 ### 5. The result, and the speed secret
 The contacts are left **in GPU memory** — they are *not* copied back to the CPU
@@ -120,7 +122,7 @@ the CPU **issues** all this GPU work and then **moves on without waiting** for i
 to finish. The GPU computes the frame's collisions while the CPU is already
 setting up the next frame. Avoiding that wait is what makes the benchmark hit
 hundreds-to-thousands of frames per second.
-Why and how: [10_phase4_sync_and_output.md](10_phase4_sync_and_output.md).
+Why and how: [12_sync_and_output.md](12_sync_and_output.md).
 
 ---
 
@@ -138,7 +140,7 @@ geometry differs:
 | **Vertex-triangle, cross** | a point-cloud tool vs a tissue mesh | cloud points vs mesh triangles |
 
 Full breakdown with kernels, inputs, outputs, and thread counts:
-[13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md).
+[17_kernels_reference.md](17_kernels_reference.md).
 
 ---
 
@@ -155,7 +157,7 @@ The benchmark writes a CSV of timings every frame. Two numbers matter most:
 
 When you compare two approaches, trust the **kernel time** first and treat
 absolute FPS as a fuzzy guide. Every number in the CSV is defined in
-[11_profiling.md](11_profiling.md) and in the reports' companion file
+[14_benchmark_metrics.md](14_benchmark_metrics.md) and in the reports' companion file
 [reports/README_metrics_explained.md](../reports/README_metrics_explained.md).
 
 ---
@@ -172,7 +174,7 @@ flowchart TD
     CT --> CSV["CPU writes a timing line to CSV<br/>— and never waited for the GPU"]
 
     BC -. "default: dense grid + Phase 15" .-> D1[ ]
-    BC -. "opt-in for big tissues: spatial hash<br/>(~4× faster, see tutorial 14)" .-> D2[ ]
+    BC -. "opt-in for big tissues: spatial hash<br/>(~4× faster, see tutorial 07–08)" .-> D2[ ]
     style BC fill:#dff,stroke:#0aa
     style NP fill:#fdd,stroke:#a00
 ```
@@ -180,7 +182,7 @@ flowchart TD
 The **blue** box (broad cull) is where most of this project's optimization effort
 went — so successfully that the **red** box (narrow phase) is now the slowest part.
 The whole story of how each box got fast (and the things we tried that *didn't*
-work) is in **[14_optimizations.md](14_optimizations.md)**; how we *find* the
+work) is in **[16_optimizations_and_dead_ends.md](16_optimizations_and_dead_ends.md)**; how we *find* the
 bottleneck is in **[15_profiling_and_tuning.md](15_profiling_and_tuning.md)**.
 
 ## Where to go next
@@ -188,9 +190,9 @@ bottleneck is in **[15_profiling_and_tuning.md](15_profiling_and_tuning.md)**.
 - New and want the *why-it's-built-this-way* lesson, in order? Start at
   [01_foundations.md](01_foundations.md) and read through.
 - Want **every optimization** explained (easy + hard, including the failed ones)?
-  [14_optimizations.md](14_optimizations.md).
+  [16_optimizations_and_dead_ends.md](16_optimizations_and_dead_ends.md).
 - Want the *exact* kernels, data structures, and thread counts?
-  [13_kernels_and_data_structures_reference.md](13_kernels_and_data_structures_reference.md).
+  [17_kernels_reference.md](17_kernels_reference.md).
 - Want to know how to **profile and tune** a kernel yourself?
   [15_profiling_and_tuning.md](15_profiling_and_tuning.md).
 - Want the canonical engineering reference (not a tutorial)? See
