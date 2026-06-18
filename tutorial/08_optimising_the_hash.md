@@ -51,6 +51,8 @@ flowchart LR
     CO --> FI["FILL<br/>put triangle ids in buckets"]
 ```
 
+![Mark, compact, fill — occupied cells become a dense, occupancy-sized set of buckets](assets/hash/03_mark_compact_fill.svg)
+
 ## Trick 2 — Generate only *mixed* buckets
 
 **Easy:** A bucket with only tissue (or only tool) can't produce a contact — skip it.
@@ -82,6 +84,8 @@ threads just split that bucket's `tissue × tool` pairs by plain division. No se
 > Removes a `log(buckets)` binary search **per candidate pair** and gives clean
 > per-block memory locality.
 
+![One block per bucket recovers each pair by divide and modulo — no binary search](assets/hash/04_block_per_bucket.svg)
+
 ## Trick 4 — Clear only the dedup slots you *touched*
 
 **Easy:** The duplicate-pair table has millions of slots; only a few thousand are used
@@ -94,6 +98,33 @@ slots you used and wipe **only those** next time.
 > frame (and any table resize) does one full `cudaMemset`, guarded by
 > `*PairHashKeysInitialized`.
 
+### The pair-dedup table and "touched" slots, in detail
+
+This is the part people ask about most, so here it is in full.
+
+**What the table is for.** A triangle can straddle several grid cells, so the *same*
+candidate pair `(tissueId, toolId)` is generated from every cell the two triangles
+share. We want it emitted exactly **once**. The fix is a second open-addressing hash
+table, `pairHashKeys`, keyed by the packed pair: the first thread to claim a pair's slot
+writes it to the output array; later threads that hash to the same pair find their key
+already present (`prev == pair`) and silently skip.
+
+![Why the pair-dedup table exists — a shared pair generated twice is kept once](assets/hash/b1_why_dedup_table.svg)
+
+**What "touched" means.** That dedup table is huge — sized to `nextPow2(maxPairs × 2)`,
+i.e. millions of slots — but only a few thousand are claimed in any one frame. Wiping all
+of it every frame is wasted bandwidth. So the *tracked* insert does one extra thing: each
+time it claims a slot it appends that slot's **index** to a small list,
+`touchedPairHashSlots` (with a counter `touchedPairHashCount`). A "touched" slot is simply
+**a slot this frame wrote to** — nothing more.
+
+Next frame, `clearTouchedPairHash{32,64}Kernel` walks only that little list and resets
+just those slots back to `EMPTY`, instead of a multi-million-slot `cudaMemset`. Every
+other slot is left untouched because it was never written. (The very first frame, and any
+table resize, still does one full `cudaMemset`, guarded by `*PairHashKeysInitialized`.)
+
+![What touched pair-hash slots mean, across two frames](assets/hash/b2_touched_pair_slots.svg)
+
 ## Trick 5 — 32-bit compact pair encoding
 
 **Easy:** If both meshes have fewer than 65,536 triangles, a pair `(tissueId, toolId)`
@@ -103,6 +134,8 @@ the dedup table.
 > **Hard:** `useCompactCandidatePairs = (firstTris ≤ 65535 && secondTris ≤ 65535)`
 > selects `encodeCompactCandidatePair` (16+16 → 32) and the `…32Kernel` variants;
 > otherwise it falls back to 64-bit cleanly.
+
+![Clear only the touched dedup slots, and pack a pair into 32 bits](assets/hash/05_touched_clear_and_32bit.svg)
 
 ## Trick 6 — Dropping the prefix-sum scan *(a cleanup that became a speedup)*
 
@@ -141,6 +174,47 @@ flowchart LR
     F2 --> F2
 ```
 
+![Drop the unused scan (13 → 11 kernels) and replay the sequence as a CUDA graph](assets/hash/06_scan_drop_and_cuda_graph.svg)
+
+---
+
+## A full worked trace — every variable, step by step
+
+To make the build concrete, here is a tiny scene traced through the pipeline with the
+actual workspace arrays shown at each step. The scene: two tissue triangles (`T0`, `T1`)
+and two tool triangles (`U0`, `U1`), where `T0` and `U0` each straddle **two** cells —
+which is exactly what creates a duplicate pair for the dedup table to catch.
+
+**Step 0 — the input.**
+
+![Trace input — two tissue and two tool triangles, some sharing cells](assets/hash/c0_trace_input.svg)
+
+**Step 1 — after `mark`.** Each occupied cell (2, 5, 9) `atomicCAS`-claims a slot in
+`cellKeys`; every other slot stays `EMPTY`.
+
+![Trace after mark — the cellKeys table](assets/hash/c1_trace_mark.svg)
+
+**Step 2 — after `compact`.** `atomicAdd` gives each claimed slot a dense bucket index, so
+the three cells become buckets `b0`, `b1`, `b2` and `occupiedBucketCount = 3`.
+
+![Trace after compact — dense bucket ids](assets/hash/c2_trace_compact.svg)
+
+**Step 3 — after `fill`.** Triangle ids drop into their buckets. `b0` and `b1` each hold
+both a tissue and a tool triangle, so they join `mixedBucketIds`; `b2` (tool only) is
+skipped.
+
+![Trace after fill — per-bucket arrays and the mixed list](assets/hash/c3_trace_fill.svg)
+
+**Step 4 — `generate` + dedup.** The two mixed buckets emit three raw pairs. `(T0,U0)` is
+produced from both `b0` and `b1`; the second copy hits an already-claimed `pairHashKeys`
+slot and is skipped. Two unique pairs survive, and the two claimed slots are recorded in
+`touchedPairHashSlots` (so the next frame can clear exactly them).
+
+![Trace generate and dedup — raw pairs in, unique pairs and touched slots out](assets/hash/c4_trace_generate_dedup.svg)
+
+The narrow FBP kernel then consumes `candidatePairs` exactly as it would from the dense
+grid — which is why the contacts come out **bit-identical**.
+
 ---
 
 ## Which broad cull wins, and when?
@@ -168,6 +242,8 @@ Large tissue + large tool (14,368 elements), narrow **kernel** time, bit-identic
 | Spatial hash (2026-06-09, pre-opt) | ~1.27 ms | 1.2× |
 | + compact buckets / mixed-only / no-binary-search / scan-drop | ~0.41 ms | ~3.6× |
 | **+ CUDA graphs (current)** | **~0.35 ms** | **~4.2×** |
+
+![Narrow-kernel time across the four legs — 1.48 ms dense down to 0.35 ms](assets/hash/07_scoreboard.svg)
 
 Next: the **narrow phase** — the geometry that turns a candidate pair into a contact →
 [09_the_kernels.md](09_the_kernels.md) and [10_the_math.md](10_the_math.md). The full

@@ -61,8 +61,10 @@ chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 > `guide/architecture.md` and `guide/plan.md` are the terse engineering references.
 
 > **Diagrams.** Chapters 00, 07, 08, 13, 15, 16 use ```mermaid``` blocks — they render as
-> real flowcharts on GitHub, VS Code, and most markdown viewers. Other chapters use
-> plain-text diagrams that render anywhere.
+> real flowcharts on GitHub, VS Code, and most markdown viewers. Chapters 07–08 also embed
+> rendered **SVG diagrams** (in [assets/hash/](assets/hash/)) — the step-by-step
+> allocation, hashing, and optimisation walkthroughs, including a full variable-state
+> trace. Other chapters use plain-text diagrams that render anywhere.
 
 ## The one-sentence summary
 

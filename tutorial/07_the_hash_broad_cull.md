@@ -44,6 +44,8 @@ flowchart LR
 The payoff: every per-frame cost (clearing the structure, scanning it, generating
 pairs) now scales with **how much geometry there is**, not with a fixed 32,768.
 
+![Allocation — the dense grid reserves all 32,768 cells; the hash gives a slot only to occupied cells](assets/hash/01_allocation_dense_vs_hash.svg)
+
 ---
 
 ## Part 2 — The hashing, in full detail
@@ -131,6 +133,8 @@ flowchart TD
     C -->|"was a DIFFERENT key"| P["slot = (slot+1) & mask<br/>(linear probe → try next)"]
     P --> C
 ```
+
+![Open-addressing insert — fmix64, mask to a home slot, atomicCAS, linear probe on collision](assets/hash/02_open_addressing_insert.svg)
 
 Three outcomes per `atomicCAS`:
 1. **The slot was EMPTY** → I just claimed it. I'm the first thread to insert this key.
