@@ -996,6 +996,36 @@ all cells, regressed → replaced by Phase 15); `batchTriangleInsert` (breaks
 tissue-before-tool ordering); warp-aggregated atomics (atomics not the bottleneck,
 <2 %). Known perf-neutral leftover: `pairsPerBucket` is write-only after the scan drop.
 
+### 5.22  Simple direct-bucket hash — the "4th way" — LANDED 2026-06-26
+
+A fourth broad-cull path (`useSimpleHashGeneration` / `computeSimpleHashProximityContacts`)
+sits alongside the dense grid (§5.15) and the optimised hash (§5.19–5.20). It stores
+triangles **directly** into per-cell hash buckets in a **single insert pass** — each table
+slot is its own bucket (`bucketCapacity == tableSize`), claimed by `fmix64` + `atomicCAS` +
+linear probe and filled in the same step (`insertSimpleHashTrianglesKernel`). No `mark`, no
+`compact`, no pairs-per-bucket scan: the steady-state sequence is `reset → insert tissue →
+insert tool → generate mixed pairs (deduped) → reset counters → FBP` = **7 kernels** vs the
+optimised hash's 11. It reuses `resetCompactHashGridKernel`, `generateMixedHashCandidatePairs
+{32,64}Kernel` and the FBP kernel unchanged (own `simpleHashGridWorkspace()` instance), and
+has its own CUDA graph (`SOFA_SIMPLE_HASH_CUDA_GRAPH`, default on). Best-effort overflow
+(drops + reports; never triggers on the test scenes, so contacts stay bit-identical).
+
+**Measured (14,368-element scene, validation, back-to-back):** simple hash **0.383 ms**
+kernel (0.350 ms in a second run) vs optimised hash **0.370 ms** vs optimised dense
+**1.858 ms** — i.e. **tied with the optimised hash and ~5× over dense**, contacts identical
+(2354 = 1119/428/807, overflow 0), `unique_pairs=322560` identical. **Conclusion: the
+optimised hash's compaction passes are not where the speedup lives** — storing only occupied
+cells + mixed-bucket generation is, and the simple hash does both more directly. Full data:
+`reports/four_way_broadcull_comparison_20260626.md`.
+
+**Dense CUDA graph — DEFERRED, measured-pointless.** The user asked for graphs in all four
+ways; the two hash paths have them. The dense paths do not, by design: they are
+**compute-bound** (~1.86 ms of kernel work), so the ~30 µs of launch overhead a graph could
+hide is ~1.6 %, and the 4-way table shows dense is 5× slower for structural reasons a graph
+cannot touch. Wrapping the dense broad cull (a large multi-mode function with interleaved
+host timing) in a graph is invasive and risks the baseline for ≈0 gain — same honest call as
+§5.21. Can be added behind an opt-in flag if the capability is wanted regardless.
+
 ---
 
 ## 6. Phase 11/12 follow-ups (landed 2026-05-25)

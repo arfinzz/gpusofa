@@ -9,8 +9,10 @@ the optimised dense grid** — with **bit-identical contacts** (it feeds the sam
 kernel).
 
 It's opt-in: `useHashPrefixSumGeneration=True` (the dense grid is still the default for
-small-tool surgical scenes — see [08_optimising_the_hash.md](08_optimising_the_hash.md)
-for "which wins when").
+small-tool surgical scenes). There are actually **two** spatial-hash broad culls that share
+this same hashing — this optimised one, and a simpler **"4th way"** that stores triangles
+directly with no compaction and *ties it for speed*. Both, and "which wins when", are in
+[08_optimising_the_hash.md](08_optimising_the_hash.md).
 
 This chapter is in two halves:
 - **Part 1** — the idea (easy): a hash table of occupied cells.

@@ -43,6 +43,7 @@ WARMUP_STEPS = int(os.environ.get("SOFA_LARGE_WARMUP_STEPS", "10"))
 
 DETAILED_PROFILING = env_flag("SOFA_GPU_DETAILED_PROFILING", False)
 USE_HASH_PREFIXSUM = env_flag("SOFA_USE_HASH_PREFIXSUM_GENERATION", False)
+USE_SIMPLE_HASH = env_flag("SOFA_USE_SIMPLE_HASH_GENERATION", False)
 HASH_TABLE_SIZE = int(os.environ.get("SOFA_HASH_TABLE_SIZE", "0"))
 USE_TOOL_ACTIVE_CELL_GENERATION = env_flag("SOFA_USE_TOOL_ACTIVE_CELL_GENERATION", True)
 PROXIMITY_READ_CONTACT_COUNTER = env_flag("SOFA_PROXIMITY_READ_CONTACT_COUNTER", True)
@@ -90,6 +91,7 @@ def createScene(root):
         useFeatureBasedProximity=True,
         useToolActiveCellGeneration=USE_TOOL_ACTIVE_CELL_GENERATION,
         useHashPrefixSumGeneration=USE_HASH_PREFIXSUM,
+        useSimpleHashGeneration=USE_SIMPLE_HASH,
         hashTableSize=HASH_TABLE_SIZE,
         proximityComputeBarycentrics=True,
         proximityKeepContactsOnDevice=True,

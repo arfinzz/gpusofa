@@ -30,7 +30,7 @@ chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 | 05 | [Zero-copy data prep](05_zero_copy_prep.md) | Handing mesh data to the GPU without copying anything |
 | 06 | [The dense grid (+ optimised dense, Phase 15)](06_the_dense_grid.md) | The default broad cull, with a fully worked numeric example and the tool-active-cell optimization |
 | 07 | [The spatial-hash broad cull + the hashing in detail](07_the_hash_broad_cull.md) | The alternative for big tissues — and **exactly what kind of hashing** it uses (open addressing, MurmurHash, atomicCAS, linear probing) |
-| 08 | [Optimising the hash](08_optimising_the_hash.md) | The six tricks (compact buckets, no binary search, touched-clear, 32-bit pairs, scan drop) **+ CUDA graphs** that make it ~4× faster than dense |
+| 08 | [Optimising the hash + the 4th way](08_optimising_the_hash.md) | The six tricks (compact buckets, no binary search, touched-clear, 32-bit pairs, scan drop) **+ CUDA graphs** — and the **simple direct-bucket "4th way"** that ties them with 7 kernels instead of 11 |
 
 ### Part III — The narrow phase (exact contacts)
 | # | Chapter | What you'll learn |

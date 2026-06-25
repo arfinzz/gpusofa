@@ -55,6 +55,7 @@ private:
     DataBool d_batchTriangleInsert;
     DataBool d_useToolActiveCellGeneration;
     DataBool d_useHashPrefixSumGeneration;
+    DataBool d_useSimpleHashGeneration;
     DataUInt d_hashTableSize;
     DataBool d_useFeatureBasedProximity;
     DataBool d_useVertexTriangleProximity;       // routes self-collision pairs through computeFeatureBasedVertexTriangleContacts

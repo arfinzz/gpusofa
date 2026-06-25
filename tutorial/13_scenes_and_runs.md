@@ -82,7 +82,7 @@ The fast path is how you'd actually run a simulation. The validation path is how
 
 ---
 
-## The A/B comparison runs (dense vs hash)
+## The A/B comparison runs (dense vs hash vs simple hash)
 
 The `hash_prefixsum_large.py` scene can run with **either** broad cull by flipping
 `SOFA_USE_HASH_PREFIXSUM_GENERATION`, on identical geometry — so you can measure them
@@ -96,17 +96,26 @@ head-to-head. There are three geometry sizes used to show the **regime split**:
 
 **The deciding factor is tissue/occupancy size, not tool size:** hash wins when a large
 fraction of the work comes from a large mesh; dense + Phase 15 wins on genuinely small
-scenes. (Both always produce **identical contacts**.)
+scenes. (All paths always produce **identical contacts**.)
+
+**The 4-way run.** `run_mode_comparison_ab_wsl.sh` runs **all four** broad culls back-to-back
+on the large scene: plain dense, Phase-15 dense, optimised hash, and the simple direct-bucket
+hash (`SOFA_USE_SIMPLE_HASH_GENERATION=1`). Measured (validation): dense plain 2.07 /
+Phase-15 1.86 / optimised hash 0.37 / **simple hash 0.38 ms** narrow kernel — all **2354
+contacts, 0 overflow**. The simple hash ties the optimised hash with a **7-kernel** pipeline
+instead of 11 (see [08_optimising_the_hash.md](08_optimising_the_hash.md) and
+[reports/four_way_broadcull_comparison_20260626.md](../reports/four_way_broadcull_comparison_20260626.md)).
 
 ---
 
 ## The standalone backend bench (no SOFA at all)
 
 `SofaGpuCollisionDenseGridBackendBench` runs the kernels directly on generated geometry,
-with **no SOFA scene** — fastest to iterate and the cleanest correctness check. With
-`SOFA_BACKEND_BENCH_RUN_HASH=1` it runs the hash path too and asserts
-**`hash_contacts == fbp_contacts`** (currently 8018 = 8018, overflow 0) — the proof that
-the hash broad cull and the dense grid feed the same narrow kernel the same pairs.
+with **no SOFA scene** — fastest to iterate and the cleanest correctness check. It runs the
+dense FBP, the optimised hash *and* the simple hash and asserts they all emit the **same**
+contacts: **`hash_contacts == fbp_contacts`** and **`simplehash_contacts == fbp_contacts`**
+(currently 8018 = 8018 = 8018, overflow 0) — proof that all three broad culls feed the same
+narrow kernel the same pairs.
 
 ---
 
@@ -122,13 +131,16 @@ scripts/run_fbp_large_tissue_wsl.sh        # large_tissue_blade
 scripts/run_vertex_triangle_smoke_wsl.sh   # self-collision
 scripts/run_cross_model_vt_smoke_wsl.sh    # cross-model
 
-# Dense vs hash A/B (same scene, both broad culls):
-scripts/run_hash_prefixsum_large_ab_wsl.sh # large tissue + large tool
-scripts/run_mode_comparison_ab_wsl.sh      # plain dense | Phase-15 dense | optimised hash
+# Broad-cull comparison (same scene):
+scripts/run_hash_prefixsum_large_ab_wsl.sh # dense vs optimised hash, large tissue + large tool
+scripts/run_mode_comparison_ab_wsl.sh      # 4-way: plain dense | Phase-15 dense | optimised hash | simple hash
 scripts/run_tiny_ab_wsl.sh                 # the tiny regime (where dense wins)
 
-# Backend parity (no SOFA): prints hash_contacts == fbp_contacts:
-SOFA_BACKEND_BENCH_RUN_HASH=1 ./SofaGpuCollisionDenseGridBackendBench
+# Single way via env (mutually exclusive; the optimised hash wins the tie-break):
+SOFA_USE_SIMPLE_HASH_GENERATION=1 runSofa ... testscenes/hash_prefixsum_large.py
+
+# Backend parity (no SOFA): prints fbp / hash / simplehash contacts must all match:
+SOFA_BACKEND_BENCH_RUN_SIMPLE_HASH=1 ./SofaGpuCollisionDenseGridBackendBench
 
 # One comprehensive report run (suite + mode comparison + ncu + parity):
 scripts/run_report_bench_wsl.sh

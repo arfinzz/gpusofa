@@ -1,4 +1,4 @@
-# 08 — Optimising the hash broad cull (the six tricks + CUDA graphs)
+# 08 — Optimising the hash broad cull (six tricks, CUDA graphs, and the simpler 4th way)
 
 [07_the_hash_broad_cull.md](07_the_hash_broad_cull.md) explained the *idea* (a hash
 table of occupied cells) and the *hashing* (open addressing, MurmurHash `fmix64`,
@@ -217,6 +217,80 @@ grid — which is why the contacts come out **bit-identical**.
 
 ---
 
+## The 4th way — a simpler direct-bucket hash
+
+The optimised hash above is fast, but look at how much *machinery* it took: `mark` →
+`compact` → `fill` is a **three-pass build** just to give each occupied cell a dense bucket
+index before any triangle is stored. A fair question: **is all that compaction actually
+where the speed comes from?** The "simple hash" (the project's `useSimpleHashGeneration`
+path) answers it by **throwing the compaction away** and storing triangles *directly*.
+
+**Easy:** instead of building dense buckets first, let **each hash slot be its own bucket**.
+One pass over the triangles: for every cell a triangle touches, hash the cell to a slot,
+claim it (`atomicCAS` + linear probe), and **append the triangle id right there**. No mark
+pass, no compact pass, no pairs-per-bucket count. Then the *same* mixed-bucket generator and
+the *same* FBP kernel finish the job.
+
+```mermaid
+flowchart TD
+    A["1. clear ONLY touched dedup slots"] --> B["2. reset grid"]
+    B --> C["3. insert tissue<br/>(claim slot + store id, one pass)"]
+    C --> D["4. insert tool<br/>(claim/hit slot + store + flag MIXED)"]
+    D --> E["5. generate: ONE BLOCK PER mixed slot<br/>(divide/modulo, deduped)"]
+    E --> F["6. reset proximity counters"]
+    F --> G["7. FBP narrow kernel"]
+    style C fill:#dff
+    style D fill:#dff
+    style E fill:#dfd
+```
+
+That's **7 kernels**, versus the optimised hash's 11 — the `mark`, `compact` and
+`pairs-per-bucket` passes are all gone. The whole sequence is replayed as its own **CUDA
+graph** (`SOFA_SIMPLE_HASH_CUDA_GRAPH`, default on), exactly like the optimised hash.
+
+> **Hard:** there is exactly **one new kernel** — `insertSimpleHashTrianglesKernel`. Because
+> `bucketCapacity == tableSize`, a slot *is* a bucket, so `tissueIds[slot * maxPerCell +
+> local]` is indexed by slot directly and `generateMixedHashCandidatePairs{32,64}Kernel`
+> works unchanged. The single-pass insert is correct under concurrency because `atomicCAS`
+> makes the slot claim **idempotent**: the first thread for a cell claims the slot, every
+> later thread for the *same* cell follows the same deterministic probe sequence and finds
+> `key == cellId` (a hit) before any empty slot, so all of a cell's triangles converge on one
+> slot. Tissue is inserted before tool (separate launches), so the "this slot just became
+> mixed" test (`first tool triangle && tissueCount[slot] > 0`) fires exactly once per slot.
+
+**Best-effort, by choice.** A cell holding more than `maxTissue/maxToolTrianglesPerCell`
+triangles drops the surplus (counted in `overflowCount`) instead of falling back. But those
+per-cell caps are *identical* to the dense grid and the optimised hash, so on every test
+scene the overflow is **0** and the candidate set — and therefore the contacts — is exactly
+the same.
+
+### Does it actually keep up? (yes)
+
+Measured on the 14,368-element scene, validation mode, all four ways back-to-back on the
+same GPU (so the comparison is thermally fair):
+
+![Four-way broad-cull kernel time — simple hash ties the optimised hash with 7 kernels](assets/hash/08_simple_hash_4way.svg)
+
+| Broad cull | narrow **kernel** | contacts (VF/FV/EE) | overflow | kernels |
+|---|---:|:--|:--:|:--:|
+| baseline dense grid | 2.07 ms | 2354 (1119/428/807) | 0 | 7 |
+| optimised dense (Phase 15) | 1.86 ms | 2354 (1119/428/807) | 0 | 7 |
+| optimised hash | **0.37 ms** | 2354 (1119/428/807) | 0 | 11 |
+| **simple hash (4th way)** | **0.38 ms** | 2354 (1119/428/807) | 0 | **7** |
+
+**The simple hash ties the optimised hash** (0.37 vs 0.38 ms — within thermal noise) and is
+~5× faster than the optimised dense grid, **with 7 kernels instead of 11 and bit-identical
+contacts**. So the honest answer to the question above is: **the compaction passes are *not*
+where the speedup lives.** The win comes from (a) storing only *occupied* cells and (b)
+generating over *mixed* buckets only — and the simple hash does both, more directly. The
+elaborate mark/compact/fill build buys almost nothing here; it trades a little bucket memory
+(`tableSize` buckets instead of occupancy-many) for two fewer passes.
+
+(Full numbers and the correctness cross-checks are in
+[reports/four_way_broadcull_comparison_20260626.md](../reports/four_way_broadcull_comparison_20260626.md).)
+
+---
+
 ## Which broad cull wins, and when?
 
 Both produce identical contacts — the choice is pure speed, and it depends on the scene:
@@ -224,11 +298,12 @@ Both produce identical contacts — the choice is pure speed, and it depends on 
 | Scene | Winner | Why |
 |---|---|---|
 | **Small tool, local footprint** (the surgical default) | **dense grid + Phase 15** | the tool touches ~30 cells; Phase-15 generation is already ~8 µs — the hash's fixed build stages aren't worth it |
-| **Large tissue and/or large tool** | **optimised hash** | only occupied cells are materialized; ~4× faster kernel |
-| **self-collision / point-cloud-vs-mesh** | **dense (v-t path)** | the hash cull is wired only for the tri-tri FBP path |
+| **Large tissue and/or large tool** | **optimised hash *or* simple hash (tied)** | only occupied cells are materialized; both ~5× faster kernel than dense — the simple hash matches the optimised one with fewer kernels |
+| **self-collision / point-cloud-vs-mesh** | **dense (v-t path)** | both hash culls are wired only for the tri-tri FBP path |
 
-So the hash ships **opt-in, default-off** (`useHashPrefixSumGeneration`) — turning it on
-costs the default surgical scene nothing.
+So both hash paths ship **opt-in, default-off** (`useHashPrefixSumGeneration` and
+`useSimpleHashGeneration`, mutually exclusive — the optimised hash wins the tie-break if both
+are set) — turning either on costs the default surgical scene nothing.
 
 ---
 
@@ -244,6 +319,11 @@ Large tissue + large tool (14,368 elements), narrow **kernel** time, bit-identic
 | **+ CUDA graphs (current)** | **~0.35 ms** | **~4.2×** |
 
 ![Narrow-kernel time across the four legs — 1.48 ms dense down to 0.35 ms](assets/hash/07_scoreboard.svg)
+
+This scoreboard is the *optimised hash's* own progression. The **simple 4th way** above lands
+at the same ~0.35–0.38 ms with a **7-kernel** pipeline — the clearest evidence that the
+compaction passes weren't the source of the speedup; storing only occupied cells and
+generating over mixed buckets were.
 
 Next: the **narrow phase** — the geometry that turns a candidate pair into a contact →
 [09_the_kernels.md](09_the_kernels.md) and [10_the_math.md](10_the_math.md). The full

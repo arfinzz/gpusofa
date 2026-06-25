@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 680 262" role="img"><title>Four-way broad-cull kernel time</title><desc>On the 14,368-element scene the baseline dense grid takes 2.07 ms, optimised dense 1.86 ms, optimised hash 0.37 ms and the simple direct-bucket hash 0.38 ms — the simple hash ties the optimised hash with 7 kernels instead of 11, all bit-identical.</desc>
+<style>
+:root{--tp:#26251f;--tsd:#5f5e5a;}
+svg{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Arial,sans-serif;}
+text.t{font-size:14px;fill:var(--tp);}text.ts{font-size:12px;fill:var(--tsd);}text.th{font-size:14px;font-weight:500;fill:var(--tp);}
+.c-gray>rect{fill:#F1EFE8;stroke:#5F5E5A;}.c-amber>rect{fill:#FAEEDA;stroke:#854F0B;}
+.c-teal>rect{fill:#E1F5EE;stroke:#0F6E56;}.c-green>rect{fill:#EAF3DE;stroke:#3B6D11;}
+@media (prefers-color-scheme:dark){
+:root{--tp:#f1efe8;--tsd:#b4b2a9;}
+.c-gray>rect{fill:#444441;stroke:#B4B2A9;}.c-amber>rect{fill:#633806;stroke:#EF9F27;}
+.c-teal>rect{fill:#085041;stroke:#5DCAA5;}.c-green>rect{fill:#27500A;stroke:#C0DD97;}}
+</style>
+<text class="t" x="200" y="83" text-anchor="end" dominant-baseline="central">baseline dense grid</text>
+<g class="c-gray"><rect x="212" y="70" width="348" height="26" rx="4" stroke-width="0.5"/></g>
+<text class="ts" x="568" y="83" text-anchor="start" dominant-baseline="central">2.07 ms · 7 kernels</text>
+<text class="t" x="200" y="123" text-anchor="end" dominant-baseline="central">optimised dense (Phase 15)</text>
+<g class="c-amber"><rect x="212" y="110" width="312" height="26" rx="4" stroke-width="0.5"/></g>
+<text class="ts" x="532" y="123" text-anchor="start" dominant-baseline="central">1.86 ms · 7 kernels</text>
+<text class="t" x="200" y="163" text-anchor="end" dominant-baseline="central">optimised hash</text>
+<g class="c-teal"><rect x="212" y="150" width="62" height="26" rx="4" stroke-width="0.5"/></g>
+<text class="ts" x="282" y="163" text-anchor="start" dominant-baseline="central">0.37 ms · 11 kernels</text>
+<text class="t" x="200" y="203" text-anchor="end" dominant-baseline="central">simple hash (4th way)</text>
+<g class="c-green"><rect x="212" y="190" width="64" height="26" rx="4" stroke-width="0.5"/></g>
+<text class="ts" x="284" y="203" text-anchor="start" dominant-baseline="central">0.38 ms · 7 kernels</text>
+<text class="ts" x="340" y="240" text-anchor="middle" dominant-baseline="central">all bit-identical (2354 contacts, 0 overflow) · simple ties the optimised hash with fewer kernels</text>
+</svg>

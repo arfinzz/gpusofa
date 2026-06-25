@@ -27,9 +27,10 @@ export SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 mkdir -p "${BASE}"
 
 run_mode() {
-    label="$1"; hashflag="$2"; phase15="$3"
+    label="$1"; hashflag="$2"; phase15="$3"; simplehash="${4:-0}"
     d="${BASE}/${label}"; mkdir -p "${d}"
     env SOFA_USE_HASH_PREFIXSUM_GENERATION="${hashflag}" \
+        SOFA_USE_SIMPLE_HASH_GENERATION="${simplehash}" \
         SOFA_USE_TOOL_ACTIVE_CELL_GENERATION="${phase15}" \
         SOFA_BENCHMARK_LABEL_SUFFIX="_${label}" \
         SOFA_BENCHMARK_LOG_DIR="${d}" \
@@ -39,13 +40,14 @@ run_mode() {
 }
 
 nvidia-smi --query-gpu=temperature.gpu,clocks.gr --format=csv,noheader || true
-run_mode dense_plain   0 0
-run_mode dense_phase15 0 1
-run_mode hash_opt      1 1
+run_mode dense_plain   0 0 0
+run_mode dense_phase15 0 1 0
+run_mode hash_opt      1 1 0
+run_mode simple_hash   0 1 1
 
 echo
 echo "=== SUMMARY (kernel time is the robust metric) ==="
-for leg in dense_plain dense_phase15 hash_opt; do
+for leg in dense_plain dense_phase15 hash_opt simple_hash; do
     f="$(ls "${BASE}/${leg}"/*summary*.txt 2>/dev/null | head -1)"
     [ -z "${f}" ] && { echo "${leg}: NO SUMMARY (see ${BASE}/${leg}/run.log)"; continue; }
     fps=$(grep -E '^avg_fps=' "${f}"|cut -d= -f2)

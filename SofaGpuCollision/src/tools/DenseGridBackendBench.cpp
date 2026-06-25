@@ -690,5 +690,110 @@ int main()
                   << ") should equal fbp_contacts above.\n";
     }
 
+    if (envBool("SOFA_BACKEND_BENCH_RUN_SIMPLE_HASH", true))
+    {
+        std::cout << "\n--- bench: simple direct-bucket hash (tri-tri, 4th way) ---\n";
+        const auto tissueIndexed = packedToIndexed(tissue);
+        const auto bladeIndexed = packedToIndexed(blade);
+
+        TriangleIndexedSurface tissueSurface;
+        tissueSurface.positions = tissueIndexed.positions.data();
+        tissueSurface.devicePositions = nullptr;
+        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
+        tissueSurface.triangleIndices = tissueIndexed.indices.data();
+        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
+        tissueSurface.surfaceId = 0xD001ull;
+        tissueSurface.topologyVersion = 1;
+
+        TriangleIndexedSurface bladeSurface;
+        bladeSurface.positions = bladeIndexed.positions.data();
+        bladeSurface.devicePositions = nullptr;
+        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
+        bladeSurface.triangleIndices = bladeIndexed.indices.data();
+        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
+        bladeSurface.surfaceId = 0xD002ull;
+        bladeSurface.topologyVersion = 1;
+
+        SofaGpuCollision::backend::HashPrefixSumConfig hashConfig;
+        hashConfig.hashTableSize = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_TABLE_SIZE", 0));
+        hashConfig.maxProbe = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_MAX_PROBE", 64));
+
+        FeatureBasedProximityConfig fbpConfig;
+        fbpConfig.contactDistance = config.contactDistance;
+        fbpConfig.computeBarycentrics = true;
+        fbpConfig.keepContactsOnDevice = false;
+        fbpConfig.readContactCounter = true;
+        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+
+        const std::filesystem::path simplePath = outputPath.parent_path() / (outputPath.stem().string() + "_simplehash.csv");
+        std::ofstream simpleCsv(simplePath, std::ios::out | std::ios::trunc);
+        simpleCsv << std::fixed << std::setprecision(9);
+        simpleCsv << "step,wall_ms,gpu_kernel_ms,h2d_bytes,d2h_bytes,kernel_launch_count,cuda_memset_count,"
+                     "hash_table_size,active_slots,raw_pairs,unique_pairs,emitted_contacts,vf,fv,ee,"
+                     "bucket_overflow,probe_overflow\n";
+
+        double simpleWallTotal = 0.0, simpleKernelTotal = 0.0;
+        int simpleMeasured = 0;
+        std::uint64_t simpleLastContacts = 0, simpleLastUnique = 0, simpleLastActive = 0, simpleLastTable = 0;
+        std::uint64_t simpleLastVf = 0, simpleLastFv = 0, simpleLastEe = 0, simpleLastBucketOf = 0, simpleLastProbeOf = 0;
+
+        for (int step = 0; step < steps + warmup; ++step)
+        {
+            std::vector<ProximityContact> simpleContacts;
+            SofaGpuCollision::backend::BackendExecutionStats stats;
+            FeatureBasedProximityStats proximityStats;
+            SofaGpuCollision::backend::HashPrefixSumStats hashStatsOut;
+            std::string diagnostic;
+
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = SofaGpuCollision::backend::computeSimpleHashProximityContacts(
+                tissueSurface, bladeSurface, config, hashConfig, fbpConfig,
+                simpleContacts, &proximityStats, &hashStatsOut, diagnostic, &stats);
+            const double wallMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (!ok) { std::cerr << "Simple-hash bench failed: " << diagnostic << "\n"; return 6; }
+
+            if (step >= warmup)
+            {
+                ++simpleMeasured;
+                simpleWallTotal += wallMs;
+                simpleKernelTotal += stats.gpuKernelMilliseconds;
+                simpleLastContacts = proximityStats.emittedContactCount;
+                simpleLastUnique = hashStatsOut.uniquePairCount;
+                simpleLastActive = hashStatsOut.occupiedSlotCount;
+                simpleLastTable = hashStatsOut.hashTableSize;
+                simpleLastVf = proximityStats.vfContactCount;
+                simpleLastFv = proximityStats.fvContactCount;
+                simpleLastEe = proximityStats.eeContactCount;
+                simpleLastBucketOf = hashStatsOut.bucketOverflowCount;
+                simpleLastProbeOf = hashStatsOut.hashProbeOverflowCount;
+            }
+
+            simpleCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
+                      << stats.hostToDeviceBytes << ',' << stats.deviceToHostBytes << ','
+                      << stats.kernelLaunchCount << ',' << stats.cudaMemsetCount << ','
+                      << hashStatsOut.hashTableSize << ',' << hashStatsOut.occupiedSlotCount << ','
+                      << hashStatsOut.rawPairCount << ',' << hashStatsOut.uniquePairCount << ','
+                      << proximityStats.emittedContactCount << ','
+                      << proximityStats.vfContactCount << ',' << proximityStats.fvContactCount << ','
+                      << proximityStats.eeContactCount << ','
+                      << hashStatsOut.bucketOverflowCount << ',' << hashStatsOut.hashProbeOverflowCount << '\n';
+        }
+
+        std::cout << "simplehash_measured_steps=" << simpleMeasured << '\n'
+                  << "simplehash_wall_avg_ms=" << (simpleMeasured > 0 ? simpleWallTotal / simpleMeasured : 0.0) << '\n'
+                  << "simplehash_gpu_kernel_avg_ms=" << (simpleMeasured > 0 ? simpleKernelTotal / simpleMeasured : 0.0) << '\n'
+                  << "simplehash_table_size=" << simpleLastTable << '\n'
+                  << "simplehash_active_slots=" << simpleLastActive << '\n'
+                  << "simplehash_unique_pairs=" << simpleLastUnique << '\n'
+                  << "simplehash_contacts=" << simpleLastContacts << " (vf=" << simpleLastVf
+                  << " fv=" << simpleLastFv << " ee=" << simpleLastEe << ")\n"
+                  << "simplehash_bucket_overflow=" << simpleLastBucketOf
+                  << " simplehash_probe_overflow=" << simpleLastProbeOf << '\n'
+                  << "simplehash_csv=" << simplePath.string() << '\n'
+                  << "CORRECTNESS: simplehash_contacts (" << simpleLastContacts
+                  << ") should equal fbp_contacts above (zero bucket_overflow).\n";
+    }
+
     return 0;
 }

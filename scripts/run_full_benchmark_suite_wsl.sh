@@ -69,9 +69,10 @@ run_leg vt_self_fastpath    "${VT_SELF}"  SOFA_PROXIMITY_READ_CONTACT_COUNTER=0
 run_leg vt_cross_validation "${VT_CROSS}" SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 run_leg vt_cross_fastpath   "${VT_CROSS}" SOFA_PROXIMITY_READ_CONTACT_COUNTER=0
 
-# --- hash + prefix-sum A/B (large tissue + large tool) ---
+# --- broad-cull 4-way (large tissue + large tool): dense, optimised hash, simple hash ---
 run_leg hash_dense  "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=0 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 run_leg hash_on     "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg hash_simple "${HASH}" SOFA_USE_SIMPLE_HASH_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 
 echo
 echo "============================================================"

@@ -364,4 +364,25 @@ SOFA_GPU_COLLISION_API bool computeHashPrefixSumProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats = nullptr);
 
+// Experimental "4th way" (simple direct-bucket spatial hash). Like
+// computeHashPrefixSumProximityContacts it replaces the dense grid with an
+// open-addressing spatial hash of cells (MurmurHash3 fmix64 + linear probing),
+// but it stores triangles DIRECTLY into per-cell buckets in a single insert pass
+// — no separate mark/compact/fill build (each table slot IS a bucket). It is
+// best-effort: a cell holding more than maxTissue/maxToolTrianglesPerCell
+// entries drops the surplus (reported in HashPrefixSumStats::bucketOverflowCount).
+// Reuses the same FBP narrow kernel, candidate dedup and CUDA graph as the other
+// paths. Independent workspace from the optimised hash path.
+SOFA_GPU_COLLISION_API bool computeSimpleHashProximityContacts(
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    const DenseGridConfig& gridConfig,
+    const HashPrefixSumConfig& hashConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    HashPrefixSumStats* hashStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
+
 } // namespace SofaGpuCollision::backend

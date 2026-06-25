@@ -5,7 +5,13 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: **2026-06-18**. The hash broad cull is now optimised + merged to
+Last refreshed: **2026-06-26**. A fourth broad-cull "way" — a **simple direct-bucket
+spatial hash** (`useSimpleHashGeneration`, single-pass insert, 7 kernels, own CUDA graph)
+— is now wired alongside the dense grid and the optimised hash. Measured tied with the
+optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow; the
+compaction passes turn out not to be where the speedup comes from. Full 4-way data:
+`reports/four_way_broadcull_comparison_20260626.md`.
+The hash broad cull is now optimised + merged to
 `main` (compact buckets, no binary search, dropped scan, CUDA graphs — ~4× faster
 kernel than the optimised dense grid on a large tissue, bit-identical contacts), and
 the `featureBasedProximityKernel` narrow phase is now the dominant GPU cost (a
@@ -248,7 +254,8 @@ output-mode switches and the dense-grid configuration.
 | `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed; mutually exclusive with `useToolActiveCellGeneration` |
 | `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
 | `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms on 12.8k+1.6k tris; compact buckets, mixed-bucket gen, no binary search, touched-slot clear, CUB scan, 32-bit pairs). See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md`. Requires `useFeatureBasedProximity=true` |
-| `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
+| `useSimpleHashGeneration` | **false** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash: triangles are stored straight into per-cell hash buckets in a **single insert pass** (no mark/compact/fill — each slot is its own bucket), then mixed-bucket generation + dedup + FBP. **7 kernels** vs the optimised hash's 11; own CUDA graph. Best-effort on per-cell overflow (drops + reports, never triggers on the test scenes). **Measured tied with the optimised hash (~0.35–0.38 ms kernel, ~5× over dense) and bit-identical** on the 14,368-element scene. Mutually exclusive with `useHashPrefixSumGeneration` (hash wins). Requires `useFeatureBasedProximity=true`. See `reports/four_way_broadcull_comparison_20260626.md` |
+| `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration` / `useSimpleHashGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |
 | `proximityComputeBarycentrics` | true | Populate ProximityContact barycentric weights |
