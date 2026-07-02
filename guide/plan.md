@@ -10,7 +10,7 @@ Last refreshed: **2026-06-18**. Since 2026-06-09 the hash cull was optimised and
 merged to `main` (§5.19), three more hash opts + CUDA graphs landed (§5.20), and an
 FBP-kernel occupancy optimization was attempted and reverted as a measured regression
 (§5.21). Current numbers + the full optimization/failed-methods history:
-`reports/performance_and_optimizations_20260618.md`.
+`reports/performance_five_ways_20260703.md`.
 
 ---
 
@@ -40,10 +40,13 @@ generation now default-on) delivers:
 (FPS figures are thermally sensitive on this laptop; ranges given. The
 one-tissue tri-tri FBP path was ~775 FPS before Phase 15 and ~940 after.)
 
-All four paths share the same dense-grid broad cull. The differences are in
-the narrow-pass kernel and the host-side dispatch. **Phase 15 (§5.15)
-collapsed the candidate-generation kernel from ~300 µs to ~8 µs, making it
-no longer the bottleneck.**
+All four paths default to the dense-grid broad cull; the tri-tri FBP path can
+swap it for any of the alternative broad culls (**five ways** total: baseline
+dense, Phase-15 dense, optimised hash §5.19–5.20, simple hash §5.22, sorted
+grid §5.23 — all bit-identical). The narrow-path differences are in the
+narrow-pass kernel and the host-side dispatch. **Phase 15 (§5.15) collapsed
+the candidate-generation kernel from ~300 µs to ~8 µs, making it no longer the
+bottleneck.**
 
 **2026-06-09 re-benchmark (`reports/archive_pre_20260618/benchmark_suite_20260609.md`).** The full
 suite was re-run on the same hardware. Contact counts are **bit-identical** to
@@ -990,7 +993,7 @@ narrow kernel does coalesced 128-bit loads reused across a triangle's many candi
 pairs (a pre-pass kernel + buffers + CUDA-graph integration — scoped, not yet done).
 
 **Methods that DO NOT work (do not retry)** — full table in
-`reports/performance_and_optimizations_20260618.md` §6: FBP `__launch_bounds__` /
+`reports/performance_five_ways_20260703.md` §6: FBP `__launch_bounds__` /
 register-reduction / `__ldg` (LSU-bound, regression); `compactActiveCells` (scanned
 all cells, regressed → replaced by Phase 15); `batchTriangleInsert` (breaks
 tissue-before-tool ordering); warp-aggregated atomics (atomics not the bottleneck,
@@ -1016,7 +1019,7 @@ kernel (0.350 ms in a second run) vs optimised hash **0.370 ms** vs optimised de
 (2354 = 1119/428/807, overflow 0), `unique_pairs=322560` identical. **Conclusion: the
 optimised hash's compaction passes are not where the speedup lives** — storing only occupied
 cells + mixed-bucket generation is, and the simple hash does both more directly. Full data:
-`reports/four_way_broadcull_comparison_20260626.md`.
+`reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md`.
 
 **Dense CUDA graph — DEFERRED, measured-pointless.** The user asked for graphs in all four
 ways; the two hash paths have them. The dense paths do not, by design: they are
@@ -1025,6 +1028,48 @@ hide is ~1.6 %, and the 4-way table shows dense is 5× slower for structural rea
 cannot touch. Wrapping the dense broad cull (a large multi-mode function with interleaved
 host timing) in a graph is invasive and risks the baseline for ≈0 gain — same honest call as
 §5.21. Can be added behind an opt-in flag if the capability is wanted regardless.
+
+### 5.23  Sorted-grid (tiled binning) broad cull — the "5th way" — LANDED 2026-07-03
+
+Green's sorted-particle-grid method adapted to triangles (`useSortedGridGeneration` /
+`computeSortedGridProximityContacts`): expand each triangle into `(cellKey, triId)`
+incidences (key = `cellId*2 + meshTag` so tissue sorts before tool within a cell; the same
+pass stores per-triangle inflated AABBs and bumps a per-key histogram) → **sort by key** →
+every cell's triangles are a contiguous run whose boundaries come straight from the scanned
+histogram → one block per mixed cell generates the cross product with the **tool run staged
+in shared memory** (the tiled-binning + shared-memory-privatization pattern). **No per-cell
+capacity caps** → no best-effort drops; incidence buffer = 16× triangle count (the SOFA
+scene's triangles span ~8.6 cells on average — the initial 8× default overflowed by 8,080,
+watch `incidenceOverflowCount`). 9 kernels, own CUDA graph (`SOFA_SORTED_GRID_CUDA_GRAPH`).
+
+Two internal A/Bs, both measured on the 14,368-element scene (validation, back-to-back):
+- **Sort engine** (`sortedGridUseCubSort`): hand-rolled **one-pass counting sort** 0.352 ms
+  vs `cub::DeviceRadixSort` 0.479 ms — counting wins (single pass; the scanned histogram
+  doubles as run starts AND scatter cursors; keeps the default path CUB-free).
+- **Dedup** (`sortedGridUsePairHashDedup`): **home-cell exactly-once emission** 0.352 ms vs
+  the atomicCAS pair-hash 0.512 ms — home-cell wins, and it **doubles as an exact AABB
+  pre-cull** (disjoint inflated AABBs ⇒ distance > contactDistance ⇒ skip): 322,560 →
+  **43,584** candidate pairs on the large bench.
+
+**Results (all bit-identical, overflow 0):** 7-leg comparison — dense 1.69 / Phase-15 1.37 /
+opt-hash 0.347 / simple 0.336 / **sorted 0.352 ms** (tied with the hashes). Backend bench
+(79,520 elements): dense-FBP 2.65 / opt-hash 2.01 / simple 2.14 / **sorted 0.65 ms — ~3×
+faster than every other way**, because the home-cell pre-cull starves the load-bound FBP
+kernel of 86 % of its pairs. The §"radix sort will likely lose" prediction was wrong; the
+sort roughly ties at binning, and the *dedup strategy the sorted layout enables* is what
+wins. Report: `reports/performance_five_ways_20260703.md`; parity tool:
+`scripts/run_sorted_grid_parity_wsl.sh`.
+
+**Environment gotchas fenced off (do not re-debug):**
+1. **CUB `DeviceRadixSort` on this WSL2 stack intermittently returns `cudaSuccess` with
+   completely unsorted output** (~20–25 % of processes, decided per process, constant
+   within it; proven with a device-side verifier: 536,295/536,304 violations). Shipped
+   mitigation: frame-0 health probe (verify kernel + 4-byte sync, once per process) →
+   process-wide fallback to the counting sort + frame redo + stderr notice.
+   `SOFA_SORTED_GRID_VERIFY=1` = continuous verification.
+2. **Do not pad a buffer with `cudaMemsetAsync` before a same-frame kernel rewrite** —
+   async memsets may run on a copy/DMA engine; use a tail-pad **fill kernel after the
+   writer** instead (cheaper, unambiguous, graph-friendly).
 
 ---
 

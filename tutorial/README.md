@@ -5,9 +5,10 @@ assuming **no prior knowledge** of SOFA, GPUs, or CUDA. Every claim is grounded 
 real code (file and function names are given). It is the gentle, example-driven
 companion to `guide/architecture.md` (the terse reference).
 
-It reflects the **current** state of the project: the dense grid *and* the optimised
-spatial-hash broad cull, the four narrow-phase paths, CUDA graphs, the profiling story,
-and the optimizations that worked **and the ones that failed**.
+It reflects the **current** state of the project: the **five broad-cull ways** (dense,
+Phase-15 dense, optimised hash, simple direct-bucket hash, sorted grid), the four
+narrow-phase paths, CUDA graphs, the profiling story, and the optimizations that worked
+**and the ones that failed**.
 
 ## How to read this
 
@@ -57,7 +58,7 @@ chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 > **Companion documents (outside the tutorial):**
 > [reports/README_metrics_explained.md](../reports/README_metrics_explained.md) defines
 > every benchmark number; the current measured results + full optimization history are in
-> [reports/performance_and_optimizations_20260618.md](../reports/performance_and_optimizations_20260618.md);
+> [reports/performance_five_ways_20260703.md](../reports/performance_five_ways_20260703.md);
 > `guide/architecture.md` and `guide/plan.md` are the terse engineering references.
 
 > **Diagrams.** Chapters 00, 07, 08, 13, 15, 16 use ```mermaid``` blocks — they render as

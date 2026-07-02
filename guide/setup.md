@@ -4,8 +4,9 @@ End-to-end instructions for running, building, profiling, and tuning the
 GPU SOFA collision pipeline. Read top to bottom for a fresh machine; jump
 to a section if you already know the lay of the land.
 
-Last refreshed: 2026-06-09 (full-suite benchmark refresh + experimental
-spatial-hash + prefix-sum broad cull on branch `experiment/hash-prefixsum-broadphase`).
+Last refreshed: 2026-07-03 (five broad-cull ways wired and measured — dense,
+Phase-15 dense, optimised hash, simple hash, sorted grid — plus full per-kernel
+profiling for every mode; see `reports/performance_five_ways_20260703.md`).
 
 ---
 
@@ -295,8 +296,13 @@ These all default sensibly. Set them only to override.
 | `SOFA_USE_HASH_PREFIXSUM_GENERATION` | **0** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash + prefix-sum broad cull for the tri-tri FBP path. Read only by `testscenes/hash_prefixsum_large.py`; on the production scenes set the `useHashPrefixSumGeneration` Data field directly. Targets large-tissue + large-tool; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms), contacts bit-identical. Requires FBP on. See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md` |
 | `SOFA_HASH_TABLE_SIZE` | **0** | Hash table slot count for the hash / simple-hash paths. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `SOFA_HASH_CUDA_GRAPH` | **1** | **DEFAULT ON (guide/plan.md §5.20).** Replay the hash broad cull's 11-kernel sequence as a captured CUDA Graph each steady-state frame (verified bit-identical, ~−7 % kernel / +10 % FPS). Set to 0 to launch the kernels individually (e.g. to A/B, or under detailed profiling, where it is auto-disabled). Only affects the `useHashPrefixSumGeneration` path |
-| `SOFA_USE_SIMPLE_HASH_GENERATION` | **0** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash for the tri-tri FBP path — triangles stored straight into per-cell hash buckets in one insert pass (no mark/compact/fill), 7 kernels. Read by `testscenes/hash_prefixsum_large.py`; or set the `useSimpleHashGeneration` Data field directly. **Measured tied with the optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow** on the 14,368-element scene. Mutually exclusive with the hash flag (hash wins). Requires FBP on. See `reports/four_way_broadcull_comparison_20260626.md` |
+| `SOFA_USE_SIMPLE_HASH_GENERATION` | **0** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash for the tri-tri FBP path — triangles stored straight into per-cell hash buckets in one insert pass (no mark/compact/fill), 7 kernels. Read by `testscenes/hash_prefixsum_large.py`; or set the `useSimpleHashGeneration` Data field directly. **Measured tied with the optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow** on the 14,368-element scene. Mutually exclusive with the hash flag (hash wins). Requires FBP on. See `reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md` |
 | `SOFA_SIMPLE_HASH_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the simple-hash 7-kernel sequence as a captured CUDA Graph each steady-state frame (same machinery as `SOFA_HASH_CUDA_GRAPH`, safe fallback). Set to 0 to launch individually. Only affects the `useSimpleHashGeneration` path |
+| `SOFA_USE_SORTED_GRID_GENERATION` | **0** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Sorted-grid (tiled binning) broad cull: incidence expansion → counting sort by cell → block-per-mixed-cell generation with shared-memory staging; home-cell exactly-once dedup doubling as an exact AABB pre-cull. No per-cell caps. **Ties the hashes on the 14,368 scene (~0.35 ms); ~3× faster than everything on the 79,520 bench (0.65 ms), bit-identical.** Read by `testscenes/hash_prefixsum_large.py`, or set the `useSortedGridGeneration` Data field. See `reports/performance_five_ways_20260703.md` |
+| `SOFA_SORTED_GRID_CUB_SORT` | **0** | Sorted-grid engine A/B: 1 = `cub::DeviceRadixSort` instead of the counting sort (measured slower: 0.48 vs 0.35 ms). Guarded by a frame-0 health probe — on this WSL2 stack CUB intermittently returns success with unsorted output; the probe detects it, prints a notice, and falls back to the counting sort for the process |
+| `SOFA_SORTED_GRID_PAIRHASH_DEDUP` | **0** | Sorted-grid dedup A/B: 1 = atomicCAS pair-hash (like the hash ways; reproduces their 322,560-pair candidate set) instead of home-cell emission (measured slower: 0.51 vs 0.35 ms, and forfeits the pre-cull) |
+| `SOFA_SORTED_GRID_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the sorted-grid 9-kernel sequence as a captured CUDA Graph each steady-state frame. Set to 0 to launch individually |
+| `SOFA_SORTED_GRID_VERIFY` | **0** | Diagnostic: run a device-side verifier over the sorted key stream every frame (ascending + run boundaries match the scanned histogram); violations land in the probe-overflow counter. The frame-0 CUB health probe runs regardless of this flag |
 
 ### 6.4  Feature-based proximity (Phase 11+12)
 

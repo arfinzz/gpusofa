@@ -139,7 +139,7 @@ scripts/run_report_bench_wsl.sh
 
 Metric definitions: [reports/README_metrics_explained.md](../reports/README_metrics_explained.md).
 The current numbers + the full bottleneck analysis:
-`reports/performance_and_optimizations_20260618.md`.
+`reports/performance_five_ways_20260703.md`.
 
 Next: armed with how to *find* a bottleneck, here is the catalogue of every optimization
 we actually applied — and the ones that were tried and **failed**, so you don't retry

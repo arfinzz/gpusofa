@@ -287,7 +287,7 @@ elaborate mark/compact/fill build buys almost nothing here; it trades a little b
 (`tableSize` buckets instead of occupancy-many) for two fewer passes.
 
 (Full numbers and the correctness cross-checks are in
-[reports/four_way_broadcull_comparison_20260626.md](../reports/four_way_broadcull_comparison_20260626.md).)
+[reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md](../reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md).)
 
 ---
 

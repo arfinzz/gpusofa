@@ -795,5 +795,116 @@ int main()
                   << ") should equal fbp_contacts above (zero bucket_overflow).\n";
     }
 
+    if (envBool("SOFA_BACKEND_BENCH_RUN_SORTED_GRID", true))
+    {
+        std::cout << "\n--- bench: sorted-grid tiled binning (tri-tri, 5th way) ---\n";
+        const auto tissueIndexed = packedToIndexed(tissue);
+        const auto bladeIndexed = packedToIndexed(blade);
+
+        TriangleIndexedSurface tissueSurface;
+        tissueSurface.positions = tissueIndexed.positions.data();
+        tissueSurface.devicePositions = nullptr;
+        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
+        tissueSurface.triangleIndices = tissueIndexed.indices.data();
+        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
+        tissueSurface.surfaceId = 0xE001ull;
+        tissueSurface.topologyVersion = 1;
+
+        TriangleIndexedSurface bladeSurface;
+        bladeSurface.positions = bladeIndexed.positions.data();
+        bladeSurface.devicePositions = nullptr;
+        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
+        bladeSurface.triangleIndices = bladeIndexed.indices.data();
+        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
+        bladeSurface.surfaceId = 0xE002ull;
+        bladeSurface.topologyVersion = 1;
+
+        SofaGpuCollision::backend::SortedGridConfig sortedConfig;
+        sortedConfig.useCubRadixSort = envBool("SOFA_BACKEND_BENCH_SORTED_CUB", false);
+        sortedConfig.usePairHashDedup = envBool("SOFA_BACKEND_BENCH_SORTED_PAIRHASH", false);
+
+        FeatureBasedProximityConfig fbpConfig;
+        fbpConfig.contactDistance = config.contactDistance;
+        fbpConfig.computeBarycentrics = true;
+        fbpConfig.keepContactsOnDevice = false;
+        fbpConfig.readContactCounter = true;
+        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+
+        const std::filesystem::path sortedPath = outputPath.parent_path() / (outputPath.stem().string() + "_sortedgrid.csv");
+        std::ofstream sortedCsv(sortedPath, std::ios::out | std::ios::trunc);
+        sortedCsv << std::fixed << std::setprecision(9);
+        sortedCsv << "step,wall_ms,gpu_kernel_ms,h2d_bytes,d2h_bytes,kernel_launch_count,cuda_memset_count,"
+                     "bin_count,incidences,mixed_cells,unique_pairs,emitted_contacts,vf,fv,ee,"
+                     "incidence_overflow,pair_overflow\n";
+
+        double sortedWallTotal = 0.0, sortedKernelTotal = 0.0;
+        int sortedMeasured = 0;
+        std::uint64_t sortedLastContacts = 0, sortedLastUnique = 0, sortedLastMixed = 0, sortedLastIncidences = 0;
+        std::uint64_t sortedLastVf = 0, sortedLastFv = 0, sortedLastEe = 0, sortedLastIncOf = 0, sortedLastPairOf = 0;
+        std::uint64_t sortedLastVerify = 0;
+
+        for (int step = 0; step < steps + warmup; ++step)
+        {
+            std::vector<ProximityContact> sortedContacts;
+            SofaGpuCollision::backend::BackendExecutionStats stats;
+            FeatureBasedProximityStats proximityStats;
+            SofaGpuCollision::backend::SortedGridStats sortedStatsOut;
+            std::string diagnostic;
+
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = SofaGpuCollision::backend::computeSortedGridProximityContacts(
+                tissueSurface, bladeSurface, config, sortedConfig, fbpConfig,
+                sortedContacts, &proximityStats, &sortedStatsOut, diagnostic, &stats);
+            const double wallMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (!ok) { std::cerr << "Sorted-grid bench failed: " << diagnostic << "\n"; return 7; }
+
+            if (step >= warmup)
+            {
+                ++sortedMeasured;
+                sortedWallTotal += wallMs;
+                sortedKernelTotal += stats.gpuKernelMilliseconds;
+                sortedLastContacts = proximityStats.emittedContactCount;
+                sortedLastUnique = sortedStatsOut.uniquePairCount;
+                sortedLastMixed = sortedStatsOut.mixedCellCount;
+                sortedLastIncidences = sortedStatsOut.incidenceCount;
+                sortedLastVf = proximityStats.vfContactCount;
+                sortedLastFv = proximityStats.fvContactCount;
+                sortedLastEe = proximityStats.eeContactCount;
+                sortedLastIncOf = sortedStatsOut.incidenceOverflowCount;
+                sortedLastPairOf = sortedStatsOut.pairOverflowCount;
+                sortedLastVerify = stats.hashDedupeProbeOverflowCount;
+            }
+
+            sortedCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
+                      << stats.hostToDeviceBytes << ',' << stats.deviceToHostBytes << ','
+                      << stats.kernelLaunchCount << ',' << stats.cudaMemsetCount << ','
+                      << sortedStatsOut.binCount << ',' << sortedStatsOut.incidenceCount << ','
+                      << sortedStatsOut.mixedCellCount << ',' << sortedStatsOut.uniquePairCount << ','
+                      << proximityStats.emittedContactCount << ','
+                      << proximityStats.vfContactCount << ',' << proximityStats.fvContactCount << ','
+                      << proximityStats.eeContactCount << ','
+                      << sortedStatsOut.incidenceOverflowCount << ',' << sortedStatsOut.pairOverflowCount << '\n';
+        }
+
+        std::cout << "sortedgrid_engine=" << (sortedConfig.useCubRadixSort ? "cub_radix" : "counting") << '\n'
+                  << "sortedgrid_dedup=" << (sortedConfig.usePairHashDedup ? "pair_hash" : "home_cell") << '\n'
+                  << "sortedgrid_measured_steps=" << sortedMeasured << '\n'
+                  << "sortedgrid_wall_avg_ms=" << (sortedMeasured > 0 ? sortedWallTotal / sortedMeasured : 0.0) << '\n'
+                  << "sortedgrid_gpu_kernel_avg_ms=" << (sortedMeasured > 0 ? sortedKernelTotal / sortedMeasured : 0.0) << '\n'
+                  << "sortedgrid_incidences=" << sortedLastIncidences << '\n'
+                  << "sortedgrid_mixed_cells=" << sortedLastMixed << '\n'
+                  << "sortedgrid_unique_pairs=" << sortedLastUnique << '\n'
+                  << "sortedgrid_contacts=" << sortedLastContacts << " (vf=" << sortedLastVf
+                  << " fv=" << sortedLastFv << " ee=" << sortedLastEe << ")\n"
+                  << "sortedgrid_incidence_overflow=" << sortedLastIncOf
+                  << " sortedgrid_pair_overflow=" << sortedLastPairOf << '\n'
+                  << "sortedgrid_verify_violations=" << sortedLastVerify
+                  << " (0 unless SOFA_SORTED_GRID_VERIFY=1)\n"
+                  << "sortedgrid_csv=" << sortedPath.string() << '\n'
+                  << "CORRECTNESS: sortedgrid_contacts (" << sortedLastContacts
+                  << ") should equal fbp_contacts above (unique_pairs may be lower in home-cell mode).\n";
+    }
+
     return 0;
 }

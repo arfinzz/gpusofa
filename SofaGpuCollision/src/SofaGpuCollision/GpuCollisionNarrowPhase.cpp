@@ -297,6 +297,9 @@ GpuCollisionNarrowPhase::GpuCollisionNarrowPhase()
     , d_useToolActiveCellGeneration(initData(&d_useToolActiveCellGeneration, true, "useToolActiveCellGeneration", "Phase 15 (DEFAULT ON since 2026-05-25): generate candidate pairs over tool-occupied (mixed) cells only. The active-cell list is built during the tool insert (no separate scan), then candidate generation launches a small fixed grid over that list instead of one block per grid cell. Measured 4.3x faster on one-tissue/one-blade and 1.08x on large-tissue, bit-identical contacts, never a regression. Mutually exclusive with batchTriangleInsert."))
     , d_useHashPrefixSumGeneration(initData(&d_useHashPrefixSumGeneration, false, "useHashPrefixSumGeneration", "EXPERIMENTAL (experiment/hash-prefixsum-broadphase): replace the dense-grid broad cull with a spatial-hash + prefix-sum work-expansion broad cull for the tri-tri FBP path. Intended for large-tissue + large-tool scenes. The narrow phase (FBP kernel) is unchanged, so contacts are identical. Default off."))
     , d_useSimpleHashGeneration(initData(&d_useSimpleHashGeneration, false, "useSimpleHashGeneration", "EXPERIMENTAL '4th way': replace the dense-grid broad cull with a SIMPLE direct-bucket spatial hash for the tri-tri FBP path. Triangles are stored straight into per-cell hash buckets in one insert pass (no mark/compact/fill). Best-effort on per-cell overflow. Same FBP narrow kernel, so contacts match the other paths when there is no overflow. Default off. Mutually exclusive with useHashPrefixSumGeneration (hash takes precedence)."))
+    , d_useSortedGridGeneration(initData(&d_useSortedGridGeneration, false, "useSortedGridGeneration", "EXPERIMENTAL '5th way': replace the dense-grid broad cull with a SORTED-GRID (tiled binning) broad cull for the tri-tri FBP path — expand (cell, triangle) incidences, sort them by cell, generate pairs from each cell's contiguous run with the tool run staged in shared memory. NO per-cell capacity caps (no best-effort drops). Same FBP narrow kernel -> identical contacts. Default off. Precedence: hash > simple hash > sorted grid."))
+    , d_sortedGridUseCubSort(initData(&d_sortedGridUseCubSort, false, "sortedGridUseCubSort", "Sorted-grid sort engine: false (default) = hand-rolled one-pass counting sort (CUB-free); true = cub::DeviceRadixSort over the padded incidence buffer."))
+    , d_sortedGridUsePairHashDedup(initData(&d_sortedGridUsePairHashDedup, false, "sortedGridUsePairHashDedup", "Sorted-grid dedup: false (default) = home-cell exactly-once emission (no dedup hash table; also pre-culls AABB-disjoint pairs, so candidate counts may be lower while contacts stay identical); true = the same atomicCAS pair-hash as the hash ways (reproduces their candidate set exactly)."))
     , d_hashTableSize(initData(&d_hashTableSize, static_cast<unsigned int>(0), "hashTableSize", "Hash table slot count for useHashPrefixSumGeneration / useSimpleHashGeneration. 0 = auto-derive (~4 slots per input triangle). Rounded up to a power of two."))
     , d_useFeatureBasedProximity(initData(&d_useFeatureBasedProximity, false, "useFeatureBasedProximity", "Replace SAT-style exact triangle intersection with feature-based proximity (VF + EE) using Ericson closest-point math. Outputs barycentric weights for a CUDA constraint solver."))
     , d_useVertexTriangleProximity(initData(&d_useVertexTriangleProximity, false, "useVertexTriangleProximity", "When set together with useFeatureBasedProximity, route self-collision pairs (pair.first == pair.second on a CudaTriangleCollisionModel) through the vertex-triangle proximity kernel. Useful for surgical self-collision such as cutting/tearing."))
@@ -1187,6 +1190,26 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                         proximityContacts,
                         &proximityStats,
                         &hashStats,
+                        diagnostic,
+                        &backendStats);
+                }
+                else if (d_useSortedGridGeneration.getValue())
+                {
+                    // 5th way: sorted-grid (tiled binning) broad cull. Same FBP
+                    // narrow kernel -> contacts identical to the other paths.
+                    backend::SortedGridConfig sortedConfig;
+                    sortedConfig.useCubRadixSort = d_sortedGridUseCubSort.getValue();
+                    sortedConfig.usePairHashDedup = d_sortedGridUsePairHashDedup.getValue();
+                    backend::SortedGridStats sortedStats;
+                    exactSucceeded = backend::computeSortedGridProximityContacts(
+                        firstIndexedSurface,
+                        secondIndexedSurface,
+                        denseGridConfig,
+                        sortedConfig,
+                        proximityConfig,
+                        proximityContacts,
+                        &proximityStats,
+                        &sortedStats,
                         diagnostic,
                         &backendStats);
                 }

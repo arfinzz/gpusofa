@@ -385,4 +385,54 @@ SOFA_GPU_COLLISION_API bool computeSimpleHashProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats = nullptr);
 
+// Experimental "5th way" (sorted-grid / tiled-binning broad cull, Green's
+// particle-grid method adapted to triangles). Each triangle is expanded into
+// (cellKey, triangleId) incidences (key = cellId*2 + meshTag, so tissue sorts
+// before tool within a cell), the incidences are sorted by key, and the scanned
+// per-key histogram gives every cell's contiguous run — no per-cell capacity
+// caps, so NO best-effort drops (unlike the simple hash). Candidate pairs are
+// generated one block per mixed cell with the tool run staged in shared memory.
+struct SortedGridConfig
+{
+    // Sort engine: false (default) = hand-rolled one-pass counting sort
+    // (histogram -> single-block chained scan -> scatter; the scanned histogram
+    // doubles as the cell-run starts, and the repo stays CUB-free on this
+    // route). true = cub::DeviceRadixSort::SortPairs over the padded incidence
+    // buffer (textbook route; re-adds the CUB dependency).
+    bool useCubRadixSort { false };
+    // Dedup: false (default) = home-cell exactly-once emission (a pair is
+    // emitted only from the cell containing the min corner of its two AABBs'
+    // intersection — no dedup hash table at all). true = the same atomicCAS
+    // pair-hash + touched-slot machinery as the hash ways.
+    bool usePairHashDedup { false };
+    // Incidence buffer capacity = scale * (firstTris + secondTris). Overflowed
+    // incidences are dropped and counted. Default 16: the SOFA hash scene's
+    // triangles overlap ~8.6 cells on average (8x measured 8,080 dropped
+    // incidences there, 2026-07-03), so 16x gives ~2x headroom. Watch the
+    // incidenceOverflowCount stat when changing scenes.
+    std::uint32_t incidenceCapacityScale { 16 };
+};
+
+struct SortedGridStats
+{
+    std::uint32_t binCount { 0 };                 // 2 * cellCount (cell x meshTag)
+    std::uint32_t incidenceCount { 0 };           // (cell, triangle) entries this frame
+    std::uint32_t mixedCellCount { 0 };           // cells holding both tissue and tool
+    std::uint32_t uniquePairCount { 0 };          // candidate pairs after dedup
+    std::uint32_t incidenceOverflowCount { 0 };   // dropped incidences (capacity)
+    std::uint32_t pairOverflowCount { 0 };        // dropped pairs (maxCandidatePairs)
+};
+
+SOFA_GPU_COLLISION_API bool computeSortedGridProximityContacts(
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    const DenseGridConfig& gridConfig,
+    const SortedGridConfig& sortedConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    SortedGridStats* sortedStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
+
 } // namespace SofaGpuCollision::backend

@@ -5,19 +5,27 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: **2026-06-26**. A fourth broad-cull "way" — a **simple direct-bucket
-spatial hash** (`useSimpleHashGeneration`, single-pass insert, 7 kernels, own CUDA graph)
-— is now wired alongside the dense grid and the optimised hash. Measured tied with the
+Last refreshed: **2026-07-03**. A fifth broad-cull "way" — the **sorted-grid / tiled
+binning cull** (`useSortedGridGeneration`: incidence expansion → counting sort by cell →
+block-per-mixed-cell generation with shared-memory staging, home-cell exactly-once dedup,
+no per-cell caps, own CUDA graph) — joins the dense grid, optimised hash, and simple hash.
+Measured bit-identical everywhere; **ties the hashes on the 14,368 scene (~0.35 ms) and is
+~3× faster than every other way on the 79,520 bench (0.65 vs 2.0–2.6 ms)** because its
+home-cell dedup doubles as an exact AABB pre-cull (322,560 → 43,584 pairs). 5-way data +
+two environment gotchas (WSL2 CUB radix-sort flakiness with auto-fallback; async-memset
+ordering): `reports/performance_five_ways_20260703.md`, plan §5.23.
+The fourth way — a **simple direct-bucket spatial hash** (`useSimpleHashGeneration`,
+single-pass insert, 7 kernels, own CUDA graph) — measured tied with the
 optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow; the
 compaction passes turn out not to be where the speedup comes from. Full 4-way data:
-`reports/four_way_broadcull_comparison_20260626.md`.
+`reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md`.
 The hash broad cull is now optimised + merged to
 `main` (compact buckets, no binary search, dropped scan, CUDA graphs — ~4× faster
 kernel than the optimised dense grid on a large tissue, bit-identical contacts), and
 the `featureBasedProximityKernel` narrow phase is now the dominant GPU cost (a
 load-throughput-bound kernel; an occupancy optimization was tried and reverted —
 plan.md §5.21). **Current measured numbers + the full optimization history live in
-`reports/performance_and_optimizations_20260618.md`** (earlier dated reports are under
+`reports/performance_five_ways_20260703.md`** (earlier dated reports are under
 `reports/archive_pre_20260618/`).
 
 ---
@@ -45,9 +53,22 @@ The plugin provides four narrow-phase output modes, each opt-in:
 3. **FBP vertex-triangle self-collision** (vertex set against its own triangles)
 4. **FBP vertex-triangle cross-model** (CudaPointCollisionModel against CudaTriangleCollisionModel)
 
-All four share the same dense-grid broad cull. The choice between them is
-driven by Data fields on `GpuCollisionNarrowPhase` and the type of the
-collision-model pair the SOFA broad phase emits.
+The choice between them is driven by Data fields on `GpuCollisionNarrowPhase`
+and the type of the collision-model pair the SOFA broad phase emits. The
+**broad cull** feeding the narrow pass is itself selectable for the tri-tri FBP
+path — **five ways** (all bit-identical contacts, see
+`reports/performance_five_ways_20260703.md`):
+
+| Broad cull | Flag | Regime |
+|---|---|---|
+| 1. baseline dense grid | `useToolActiveCellGeneration=0` | reference only |
+| 2. optimised dense grid (Phase 15) | *(default)* | small-tool surgical scenes |
+| 3. optimised spatial hash | `useHashPrefixSumGeneration=1` | large tissue + tool |
+| 4. simple direct-bucket hash | `useSimpleHashGeneration=1` | large tissue + tool, fewest kernels |
+| 5. sorted grid (tiled binning) | `useSortedGridGeneration=1` | large + dense pairs (fastest there, no per-cell caps) |
+
+The exact-contact and v-t paths always use the dense grid; precedence when
+several flags are set: hash > simple > sorted > dense.
 
 ---
 
@@ -85,8 +106,11 @@ pair based on:
 | Both sides `CudaTri` (default) | **exact-contact (SAT)** |
 | Anything else | legacy CPU SOFA fallback |
 
-All four GPU paths share the dense-grid broad cull. They differ only in the
-narrow-pass kernel that runs after the candidate pairs have been generated.
+All four GPU paths default to the dense-grid broad cull; the tri-tri FBP path
+can swap it for the optimised hash, simple hash, or sorted grid (table in §1).
+The paths differ only in the narrow-pass kernel that runs after the candidate
+pairs have been generated — which is why every broad cull yields identical
+contacts.
 
 ---
 
@@ -254,7 +278,10 @@ output-mode switches and the dense-grid configuration.
 | `batchTriangleInsert` | **false** | Experimental: combine tissue + tool insert into one launch. Regressed; mutually exclusive with `useToolActiveCellGeneration` |
 | `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
 | `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms on 12.8k+1.6k tris; compact buckets, mixed-bucket gen, no binary search, touched-slot clear, CUB scan, 32-bit pairs). See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md`. Requires `useFeatureBasedProximity=true` |
-| `useSimpleHashGeneration` | **false** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash: triangles are stored straight into per-cell hash buckets in a **single insert pass** (no mark/compact/fill — each slot is its own bucket), then mixed-bucket generation + dedup + FBP. **7 kernels** vs the optimised hash's 11; own CUDA graph. Best-effort on per-cell overflow (drops + reports, never triggers on the test scenes). **Measured tied with the optimised hash (~0.35–0.38 ms kernel, ~5× over dense) and bit-identical** on the 14,368-element scene. Mutually exclusive with `useHashPrefixSumGeneration` (hash wins). Requires `useFeatureBasedProximity=true`. See `reports/four_way_broadcull_comparison_20260626.md` |
+| `useSimpleHashGeneration` | **false** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash: triangles are stored straight into per-cell hash buckets in a **single insert pass** (no mark/compact/fill — each slot is its own bucket), then mixed-bucket generation + dedup + FBP. **7 kernels** vs the optimised hash's 11; own CUDA graph. Best-effort on per-cell overflow (drops + reports, never triggers on the test scenes). **Measured tied with the optimised hash (~0.35–0.38 ms kernel, ~5× over dense) and bit-identical** on the 14,368-element scene. Mutually exclusive with `useHashPrefixSumGeneration` (hash wins). Requires `useFeatureBasedProximity=true`. See `reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md` |
+| `useSortedGridGeneration` | **false** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Replace the dense grid with a **sorted-grid (tiled binning)** broad cull: expand (cell, triangle) incidences → sort by cell (counting sort) → contiguous per-cell runs → one block per mixed cell with the tool run staged in **shared memory**. **No per-cell capacity caps** (no best-effort drops); dedup is home-cell exactly-once emission, which doubles as an **exact AABB pre-cull** (322,560 → 43,584 pairs on the large bench). **Measured: ties the hash cluster on the 14,368 scene (~0.35 ms) and is ~3× faster than every other way on the 79,520 bench (0.65 vs 2.0–2.6 ms), bit-identical.** 9 kernels, own CUDA graph. Precedence: hash > simple > sorted. Requires `useFeatureBasedProximity=true`. See `reports/performance_five_ways_20260703.md` |
+| `sortedGridUseCubSort` | **false** | Sorted-grid sort engine: false = hand-rolled one-pass counting sort (CUB-free, **faster**: 0.35 vs 0.48 ms); true = `cub::DeviceRadixSort`. The CUB engine is guarded by a **frame-0 health probe** (this WSL2 stack intermittently returns success with unsorted output ~20–25 % of processes) that auto-falls back to the counting sort |
+| `sortedGridUsePairHashDedup` | **false** | Sorted-grid dedup: false = home-cell exactly-once (no dedup table + exact AABB pre-cull, **faster**: 0.35 vs 0.51 ms); true = the shared atomicCAS pair-hash (reproduces the other ways' candidate set exactly) |
 | `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration` / `useSimpleHashGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |

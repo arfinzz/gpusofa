@@ -3,7 +3,7 @@
 You've seen the pipeline. This chapter is the **catalogue**: the five test scenes, what
 each one is *for*, the two ways every scene can be run, the A/B comparison runs, and how
 to read what each produces. All numbers are the fresh 2026-06-18 measurements on the
-GTX 1650 Ti (full table in `reports/performance_and_optimizations_20260618.md`).
+GTX 1650 Ti (full table in `reports/performance_five_ways_20260703.md`).
 
 ---
 
@@ -98,13 +98,15 @@ head-to-head. There are three geometry sizes used to show the **regime split**:
 fraction of the work comes from a large mesh; dense + Phase 15 wins on genuinely small
 scenes. (All paths always produce **identical contacts**.)
 
-**The 4-way run.** `run_mode_comparison_ab_wsl.sh` runs **all four** broad culls back-to-back
-on the large scene: plain dense, Phase-15 dense, optimised hash, and the simple direct-bucket
-hash (`SOFA_USE_SIMPLE_HASH_GENERATION=1`). Measured (validation): dense plain 2.07 /
-Phase-15 1.86 / optimised hash 0.37 / **simple hash 0.38 ms** narrow kernel — all **2354
-contacts, 0 overflow**. The simple hash ties the optimised hash with a **7-kernel** pipeline
-instead of 11 (see [08_optimising_the_hash.md](08_optimising_the_hash.md) and
-[reports/four_way_broadcull_comparison_20260626.md](../reports/four_way_broadcull_comparison_20260626.md)).
+**The 7-leg run.** `run_mode_comparison_ab_wsl.sh` runs **all five broad culls** (plus the
+sorted grid's two internal A/B toggles) back-to-back on the large scene. Measured
+(validation, 2026-07-03): dense plain 1.69 / Phase-15 1.37 / optimised hash 0.347 /
+simple hash 0.336 / **sorted grid 0.352 ms** narrow kernel (sorted-CUB 0.479, sorted
+pair-hash 0.512) — all **2354 contacts, 0 overflow**. The simple hash ties the optimised
+hash with a **7-kernel** pipeline instead of 11, and the sorted grid ties them with 9 —
+then wins outright on the 79,520-element bench (0.65 vs 2.0–2.6 ms) thanks to its
+home-cell AABB pre-cull (see [08_optimising_the_hash.md](08_optimising_the_hash.md) and
+[reports/performance_five_ways_20260703.md](../reports/performance_five_ways_20260703.md)).
 
 ---
 
@@ -133,7 +135,7 @@ scripts/run_cross_model_vt_smoke_wsl.sh    # cross-model
 
 # Broad-cull comparison (same scene):
 scripts/run_hash_prefixsum_large_ab_wsl.sh # dense vs optimised hash, large tissue + large tool
-scripts/run_mode_comparison_ab_wsl.sh      # 4-way: plain dense | Phase-15 dense | optimised hash | simple hash
+scripts/run_mode_comparison_ab_wsl.sh      # 7 legs: dense | Phase-15 | opt hash | simple hash | sorted grid (+cub/+pairhash)
 scripts/run_tiny_ab_wsl.sh                 # the tiny regime (where dense wins)
 
 # Single way via env (mutually exclusive; the optimised hash wins the tie-break):
@@ -149,7 +151,7 @@ scripts/run_report_bench_wsl.sh
 Every number these print is defined in
 [reports/README_metrics_explained.md](../reports/README_metrics_explained.md); the
 current consolidated results are in
-`reports/performance_and_optimizations_20260618.md`.
+`reports/performance_five_ways_20260703.md`.
 
 Next: how those timing numbers are produced and what each CSV column means →
 [14_benchmark_metrics.md](14_benchmark_metrics.md).
