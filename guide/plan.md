@@ -1071,6 +1071,32 @@ wins. Report: `reports/performance_five_ways_20260703.md`; parity tool:
    async memsets may run on a copy/DMA engine; use a tail-pad **fill kernel after the
    writer** instead (cheaper, unambiguous, graph-friendly).
 
+### 5.24  Backend modularization + dedup — LANDED 2026-07-03 (no behavior change)
+
+The 8,649-line `cuda/GpuCollisionBackend.cu` monolith was split into per-module files
+under `cuda/detail/` — `BackendCommon.cuh` (device structs + math + alloc/copy/timing
+helpers + `makeDeviceDenseGridConfig`), `DenseGrid.cuh`, `BroadPhaseLegacy.cuh`,
+`FbpKernels.cuh` (+ shared `downloadDeviceProximityContacts`), `HashGrid.cuh`,
+`SimpleHash.cuh`, `SortedGrid.cuh` — each holding one concern's workspace + kernels +
+host driver(s). **The backend still compiles as ONE translation unit** (the `.cu` is a
+thin umbrella of ordered textual includes): kernels stay visible to their launch sites
+without `-rdc`/device-linking, so codegen matches the monolith — verified by full
+parity (bench all legs 8018 across all 4 sorted-grid combos; 7-leg mode comparison
+2354 everywhere; timings unchanged: hash 0.331 / simple 0.334 / sorted 0.346 ms).
+
+Dedup landed with it: the 32/64-bit twin kernels (`generateMixedHashCandidatePairs`,
+`generateSortedGridCandidatePairs`, `clearTouchedPairHash`, the tracked dedup insert)
+are now single templates over `PairTraits<PairT>`; the contact download/convert block
+(five copies) and the device grid-config construction (three copies) are shared
+helpers.
+
+**Deliberately deferred:** (a) merging the two ~870-line dense drivers — they are the
+baseline every comparison rests on; (b) extracting a shared CUDA-graph "replayer" from
+the hash/simple/sorted drivers — the sorted-grid copy materially differs (the frame-0
+CUB health probe is interleaved with its capture logic), so the abstraction is less
+clean than it looks; (c) bench-leg dedup (test harness, cosmetic). Revisit only with a
+concrete need.
+
 ---
 
 ## 6. Phase 11/12 follow-ups (landed 2026-05-25)
