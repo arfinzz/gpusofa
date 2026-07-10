@@ -78,26 +78,13 @@ struct SortedGridWorkspace
     bool pairHashKeysInitialized { false };
     bool compactPairHashKeysInitialized { false };
     bool firstFrameDone { false };
-    cudaStream_t captureStream { nullptr };
-    cudaGraphExec_t graphExec { nullptr };
-    bool graphInstantiated { false };
+    CudaGraphReplayer graph;
     // CUB radix-sort health: 0 = unprobed, 1 = verified good, -1 = produced an
     // invalid ordering on this system -> process-wide fallback to the counting
     // sort. (Observed on WSL2/CUDA 12.0: DeviceRadixSort intermittently returns
     // cudaSuccess with garbage output, decided per process; frame-0 probe
     // catches it because the failure mode is process-constant.)
     int cubSortHealth { 0 };
-    std::uint32_t gSigBinCount { 0 };
-    std::uint32_t gSigIncidenceCap { 0 };
-    std::uint32_t gSigFirstTri { ~0u };
-    std::uint32_t gSigSecondTri { ~0u };
-    std::uint32_t gSigMaxContacts { 0 };
-    std::uint32_t gSigPairHash { 0 };
-    bool gSigUseCompact { false };
-    bool gSigUseCub { false };
-    bool gSigUsePairHashDedup { false };
-    bool gSigComputeBary { false };
-    float gSigContactDist { -1.0f };
 
     ~SortedGridWorkspace() { release(); }
 
@@ -119,8 +106,7 @@ struct SortedGridWorkspace
         cudaFree(cubTemp);
         cudaFreeHost(countersHostPinned);
         if (eventsReady) { cudaEventDestroy(startEvent); cudaEventDestroy(endEvent); }
-        if (graphExec != nullptr) { cudaGraphExecDestroy(graphExec); graphExec = nullptr; }
-        if (captureStream != nullptr) { cudaStreamDestroy(captureStream); captureStream = nullptr; }
+        graph.release();
         hist = nullptr; starts = nullptr; cursors = nullptr;
         keys = nullptr; vals = nullptr; keysOut = nullptr; valsSorted = nullptr;
         firstAabbs = nullptr; secondAabbs = nullptr; mixedCellIds = nullptr;
@@ -149,7 +135,6 @@ struct SortedGridWorkspace
         firstTopologyVersion = ~0ull; secondTopologyVersion = ~0ull;
         pairHashKeysInitialized = false; compactPairHashKeysInitialized = false;
         firstFrameDone = false;
-        graphInstantiated = false;
         cubSortHealth = 0;
     }
 
@@ -605,11 +590,7 @@ bool computeSortedGridProximityContacts(
     if (proximityStats != nullptr) *proximityStats = FeatureBasedProximityStats {};
     if (sortedStats != nullptr) *sortedStats = SortedGridStats {};
 
-    const auto surfaceInvalid = [](const TriangleIndexedSurface& s) {
-        return (s.positions == nullptr && s.devicePositions == nullptr) ||
-            s.triangleIndices == nullptr || s.vertexCount == 0 || s.triangleCount == 0;
-    };
-    if (surfaceInvalid(firstSurface) || surfaceInvalid(secondSurface))
+    if (indexedSurfaceInvalid(firstSurface) || indexedSurfaceInvalid(secondSurface))
     {
         diagnostic = "Invalid indexed triangle surface (sorted-grid path).";
         return false;
@@ -699,27 +680,7 @@ bool computeSortedGridProximityContacts(
         if (newlyAllocatedBytes > 0) executionStats->workspaceResizeCount += 1;
     }
 
-    const bool uploadFirstTopo = ws.firstSurfaceId != firstSurface.surfaceId || ws.firstTopologyVersion != firstSurface.topologyVersion;
-    const bool uploadSecondTopo = ws.secondSurfaceId != secondSurface.surfaceId || ws.secondTopologyVersion != secondSurface.topologyVersion;
-    const auto h2dStart = std::chrono::steady_clock::now();
-    if (uploadFirstTopo)
-        err = copyHostArrayToDeviceAsync(ws.firstIndices, firstSurface.triangleIndices, (std::uint32_t*)nullptr, static_cast<std::size_t>(firstSurface.triangleCount) * 3u, false);
-    if (err == cudaSuccess && uploadSecondTopo)
-        err = copyHostArrayToDeviceAsync(ws.secondIndices, secondSurface.triangleIndices, (std::uint32_t*)nullptr, static_cast<std::size_t>(secondSurface.triangleCount) * 3u, false);
-    if (err == cudaSuccess && firstSurface.devicePositions == nullptr)
-        err = copyHostArrayToDeviceAsync(ws.firstPositions, firstSurface.positions, (BackendTriangleVertex*)nullptr, static_cast<std::size_t>(firstSurface.vertexCount), false);
-    if (err == cudaSuccess && secondSurface.devicePositions == nullptr)
-        err = copyHostArrayToDeviceAsync(ws.secondPositions, secondSurface.positions, (BackendTriangleVertex*)nullptr, static_cast<std::size_t>(secondSurface.vertexCount), false);
-    if (err == cudaSuccess && uploadFirstTopo) { ws.firstSurfaceId = firstSurface.surfaceId; ws.firstTopologyVersion = firstSurface.topologyVersion; }
-    if (err == cudaSuccess && uploadSecondTopo) { ws.secondSurfaceId = secondSurface.surfaceId; ws.secondTopologyVersion = secondSurface.topologyVersion; }
-    if (executionStats != nullptr)
-    {
-        executionStats->hostToDeviceMilliseconds += elapsedMillisecondsSince(h2dStart);
-        if (uploadFirstTopo) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(firstSurface.triangleCount) * 3u * sizeof(std::uint32_t);
-        if (uploadSecondTopo) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(secondSurface.triangleCount) * 3u * sizeof(std::uint32_t);
-        if (firstSurface.devicePositions == nullptr) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(firstSurface.vertexCount) * sizeof(BackendTriangleVertex);
-        if (secondSurface.devicePositions == nullptr) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(secondSurface.vertexCount) * sizeof(BackendTriangleVertex);
-    }
+    err = uploadSurfacesToWorkspace(ws, firstSurface, secondSurface, executionStats);
     if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
 
     const BackendTriangleVertex* deviceFirstPositions = firstSurface.devicePositions != nullptr ? firstSurface.devicePositions : ws.firstPositions;
@@ -843,70 +804,28 @@ bool computeSortedGridProximityContacts(
     const bool firstFrame = !ws.firstFrameDone || pairHashNeedsInit;
     if (kGraphsEnabled && !detailedProfiling)
     {
-        const bool sigChanged =
-            ws.gSigBinCount != binCount || ws.gSigIncidenceCap != incidenceCapacity ||
-            ws.gSigFirstTri != firstSurface.triangleCount || ws.gSigSecondTri != secondSurface.triangleCount ||
-            ws.gSigMaxContacts != proximityConfig.maxContacts || ws.gSigPairHash != pairHashCount ||
-            ws.gSigUseCompact != useCompactCandidatePairs || ws.gSigUseCub != useCubEffective ||
-            ws.gSigUsePairHashDedup != usePairHashDedup || ws.gSigComputeBary != proximityConfig.computeBarycentrics ||
-            ws.gSigContactDist != proximityConfig.contactDistance;
-        if (newlyAllocatedBytes > 0 || sigChanged) ws.graphInstantiated = false;
+        const std::array<std::uint64_t, 6> graphSignature {
+            (static_cast<std::uint64_t>(binCount) << 32) | incidenceCapacity,
+            (static_cast<std::uint64_t>(firstSurface.triangleCount) << 32) | secondSurface.triangleCount,
+            (static_cast<std::uint64_t>(proximityConfig.maxContacts) << 32) | pairHashCount,
+            (useCompactCandidatePairs ? 1ull : 0ull) | (proximityConfig.computeBarycentrics ? 2ull : 0ull) |
+                (useCubEffective ? 4ull : 0ull) | (usePairHashDedup ? 8ull : 0ull),
+            floatSignatureBits(proximityConfig.contactDistance),
+            0ull };
+        ws.graph.invalidateIfChanged(graphSignature, newlyAllocatedBytes > 0);
 
         if (firstFrame)
         {
             launchAll(0, /*fullClear=*/usePairHashDedup);
             err = probeCubSortHealth();
             if (err != cudaSuccess) { diagnostic = std::string("sorted-grid cub probe: ") + cudaGetErrorString(err); return false; }
-            ws.graphInstantiated = false;
+            ws.graph.instantiated = false;
             ranViaGraph = true;
         }
         else
         {
-            if (ws.captureStream == nullptr) cudaStreamCreate(&ws.captureStream);
-            if (!ws.graphInstantiated && ws.captureStream != nullptr)
-            {
-                cudaGraph_t graph = nullptr;
-                cudaError_t capErr = cudaStreamBeginCapture(ws.captureStream, cudaStreamCaptureModeThreadLocal);
-                if (capErr == cudaSuccess)
-                {
-                    launchAll(ws.captureStream, /*fullClear=*/false);
-                    capErr = cudaStreamEndCapture(ws.captureStream, &graph);
-                }
-                if (capErr == cudaSuccess && graph != nullptr)
-                {
-                    if (ws.graphExec != nullptr) { cudaGraphExecDestroy(ws.graphExec); ws.graphExec = nullptr; }
-#if CUDART_VERSION >= 12000
-                    capErr = cudaGraphInstantiate(&ws.graphExec, graph, 0ull);
-#else
-                    capErr = cudaGraphInstantiate(&ws.graphExec, graph, nullptr, nullptr, 0);
-#endif
-                    cudaGraphDestroy(graph);
-                    if (capErr == cudaSuccess)
-                    {
-                        ws.graphInstantiated = true;
-                        ws.gSigBinCount = binCount; ws.gSigIncidenceCap = incidenceCapacity;
-                        ws.gSigFirstTri = firstSurface.triangleCount; ws.gSigSecondTri = secondSurface.triangleCount;
-                        ws.gSigMaxContacts = proximityConfig.maxContacts; ws.gSigPairHash = pairHashCount;
-                        ws.gSigUseCompact = useCompactCandidatePairs; ws.gSigUseCub = useCubEffective;
-                        ws.gSigUsePairHashDedup = usePairHashDedup; ws.gSigComputeBary = proximityConfig.computeBarycentrics;
-                        ws.gSigContactDist = proximityConfig.contactDistance;
-                    }
-                }
-                else
-                {
-                    cudaGetLastError();
-                }
-            }
-            if (ws.graphInstantiated)
-            {
-                err = cudaGraphLaunch(ws.graphExec, 0);
-                ranViaGraph = (err == cudaSuccess);
-            }
-            if (!ranViaGraph)
-            {
-                launchAll(0, /*fullClear=*/false);
-                ranViaGraph = true;
-            }
+            ws.graph.replay(graphSignature, [&](cudaStream_t s) { launchAll(s, /*fullClear=*/false); });
+            ranViaGraph = true;
         }
     }
     if (!ranViaGraph)

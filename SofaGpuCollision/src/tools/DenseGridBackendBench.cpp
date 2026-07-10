@@ -228,6 +228,42 @@ IndexedSurfaceData packedToIndexed(const std::vector<TrianglePrimitive>& packed)
     return out;
 }
 
+// Shared bench-leg builders (were per-leg copy-pasted blocks).
+TriangleIndexedSurface makeIndexedSurface(
+    const IndexedSurfaceData& indexed,
+    const std::size_t triangleCount,
+    const std::uint64_t surfaceId)
+{
+    TriangleIndexedSurface surface;
+    surface.positions = indexed.positions.data();
+    surface.devicePositions = nullptr;
+    surface.vertexCount = static_cast<std::uint32_t>(indexed.positions.size());
+    surface.triangleIndices = indexed.indices.data();
+    surface.triangleCount = static_cast<std::uint32_t>(triangleCount);
+    surface.surfaceId = surfaceId;
+    surface.topologyVersion = 1;
+    return surface;
+}
+
+FeatureBasedProximityConfig makeBenchFbpConfig(const DenseGridConfig& config)
+{
+    FeatureBasedProximityConfig fbpConfig;
+    fbpConfig.contactDistance = config.contactDistance;
+    fbpConfig.computeBarycentrics = true;
+    fbpConfig.keepContactsOnDevice = false;
+    fbpConfig.readContactCounter = true;
+    fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+    return fbpConfig;
+}
+
+SofaGpuCollision::backend::HashPrefixSumConfig makeBenchHashConfig()
+{
+    SofaGpuCollision::backend::HashPrefixSumConfig hashConfig;
+    hashConfig.hashTableSize = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_TABLE_SIZE", 0));
+    hashConfig.maxProbe = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_MAX_PROBE", 64));
+    return hashConfig;
+}
+
 void writeFbpCsvHeader(std::ofstream& csv)
 {
     csv << "step,wall_ms,gpu_kernel_ms,fbp_kernel_ms,h2d_bytes,d2h_bytes,"
@@ -403,23 +439,8 @@ int main()
         const auto tissueIndexed = packedToIndexed(tissue);
         const auto bladeIndexed = packedToIndexed(blade);
 
-        TriangleIndexedSurface tissueSurface;
-        tissueSurface.positions = tissueIndexed.positions.data();
-        tissueSurface.devicePositions = nullptr;
-        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
-        tissueSurface.triangleIndices = tissueIndexed.indices.data();
-        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
-        tissueSurface.surfaceId = 0xA001ull;
-        tissueSurface.topologyVersion = 1;
-
-        TriangleIndexedSurface bladeSurface;
-        bladeSurface.positions = bladeIndexed.positions.data();
-        bladeSurface.devicePositions = nullptr;
-        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
-        bladeSurface.triangleIndices = bladeIndexed.indices.data();
-        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
-        bladeSurface.surfaceId = 0xA002ull;
-        bladeSurface.topologyVersion = 1;
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xA001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xA002ull);
 
         FeatureBasedProximityConfig fbpConfig;
         fbpConfig.contactDistance = config.contactDistance;
@@ -591,34 +612,12 @@ int main()
         const auto tissueIndexed = packedToIndexed(tissue);
         const auto bladeIndexed = packedToIndexed(blade);
 
-        TriangleIndexedSurface tissueSurface;
-        tissueSurface.positions = tissueIndexed.positions.data();
-        tissueSurface.devicePositions = nullptr;
-        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
-        tissueSurface.triangleIndices = tissueIndexed.indices.data();
-        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
-        tissueSurface.surfaceId = 0xC001ull;
-        tissueSurface.topologyVersion = 1;
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xC001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xC002ull);
 
-        TriangleIndexedSurface bladeSurface;
-        bladeSurface.positions = bladeIndexed.positions.data();
-        bladeSurface.devicePositions = nullptr;
-        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
-        bladeSurface.triangleIndices = bladeIndexed.indices.data();
-        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
-        bladeSurface.surfaceId = 0xC002ull;
-        bladeSurface.topologyVersion = 1;
+        const SofaGpuCollision::backend::HashPrefixSumConfig hashConfig = makeBenchHashConfig();
 
-        SofaGpuCollision::backend::HashPrefixSumConfig hashConfig;
-        hashConfig.hashTableSize = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_TABLE_SIZE", 0));
-        hashConfig.maxProbe = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_MAX_PROBE", 64));
-
-        FeatureBasedProximityConfig fbpConfig;
-        fbpConfig.contactDistance = config.contactDistance;
-        fbpConfig.computeBarycentrics = true;
-        fbpConfig.keepContactsOnDevice = false;
-        fbpConfig.readContactCounter = true;
-        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+        const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
 
         const std::filesystem::path hashPath = outputPath.parent_path() / (outputPath.stem().string() + "_hash.csv");
         std::ofstream hashCsv(hashPath, std::ios::out | std::ios::trunc);
@@ -696,34 +695,12 @@ int main()
         const auto tissueIndexed = packedToIndexed(tissue);
         const auto bladeIndexed = packedToIndexed(blade);
 
-        TriangleIndexedSurface tissueSurface;
-        tissueSurface.positions = tissueIndexed.positions.data();
-        tissueSurface.devicePositions = nullptr;
-        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
-        tissueSurface.triangleIndices = tissueIndexed.indices.data();
-        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
-        tissueSurface.surfaceId = 0xD001ull;
-        tissueSurface.topologyVersion = 1;
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xD001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xD002ull);
 
-        TriangleIndexedSurface bladeSurface;
-        bladeSurface.positions = bladeIndexed.positions.data();
-        bladeSurface.devicePositions = nullptr;
-        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
-        bladeSurface.triangleIndices = bladeIndexed.indices.data();
-        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
-        bladeSurface.surfaceId = 0xD002ull;
-        bladeSurface.topologyVersion = 1;
+        const SofaGpuCollision::backend::HashPrefixSumConfig hashConfig = makeBenchHashConfig();
 
-        SofaGpuCollision::backend::HashPrefixSumConfig hashConfig;
-        hashConfig.hashTableSize = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_TABLE_SIZE", 0));
-        hashConfig.maxProbe = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_HASH_MAX_PROBE", 64));
-
-        FeatureBasedProximityConfig fbpConfig;
-        fbpConfig.contactDistance = config.contactDistance;
-        fbpConfig.computeBarycentrics = true;
-        fbpConfig.keepContactsOnDevice = false;
-        fbpConfig.readContactCounter = true;
-        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+        const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
 
         const std::filesystem::path simplePath = outputPath.parent_path() / (outputPath.stem().string() + "_simplehash.csv");
         std::ofstream simpleCsv(simplePath, std::ios::out | std::ios::trunc);
@@ -801,34 +778,14 @@ int main()
         const auto tissueIndexed = packedToIndexed(tissue);
         const auto bladeIndexed = packedToIndexed(blade);
 
-        TriangleIndexedSurface tissueSurface;
-        tissueSurface.positions = tissueIndexed.positions.data();
-        tissueSurface.devicePositions = nullptr;
-        tissueSurface.vertexCount = static_cast<std::uint32_t>(tissueIndexed.positions.size());
-        tissueSurface.triangleIndices = tissueIndexed.indices.data();
-        tissueSurface.triangleCount = static_cast<std::uint32_t>(tissue.size());
-        tissueSurface.surfaceId = 0xE001ull;
-        tissueSurface.topologyVersion = 1;
-
-        TriangleIndexedSurface bladeSurface;
-        bladeSurface.positions = bladeIndexed.positions.data();
-        bladeSurface.devicePositions = nullptr;
-        bladeSurface.vertexCount = static_cast<std::uint32_t>(bladeIndexed.positions.size());
-        bladeSurface.triangleIndices = bladeIndexed.indices.data();
-        bladeSurface.triangleCount = static_cast<std::uint32_t>(blade.size());
-        bladeSurface.surfaceId = 0xE002ull;
-        bladeSurface.topologyVersion = 1;
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xE001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xE002ull);
 
         SofaGpuCollision::backend::SortedGridConfig sortedConfig;
         sortedConfig.useCubRadixSort = envBool("SOFA_BACKEND_BENCH_SORTED_CUB", false);
         sortedConfig.usePairHashDedup = envBool("SOFA_BACKEND_BENCH_SORTED_PAIRHASH", false);
 
-        FeatureBasedProximityConfig fbpConfig;
-        fbpConfig.contactDistance = config.contactDistance;
-        fbpConfig.computeBarycentrics = true;
-        fbpConfig.keepContactsOnDevice = false;
-        fbpConfig.readContactCounter = true;
-        fbpConfig.maxContacts = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_FBP_MAX_CONTACTS", 1000000));
+        const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
 
         const std::filesystem::path sortedPath = outputPath.parent_path() / (outputPath.stem().string() + "_sortedgrid.csv");
         std::ofstream sortedCsv(sortedPath, std::ios::out | std::ios::trunc);

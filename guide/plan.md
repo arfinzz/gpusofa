@@ -1084,18 +1084,30 @@ without `-rdc`/device-linking, so codegen matches the monolith — verified by f
 parity (bench all legs 8018 across all 4 sorted-grid combos; 7-leg mode comparison
 2354 everywhere; timings unchanged: hash 0.331 / simple 0.334 / sorted 0.346 ms).
 
-Dedup landed with it: the 32/64-bit twin kernels (`generateMixedHashCandidatePairs`,
-`generateSortedGridCandidatePairs`, `clearTouchedPairHash`, the tracked dedup insert)
-are now single templates over `PairTraits<PairT>`; the contact download/convert block
-(five copies) and the device grid-config construction (three copies) are shared
-helpers.
+Dedup landed with it (two passes, each gated by full parity):
+- the 32/64-bit twin kernels (`generateMixedHashCandidatePairs`,
+  `generateSortedGridCandidatePairs`, `clearTouchedPairHash`, the tracked dedup
+  insert) are single templates over `PairTraits<PairT>`;
+- the contact download/convert block (five copies) →
+  `downloadDeviceProximityContacts`; device grid-config construction (three
+  copies) → `makeDeviceDenseGridConfig`; surface validation + topology/position
+  upload (three copies each) → `indexedSurfaceInvalid` /
+  `uploadSurfacesToWorkspace<Workspace>`;
+- the CUDA-graph capture machinery (three copies) → **`CudaGraphReplayer`**
+  (BackendCommon): drivers keep their first-frame semantics (table init, the
+  sorted-grid CUB health probe) and pack an opaque `std::array<std::uint64_t,6>`
+  signature; the replayer owns steady-state capture → instantiate → replay →
+  safe direct fallback;
+- bench legs: `makeIndexedSurface` / `makeBenchFbpConfig` / `makeBenchHashConfig`
+  (four surface-pair + three config + two hash-config blocks);
+- `GpuCollisionNarrowPhase.cpp`: the ProximityContact→ExactContact repack
+  (two copies) → `repackProximityContactsAsExact`.
 
-**Deliberately deferred:** (a) merging the two ~870-line dense drivers — they are the
-baseline every comparison rests on; (b) extracting a shared CUDA-graph "replayer" from
-the hash/simple/sorted drivers — the sorted-grid copy materially differs (the frame-0
-CUB health probe is interleaved with its capture logic), so the abstraction is less
-clean than it looks; (c) bench-leg dedup (test harness, cosmetic). Revisit only with a
-concrete need.
+**Deliberately NOT merged: the two ~870-line dense drivers.** A measured diff
+shows 72 % identical lines but across **42 interleaved hunks** — packed-host
+vs indexed-zero-copy are genuinely different data paths sharing a skeleton, and
+a merged function would be an if-forest worse than the duplication. They are
+also the baseline every comparison rests on. Revisit only with a concrete need.
 
 ---
 

@@ -16,6 +16,7 @@
 #include <cub/cub.cuh>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>

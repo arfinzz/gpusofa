@@ -196,28 +196,6 @@ double elapsedMillisecondsSince(const std::chrono::steady_clock::time_point star
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-// Build the device-side grid config from the public DenseGridConfig. Shared by
-// the hash / simple-hash / sorted-grid drivers (was three copy-pasted blocks;
-// the two dense drivers predate it and keep their own construction).
-DeviceDenseGridConfig makeDeviceDenseGridConfig(
-    const SofaGpuCollision::backend::DenseGridConfig& gridConfig,
-    const std::uint32_t pairHashCapacity)
-{
-    return DeviceDenseGridConfig {
-        make_float3(gridConfig.gridMinX, gridConfig.gridMinY, gridConfig.gridMinZ),
-        make_float3(gridConfig.gridMaxX, gridConfig.gridMaxY, gridConfig.gridMaxZ),
-        make_float3(
-            static_cast<float>(gridConfig.gridResolutionX) / (gridConfig.gridMaxX - gridConfig.gridMinX),
-            static_cast<float>(gridConfig.gridResolutionY) / (gridConfig.gridMaxY - gridConfig.gridMinY),
-            static_cast<float>(gridConfig.gridResolutionZ) / (gridConfig.gridMaxZ - gridConfig.gridMinZ)),
-        gridConfig.gridResolutionX, gridConfig.gridResolutionY, gridConfig.gridResolutionZ,
-        gridConfig.contactDistance,
-        gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell,
-        gridConfig.maxCandidatePairs, pairHashCapacity,
-        true, false
-    };
-}
-
 template<class Callable>
 cudaError_t timeCudaOperation(
     cudaEvent_t startEvent,
@@ -478,5 +456,154 @@ __device__ bool exactTriangleIntersection(
 }
 
 
+
+
+// Validity check for an indexed triangle surface, shared by the hash /
+// simple-hash / sorted-grid drivers (was three identical lambdas).
+bool indexedSurfaceInvalid(const SofaGpuCollision::backend::TriangleIndexedSurface& s)
+{
+    return (s.positions == nullptr && s.devicePositions == nullptr) ||
+        s.triangleIndices == nullptr || s.vertexCount == 0 || s.triangleCount == 0;
+}
+
+// Bit-exact float packing for graph signatures (a raw compare, not an
+// arithmetic one, so NaN/-0 quirks cannot alias two different configs).
+std::uint64_t floatSignatureBits(const float value)
+{
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+// CUDA-graph capture/replay machinery shared by the hash / simple-hash /
+// sorted-grid drivers (was three copies). The driver owns first-frame
+// semantics (direct run, table init, any probing); this class owns the
+// steady-state capture -> instantiate -> replay -> safe-direct-fallback
+// sequence. The signature is an opaque field pack built by the driver: any
+// change (or a workspace resize) invalidates the instantiated graph, exactly
+// like the per-field comparisons it replaces.
+struct CudaGraphReplayer
+{
+    cudaStream_t captureStream { nullptr };
+    cudaGraphExec_t graphExec { nullptr };
+    bool instantiated { false };
+    std::array<std::uint64_t, 6> signature {};
+
+    void release()
+    {
+        if (graphExec != nullptr) { cudaGraphExecDestroy(graphExec); graphExec = nullptr; }
+        if (captureStream != nullptr) { cudaStreamDestroy(captureStream); captureStream = nullptr; }
+        instantiated = false;
+        signature = {};
+    }
+
+    void invalidateIfChanged(const std::array<std::uint64_t, 6>& sig, const bool forceInvalidate)
+    {
+        if (forceInvalidate || sig != signature) instantiated = false;
+    }
+
+    // Steady-state frames only. launchAll(stream) must record the whole
+    // per-frame kernel sequence on the given stream.
+    template <class LaunchAll>
+    void replay(const std::array<std::uint64_t, 6>& sig, LaunchAll&& launchAll)
+    {
+        if (captureStream == nullptr) cudaStreamCreate(&captureStream);
+        if (!instantiated && captureStream != nullptr)
+        {
+            cudaGraph_t graph = nullptr;
+            cudaError_t capErr = cudaStreamBeginCapture(captureStream, cudaStreamCaptureModeThreadLocal);
+            if (capErr == cudaSuccess)
+            {
+                launchAll(captureStream);
+                capErr = cudaStreamEndCapture(captureStream, &graph);
+            }
+            if (capErr == cudaSuccess && graph != nullptr)
+            {
+                if (graphExec != nullptr) { cudaGraphExecDestroy(graphExec); graphExec = nullptr; }
+#if CUDART_VERSION >= 12000
+                capErr = cudaGraphInstantiate(&graphExec, graph, 0ull);
+#else
+                capErr = cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0);
+#endif
+                cudaGraphDestroy(graph);
+                if (capErr == cudaSuccess)
+                {
+                    instantiated = true;
+                    signature = sig;
+                }
+            }
+            else
+            {
+                cudaGetLastError();  // clear any capture error
+            }
+        }
+        bool ranViaGraph = false;
+        if (instantiated)
+        {
+            ranViaGraph = (cudaGraphLaunch(graphExec, 0) == cudaSuccess);
+        }
+        if (!ranViaGraph)
+        {
+            launchAll(static_cast<cudaStream_t>(0));  // safe direct fallback
+        }
+    }
+};
+
+// Topology/position upload for the hash / simple-hash / sorted-grid workspaces
+// (identical field layout; was three copy-pasted blocks). Indices re-upload
+// only on topology change; positions only when the caller has host input.
+template <class Workspace>
+cudaError_t uploadSurfacesToWorkspace(
+    Workspace& ws,
+    const SofaGpuCollision::backend::TriangleIndexedSurface& firstSurface,
+    const SofaGpuCollision::backend::TriangleIndexedSurface& secondSurface,
+    SofaGpuCollision::backend::BackendExecutionStats* executionStats)
+{
+    const bool uploadFirstTopo = ws.firstSurfaceId != firstSurface.surfaceId || ws.firstTopologyVersion != firstSurface.topologyVersion;
+    const bool uploadSecondTopo = ws.secondSurfaceId != secondSurface.surfaceId || ws.secondTopologyVersion != secondSurface.topologyVersion;
+    const auto h2dStart = std::chrono::steady_clock::now();
+    cudaError_t err = cudaSuccess;
+    if (uploadFirstTopo)
+        err = copyHostArrayToDeviceAsync(ws.firstIndices, firstSurface.triangleIndices, (std::uint32_t*)nullptr, static_cast<std::size_t>(firstSurface.triangleCount) * 3u, false);
+    if (err == cudaSuccess && uploadSecondTopo)
+        err = copyHostArrayToDeviceAsync(ws.secondIndices, secondSurface.triangleIndices, (std::uint32_t*)nullptr, static_cast<std::size_t>(secondSurface.triangleCount) * 3u, false);
+    if (err == cudaSuccess && firstSurface.devicePositions == nullptr)
+        err = copyHostArrayToDeviceAsync(ws.firstPositions, firstSurface.positions, (BackendTriangleVertex*)nullptr, static_cast<std::size_t>(firstSurface.vertexCount), false);
+    if (err == cudaSuccess && secondSurface.devicePositions == nullptr)
+        err = copyHostArrayToDeviceAsync(ws.secondPositions, secondSurface.positions, (BackendTriangleVertex*)nullptr, static_cast<std::size_t>(secondSurface.vertexCount), false);
+    if (err == cudaSuccess && uploadFirstTopo) { ws.firstSurfaceId = firstSurface.surfaceId; ws.firstTopologyVersion = firstSurface.topologyVersion; }
+    if (err == cudaSuccess && uploadSecondTopo) { ws.secondSurfaceId = secondSurface.surfaceId; ws.secondTopologyVersion = secondSurface.topologyVersion; }
+    if (executionStats != nullptr)
+    {
+        executionStats->hostToDeviceMilliseconds += elapsedMillisecondsSince(h2dStart);
+        if (uploadFirstTopo) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(firstSurface.triangleCount) * 3u * sizeof(std::uint32_t);
+        if (uploadSecondTopo) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(secondSurface.triangleCount) * 3u * sizeof(std::uint32_t);
+        if (firstSurface.devicePositions == nullptr) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(firstSurface.vertexCount) * sizeof(BackendTriangleVertex);
+        if (secondSurface.devicePositions == nullptr) executionStats->hostToDeviceBytes += static_cast<std::uint64_t>(secondSurface.vertexCount) * sizeof(BackendTriangleVertex);
+    }
+    return err;
+}
+
+// Build the device-side grid config from the public DenseGridConfig. Shared by
+// the hash / simple-hash / sorted-grid drivers (was three copy-pasted blocks;
+// the two dense drivers predate it and keep their own construction).
+DeviceDenseGridConfig makeDeviceDenseGridConfig(
+    const SofaGpuCollision::backend::DenseGridConfig& gridConfig,
+    const std::uint32_t pairHashCapacity)
+{
+    return DeviceDenseGridConfig {
+        make_float3(gridConfig.gridMinX, gridConfig.gridMinY, gridConfig.gridMinZ),
+        make_float3(gridConfig.gridMaxX, gridConfig.gridMaxY, gridConfig.gridMaxZ),
+        make_float3(
+            static_cast<float>(gridConfig.gridResolutionX) / (gridConfig.gridMaxX - gridConfig.gridMinX),
+            static_cast<float>(gridConfig.gridResolutionY) / (gridConfig.gridMaxY - gridConfig.gridMinY),
+            static_cast<float>(gridConfig.gridResolutionZ) / (gridConfig.gridMaxZ - gridConfig.gridMinZ)),
+        gridConfig.gridResolutionX, gridConfig.gridResolutionY, gridConfig.gridResolutionZ,
+        gridConfig.contactDistance,
+        gridConfig.maxTissueTrianglesPerCell, gridConfig.maxToolTrianglesPerCell,
+        gridConfig.maxCandidatePairs, pairHashCapacity,
+        true, false
+    };
+}
 
 } // namespace

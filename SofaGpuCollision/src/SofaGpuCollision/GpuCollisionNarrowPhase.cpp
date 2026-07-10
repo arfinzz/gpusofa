@@ -27,6 +27,32 @@
 #include <utility>
 #include <vector>
 
+namespace
+{
+
+// Bridge ProximityContact -> ExactContact so the SOFA DetectionOutput
+// publication path stays unchanged (was duplicated per dispatch branch).
+void repackProximityContactsAsExact(
+    const std::vector<SofaGpuCollision::backend::ProximityContact>& proximityContacts,
+    std::vector<SofaGpuCollision::backend::ExactContact>& exactContacts)
+{
+    exactContacts.clear();
+    exactContacts.reserve(proximityContacts.size());
+    for (const auto& pc : proximityContacts)
+    {
+        exactContacts.push_back(SofaGpuCollision::backend::ExactContact {
+            pc.firstPrimitiveIndex,
+            pc.secondPrimitiveIndex,
+            pc.pointOnFirst,
+            pc.pointOnSecond,
+            pc.normal,
+            pc.signedDistance,
+        });
+    }
+}
+
+} // namespace
+
 namespace SofaGpuCollision
 {
 
@@ -1134,19 +1160,8 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                     // so that firstTriangleIndex carries the vertex id and
                     // secondTriangleIndex carries the triangle id; this matches the
                     // backend's convention for vertex-triangle output.
-                    exactContacts.clear();
-                    exactContacts.reserve(proximityContacts.size());
-                    for (const auto& pc : proximityContacts)
-                    {
-                        exactContacts.push_back(backend::ExactContact {
-                            pc.firstPrimitiveIndex,   // vertex id
-                            pc.secondPrimitiveIndex,  // triangle id
-                            pc.pointOnFirst,
-                            pc.pointOnSecond,
-                            pc.normal,
-                            pc.signedDistance,
-                        });
-                    }
+                    // (firstPrimitiveIndex = vertex id, secondPrimitiveIndex = triangle id)
+                    repackProximityContactsAsExact(proximityContacts, exactContacts);
                 }
             }
             else if (usingIndexedDenseGrid && d_useFeatureBasedProximity.getValue())
@@ -1233,19 +1248,7 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                 // explicitly disabled proximityKeepContactsOnDevice.
                 if (exactSucceeded)
                 {
-                    exactContacts.clear();
-                    exactContacts.reserve(proximityContacts.size());
-                    for (const auto& pc : proximityContacts)
-                    {
-                        exactContacts.push_back(backend::ExactContact {
-                            pc.firstPrimitiveIndex,
-                            pc.secondPrimitiveIndex,
-                            pc.pointOnFirst,
-                            pc.pointOnSecond,
-                            pc.normal,
-                            pc.signedDistance,
-                        });
-                    }
+                    repackProximityContactsAsExact(proximityContacts, exactContacts);
                 }
             }
             else if (usingIndexedDenseGrid)
