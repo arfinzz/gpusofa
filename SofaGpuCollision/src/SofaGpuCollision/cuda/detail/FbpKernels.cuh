@@ -145,56 +145,19 @@ __device__ __forceinline__ void closestPointSegmentSegment(
     c2 = add3(p2, mul3(d2, t));
 }
 
-// One thread per candidate pair. Each thread runs 6 VF + 9 EE and keeps the
-// closest feature pair under the contact-distance threshold.
-__global__ void featureBasedProximityKernel(
-    const BackendTriangleVertex* __restrict__ firstPositions,
-    const std::uint32_t* __restrict__ firstIndices,
-    const BackendTriangleVertex* __restrict__ secondPositions,
-    const std::uint32_t* __restrict__ secondIndices,
-    const std::uint64_t* __restrict__ candidatePairs64,
-    const std::uint32_t* __restrict__ candidatePairs32,
-    const std::uint32_t* __restrict__ candidatePairCount,
-    const bool useCompactCandidatePairs,
-    DeviceProximityContact* __restrict__ contacts,
-    std::uint32_t* __restrict__ contactCount,
-    std::uint32_t* __restrict__ overflowCount,
-    std::uint32_t* __restrict__ vfCount,
-    std::uint32_t* __restrict__ fvCount,
-    std::uint32_t* __restrict__ eeCount,
-    const std::uint32_t maxContacts,
-    const float contactDistance,
-    const bool computeBarycentrics)
+// Per-pair closest-feature test: cheap exact AABB pre-reject, then 3 VF + 3 FV
+// + 9 EE keeping the closest feature under the threshold. Fills every contact
+// field EXCEPT the primitive indices (the caller owns those). Returns false
+// when the pair is rejected. Extracted verbatim from featureBasedProximityKernel
+// (2026-07-12) so the big-cell fused kernel (way 6) can run the identical math
+// against shared-memory staged vertices — same test order, bit-identical values.
+__device__ __forceinline__ bool fbpComputeClosestFeatureContact(
+    const float3 aV[3],
+    const float3 bV[3],
+    const float distThreshSq,
+    const bool computeBarycentrics,
+    DeviceProximityContact& c)
 {
-    // Grid-stride over ALL candidate pairs. The launch grid is a fixed modest
-    // size (over-launch), so the stride loop is what guarantees every pair is
-    // processed even when pairCount exceeds the launched thread count (large
-    // scenes produce far more than 65 536 candidate pairs).
-    const std::uint32_t pairCount = *candidatePairCount;
-    const std::uint32_t stride = gridDim.x * blockDim.x;
-    const float distThreshSq = contactDistance * contactDistance;
-    for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < pairCount; idx += stride)
-    {
-    std::uint32_t aIdx = 0u;
-    std::uint32_t bIdx = 0u;
-    if (useCompactCandidatePairs)
-    {
-        const std::uint32_t pair = candidatePairs32[idx];
-        aIdx = pair >> 16u;
-        bIdx = pair & 0xffffu;
-    }
-    else
-    {
-        const std::uint64_t pair = candidatePairs64[idx];
-        aIdx = static_cast<std::uint32_t>(pair >> 32);
-        bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
-    }
-
-    const DeviceTriangle ta = indexedTriangleAt(firstPositions, firstIndices, aIdx);
-    const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
-    const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
-    const float3 bV[3] = { tb.p0, tb.p1, tb.p2 };
-
     // Cheap conservative AABB pre-reject (2026-06-17): if the two triangles'
     // axis-aligned boxes are separated by more than contactDistance, their
     // closest features cannot be within contactDistance, so skip the 15
@@ -217,7 +180,7 @@ __global__ void featureBasedProximityKernel(
         const float gz = fmaxf(0.0f, fmaxf(aMin.z - bMax.z, bMin.z - aMax.z));
         if (gx * gx + gy * gy + gz * gz > distThreshSq)
         {
-            continue;
+            return false;
         }
     }
 
@@ -295,19 +258,9 @@ __global__ void featureBasedProximityKernel(
 
     if (bestDistSq > distThreshSq)
     {
-        continue;
+        return false;
     }
 
-    const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
-    if (outIdx >= maxContacts)
-    {
-        atomicAdd(overflowCount, 1u);
-        continue;
-    }
-
-    DeviceProximityContact c;
-    c.firstPrimitiveIndex = aIdx;
-    c.secondPrimitiveIndex = bIdx;
     c.featureKind = static_cast<std::uint8_t>(bestKind);
     c.firstFeatureLocalIndex = static_cast<std::uint8_t>(bestI);
     c.secondFeatureLocalIndex = static_cast<std::uint8_t>(bestJ);
@@ -336,11 +289,91 @@ __global__ void featureBasedProximityKernel(
     {
         c.normal = make_float3(0.0f, 1.0f, 0.0f);
     }
-    contacts[outIdx] = c;
+    return true;
+}
 
-    if (bestKind == 0)      atomicAdd(vfCount, 1u);
-    else if (bestKind == 1) atomicAdd(fvCount, 1u);
-    else                    atomicAdd(eeCount, 1u);
+// Append a finished contact to the output array + per-class tallies. Shared by
+// the FBP kernel and the way-6 fused kernel (same counter-then-bounds order).
+__device__ __forceinline__ void fbpEmitContact(
+    const DeviceProximityContact& c,
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* __restrict__ contactCount,
+    std::uint32_t* __restrict__ overflowCount,
+    std::uint32_t* __restrict__ vfCount,
+    std::uint32_t* __restrict__ fvCount,
+    std::uint32_t* __restrict__ eeCount,
+    const std::uint32_t maxContacts)
+{
+    const std::uint32_t outIdx = atomicAdd(contactCount, 1u);
+    if (outIdx >= maxContacts)
+    {
+        atomicAdd(overflowCount, 1u);
+        return;
+    }
+    contacts[outIdx] = c;
+    if (c.featureKind == 0u)      atomicAdd(vfCount, 1u);
+    else if (c.featureKind == 1u) atomicAdd(fvCount, 1u);
+    else                          atomicAdd(eeCount, 1u);
+}
+
+// One thread per candidate pair. Each thread runs 6 VF + 9 EE and keeps the
+// closest feature pair under the contact-distance threshold.
+__global__ void featureBasedProximityKernel(
+    const BackendTriangleVertex* __restrict__ firstPositions,
+    const std::uint32_t* __restrict__ firstIndices,
+    const BackendTriangleVertex* __restrict__ secondPositions,
+    const std::uint32_t* __restrict__ secondIndices,
+    const std::uint64_t* __restrict__ candidatePairs64,
+    const std::uint32_t* __restrict__ candidatePairs32,
+    const std::uint32_t* __restrict__ candidatePairCount,
+    const bool useCompactCandidatePairs,
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* __restrict__ contactCount,
+    std::uint32_t* __restrict__ overflowCount,
+    std::uint32_t* __restrict__ vfCount,
+    std::uint32_t* __restrict__ fvCount,
+    std::uint32_t* __restrict__ eeCount,
+    const std::uint32_t maxContacts,
+    const float contactDistance,
+    const bool computeBarycentrics)
+{
+    // Grid-stride over ALL candidate pairs. The launch grid is a fixed modest
+    // size (over-launch), so the stride loop is what guarantees every pair is
+    // processed even when pairCount exceeds the launched thread count (large
+    // scenes produce far more than 65 536 candidate pairs).
+    const std::uint32_t pairCount = *candidatePairCount;
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    const float distThreshSq = contactDistance * contactDistance;
+    for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < pairCount; idx += stride)
+    {
+    std::uint32_t aIdx = 0u;
+    std::uint32_t bIdx = 0u;
+    if (useCompactCandidatePairs)
+    {
+        const std::uint32_t pair = candidatePairs32[idx];
+        aIdx = pair >> 16u;
+        bIdx = pair & 0xffffu;
+    }
+    else
+    {
+        const std::uint64_t pair = candidatePairs64[idx];
+        aIdx = static_cast<std::uint32_t>(pair >> 32);
+        bIdx = static_cast<std::uint32_t>(pair & 0xffffffffu);
+    }
+
+    const DeviceTriangle ta = indexedTriangleAt(firstPositions, firstIndices, aIdx);
+    const DeviceTriangle tb = indexedTriangleAt(secondPositions, secondIndices, bIdx);
+    const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
+    const float3 bV[3] = { tb.p0, tb.p1, tb.p2 };
+
+    DeviceProximityContact c;
+    if (!fbpComputeClosestFeatureContact(aV, bV, distThreshSq, computeBarycentrics, c))
+    {
+        continue;
+    }
+    c.firstPrimitiveIndex = aIdx;
+    c.secondPrimitiveIndex = bIdx;
+    fbpEmitContact(c, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
     } // grid-stride loop
 }
 

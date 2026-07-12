@@ -58,7 +58,7 @@ chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 > **Companion documents (outside the tutorial):**
 > [reports/README_metrics_explained.md](../reports/README_metrics_explained.md) defines
 > every benchmark number; the current measured results + full optimization history are in
-> [reports/performance_five_ways_20260703.md](../reports/performance_five_ways_20260703.md);
+> [reports/performance_six_ways_20260713.md](../reports/performance_six_ways_20260713.md);
 > `guide/architecture.md` and `guide/plan.md` are the terse engineering references.
 
 > **Diagrams.** Chapters 00, 07, 08, 13, 15, 16 use ```mermaid``` blocks — they render as

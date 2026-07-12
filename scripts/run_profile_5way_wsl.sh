@@ -19,10 +19,10 @@ mkdir -p "$OUT"
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null)"
 export LD_LIBRARY_PATH="$BUILD:${SOFA_ROOT}/lib:${PLP}"
 
-# mode name -> leg gate env values: FBP VT HASH SIMPLE SORTED
+# mode name -> leg gate env values: FBP VT HASH SIMPLE SORTED BIGCELL
 run_env() {
-    local fbp="$1" vt="$2" hash="$3" simple="$4" sorted="$5"
-    echo "SOFA_BACKEND_BENCH_RUN_FBP=$fbp SOFA_BACKEND_BENCH_RUN_VT=$vt SOFA_BACKEND_BENCH_RUN_HASH=$hash SOFA_BACKEND_BENCH_RUN_SIMPLE_HASH=$simple SOFA_BACKEND_BENCH_RUN_SORTED_GRID=$sorted"
+    local fbp="$1" vt="$2" hash="$3" simple="$4" sorted="$5" bigcell="${6:-0}"
+    echo "SOFA_BACKEND_BENCH_RUN_FBP=$fbp SOFA_BACKEND_BENCH_RUN_VT=$vt SOFA_BACKEND_BENCH_RUN_HASH=$hash SOFA_BACKEND_BENCH_RUN_SIMPLE_HASH=$simple SOFA_BACKEND_BENCH_RUN_SORTED_GRID=$sorted SOFA_BACKEND_BENCH_RUN_BIGCELL=$bigcell"
 }
 
 profile_mode() {
@@ -35,7 +35,7 @@ profile_mode() {
         SOFA_BACKEND_BENCH_CSV="$OUT/${mode}_timings.csv" \
         SOFA_BACKEND_BENCH_STEPS=12 SOFA_BACKEND_BENCH_WARMUP=3 \
         SOFA_GPU_DETAILED_PROFILING=0 \
-        SOFA_HASH_CUDA_GRAPH=0 SOFA_SIMPLE_HASH_CUDA_GRAPH=0 SOFA_SORTED_GRID_CUDA_GRAPH=0 \
+        SOFA_HASH_CUDA_GRAPH=0 SOFA_SIMPLE_HASH_CUDA_GRAPH=0 SOFA_SORTED_GRID_CUDA_GRAPH=0 SOFA_BIGCELL_CUDA_GRAPH=0 \
         nsys profile -t cuda --force-overwrite=true -o "$OUT/${mode}" \
         "$BENCH" > "$OUT/${mode}_bench_stdout.txt" 2>&1
     if [[ -f "$OUT/${mode}.qdstrm" && -x "$NSIGHT_HOST/QdstrmImporter" ]]; then
@@ -56,7 +56,7 @@ profile_mode() {
         SOFA_BACKEND_BENCH_CSV="$OUT/${mode}_ncu_timings.csv" \
         SOFA_BACKEND_BENCH_STEPS=4 SOFA_BACKEND_BENCH_WARMUP=1 \
         SOFA_GPU_DETAILED_PROFILING=0 \
-        SOFA_HASH_CUDA_GRAPH=0 SOFA_SIMPLE_HASH_CUDA_GRAPH=0 SOFA_SORTED_GRID_CUDA_GRAPH=0 \
+        SOFA_HASH_CUDA_GRAPH=0 SOFA_SIMPLE_HASH_CUDA_GRAPH=0 SOFA_SORTED_GRID_CUDA_GRAPH=0 SOFA_BIGCELL_CUDA_GRAPH=0 \
         ncu --target-processes all --kernel-name-base function \
         --launch-count 45 --launch-skip 12 \
         --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread \
@@ -65,10 +65,21 @@ profile_mode() {
     echo
 }
 
-profile_mode dense  "$(run_env 1 0 0 0 0)"
-profile_mode hash   "$(run_env 0 0 1 0 0)"
-profile_mode simple "$(run_env 0 0 0 1 0)"
-profile_mode sorted "$(run_env 0 0 0 0 1)"
+# Optional filter: pass mode names as args to profile a subset (batching under
+# a caller wall-clock cap); no args = all five modes.
+MODES=("$@")
+should_run() {
+    [ ${#MODES[@]} -eq 0 ] && return 0
+    local m
+    for m in "${MODES[@]}"; do [ "$m" = "$1" ] && return 0; done
+    return 1
+}
+
+should_run dense   && profile_mode dense   "$(run_env 1 0 0 0 0 0)"
+should_run hash    && profile_mode hash    "$(run_env 0 0 1 0 0 0)"
+should_run simple  && profile_mode simple  "$(run_env 0 0 0 1 0 0)"
+should_run sorted  && profile_mode sorted  "$(run_env 0 0 0 0 1 0)"
+should_run bigcell && profile_mode bigcell "$(run_env 0 0 0 0 0 1)"
 
 echo "OUT_DIR=$OUT"
 echo PROFILE5WAY_DONE

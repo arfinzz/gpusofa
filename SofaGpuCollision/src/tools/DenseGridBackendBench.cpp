@@ -863,5 +863,96 @@ int main()
                   << ") should equal fbp_contacts above (unique_pairs may be lower in home-cell mode).\n";
     }
 
+    if (envBool("SOFA_BACKEND_BENCH_RUN_BIGCELL", true))
+    {
+        std::cout << "\n--- bench: big-cell fused generation + narrow phase (tri-tri, 6th way) ---\n";
+        const auto tissueIndexed = packedToIndexed(tissue);
+        const auto bladeIndexed = packedToIndexed(blade);
+
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xF001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xF002ull);
+
+        SofaGpuCollision::backend::BigCellConfig bigConfig;
+        bigConfig.bigCellFactor = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_FACTOR", 2));
+        bigConfig.toolTileCapacity = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_TILE", 256));
+        bigConfig.useHashTableBuild = envBool("SOFA_BACKEND_BENCH_BIGCELL_HASH_BUILD", false);
+        bigConfig.hashSlotsPerBigCell = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_HASH_SLOTS", 1024));
+
+        const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
+
+        const std::filesystem::path bigPath = outputPath.parent_path() / (outputPath.stem().string() + "_bigcell.csv");
+        std::ofstream bigCsv(bigPath, std::ios::out | std::ios::trunc);
+        bigCsv << std::fixed << std::setprecision(9);
+        bigCsv << "step,wall_ms,gpu_kernel_ms,h2d_bytes,d2h_bytes,kernel_launch_count,cuda_memset_count,"
+                  "big_cells,entries,mixed_big_cells,pairs_tested,emitted_contacts,vf,fv,ee,"
+                  "entry_overflow,build_overflow\n";
+
+        double bigWallTotal = 0.0, bigKernelTotal = 0.0;
+        int bigMeasured = 0;
+        std::uint64_t bigLastContacts = 0, bigLastPairs = 0, bigLastMixed = 0, bigLastEntries = 0;
+        std::uint64_t bigLastVf = 0, bigLastFv = 0, bigLastEe = 0, bigLastEntryOf = 0, bigLastBuildOf = 0;
+
+        for (int step = 0; step < steps + warmup; ++step)
+        {
+            std::vector<ProximityContact> bigContacts;
+            SofaGpuCollision::backend::BackendExecutionStats stats;
+            FeatureBasedProximityStats proximityStats;
+            SofaGpuCollision::backend::BigCellStats bigStatsOut;
+            std::string diagnostic;
+
+            const auto start = std::chrono::steady_clock::now();
+            const bool ok = SofaGpuCollision::backend::computeBigCellFusedProximityContacts(
+                tissueSurface, bladeSurface, config, bigConfig, fbpConfig,
+                bigContacts, &proximityStats, &bigStatsOut, diagnostic, &stats);
+            const double wallMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (!ok) { std::cerr << "Big-cell bench failed: " << diagnostic << "\n"; return 8; }
+
+            if (step >= warmup)
+            {
+                ++bigMeasured;
+                bigWallTotal += wallMs;
+                bigKernelTotal += stats.gpuKernelMilliseconds;
+                bigLastContacts = proximityStats.emittedContactCount;
+                bigLastPairs = bigStatsOut.pairsTestedCount;
+                bigLastMixed = bigStatsOut.mixedBigCellCount;
+                bigLastEntries = bigStatsOut.entryCount;
+                bigLastVf = proximityStats.vfContactCount;
+                bigLastFv = proximityStats.fvContactCount;
+                bigLastEe = proximityStats.eeContactCount;
+                bigLastEntryOf = bigStatsOut.entryOverflowCount;
+                bigLastBuildOf = bigStatsOut.buildOverflowCount;
+            }
+
+            bigCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
+                   << stats.hostToDeviceBytes << ',' << stats.deviceToHostBytes << ','
+                   << stats.kernelLaunchCount << ',' << stats.cudaMemsetCount << ','
+                   << bigStatsOut.bigCellCount << ',' << bigStatsOut.entryCount << ','
+                   << bigStatsOut.mixedBigCellCount << ',' << bigStatsOut.pairsTestedCount << ','
+                   << proximityStats.emittedContactCount << ','
+                   << proximityStats.vfContactCount << ',' << proximityStats.fvContactCount << ','
+                   << proximityStats.eeContactCount << ','
+                   << bigStatsOut.entryOverflowCount << ',' << bigStatsOut.buildOverflowCount << '\n';
+        }
+
+        std::cout << "bigcell_build=" << (bigConfig.useHashTableBuild ? "hash_table" : "csr") << '\n'
+                  << "bigcell_factor=" << bigConfig.bigCellFactor << '\n'
+                  << "bigcell_tool_tile=" << bigConfig.toolTileCapacity << '\n'
+                  << "bigcell_measured_steps=" << bigMeasured << '\n'
+                  << "bigcell_wall_avg_ms=" << (bigMeasured > 0 ? bigWallTotal / bigMeasured : 0.0) << '\n'
+                  << "bigcell_gpu_kernel_avg_ms=" << (bigMeasured > 0 ? bigKernelTotal / bigMeasured : 0.0) << '\n'
+                  << "bigcell_entries=" << bigLastEntries << '\n'
+                  << "bigcell_mixed_big_cells=" << bigLastMixed << '\n'
+                  << "bigcell_pairs_tested=" << bigLastPairs << '\n'
+                  << "bigcell_contacts=" << bigLastContacts << " (vf=" << bigLastVf
+                  << " fv=" << bigLastFv << " ee=" << bigLastEe << ")\n"
+                  << "bigcell_entry_overflow=" << bigLastEntryOf
+                  << " bigcell_build_overflow=" << bigLastBuildOf << '\n'
+                  << "bigcell_csv=" << bigPath.string() << '\n'
+                  << "CORRECTNESS: bigcell_contacts (" << bigLastContacts
+                  << ") should equal fbp_contacts above; bigcell_pairs_tested should equal "
+                  << "sortedgrid_unique_pairs (home-cell rule at the same small-cell granularity).\n";
+    }
+
     return 0;
 }

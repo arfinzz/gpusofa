@@ -32,9 +32,16 @@ mkdir -p "${RUNDIR}"
 echo "Full suite run dir -> ${RUNDIR}"
 
 # run_leg <leg-name> <scene-file> <KEY=VAL ...extra env>
+# SOFA_SUITE_ONLY (optional): regex; legs not matching are skipped. Lets the
+# suite run in batches when the caller has a wall-clock cap (e.g. wsl.exe
+# invocations from Windows), sharing one RUNDIR via SOFA_BENCHMARK_LOG_DIR.
 run_leg() {
     local leg="$1"; shift
     local scene="$1"; shift
+    if [[ -n "${SOFA_SUITE_ONLY:-}" && ! "${leg}" =~ ${SOFA_SUITE_ONLY} ]]; then
+        echo "  (skip ${leg} — filtered by SOFA_SUITE_ONLY)"
+        return 0
+    fi
     local leg_dir="${RUNDIR}/${leg}"
     mkdir -p "${leg_dir}"
     echo "------------------------------------------------------------"
@@ -54,6 +61,7 @@ LARGE="${REPO_DIR}/testscenes/large_tissue_blade.py"
 VT_SELF="${REPO_DIR}/testscenes/self_collision_vertex_triangle.py"
 VT_CROSS="${REPO_DIR}/testscenes/cross_model_vertex_triangle.py"
 HASH="${REPO_DIR}/testscenes/hash_prefixsum_large.py"
+XLARGE="${REPO_DIR}/testscenes/collision_xlarge_200k.py"
 
 # --- tri-tri FBP: small ---
 run_leg small_fastpath   "${SMALL}" SOFA_USE_FEATURE_BASED_PROXIMITY=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=0
@@ -69,11 +77,17 @@ run_leg vt_self_fastpath    "${VT_SELF}"  SOFA_PROXIMITY_READ_CONTACT_COUNTER=0
 run_leg vt_cross_validation "${VT_CROSS}" SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 run_leg vt_cross_fastpath   "${VT_CROSS}" SOFA_PROXIMITY_READ_CONTACT_COUNTER=0
 
-# --- broad-cull 5-way (large tissue + large tool): dense, optimised hash, simple hash, sorted grid ---
-run_leg hash_dense  "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=0 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
-run_leg hash_on     "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
-run_leg hash_simple "${HASH}" SOFA_USE_SIMPLE_HASH_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
-run_leg hash_sorted "${HASH}" SOFA_USE_SORTED_GRID_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+# --- broad-cull 6-way (large tissue + large tool): dense, optimised hash, simple hash, sorted grid, big-cell fused ---
+run_leg hash_dense   "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=0 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg hash_on      "${HASH}" SOFA_USE_HASH_PREFIXSUM_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg hash_simple  "${HASH}" SOFA_USE_SIMPLE_HASH_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg hash_sorted  "${HASH}" SOFA_USE_SORTED_GRID_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg hash_bigcell "${HASH}" SOFA_USE_BIGCELL_FUSED_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+
+# --- extra-large (~200k tris): the ways that matter at scale ---
+run_leg xlarge_dense   "${XLARGE}" SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg xlarge_sorted  "${XLARGE}" SOFA_USE_SORTED_GRID_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
+run_leg xlarge_bigcell "${XLARGE}" SOFA_USE_BIGCELL_FUSED_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 
 echo
 echo "============================================================"

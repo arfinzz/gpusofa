@@ -43,3 +43,4 @@
 #include "detail/HashGrid.cuh"
 #include "detail/SimpleHash.cuh"
 #include "detail/SortedGrid.cuh"
+#include "detail/BigCellGrid.cuh"

@@ -3,7 +3,7 @@
 You've seen the pipeline. This chapter is the **catalogue**: the five test scenes, what
 each one is *for*, the two ways every scene can be run, the A/B comparison runs, and how
 to read what each produces. All numbers are the fresh 2026-06-18 measurements on the
-GTX 1650 Ti (full table in `reports/performance_five_ways_20260703.md`).
+GTX 1650 Ti (full table in `reports/performance_six_ways_20260713.md`).
 
 ---
 
@@ -106,7 +106,7 @@ pair-hash 0.512) — all **2354 contacts, 0 overflow**. The simple hash ties the
 hash with a **7-kernel** pipeline instead of 11, and the sorted grid ties them with 9 —
 then wins outright on the 79,520-element bench (0.65 vs 2.0–2.6 ms) thanks to its
 home-cell AABB pre-cull (see [08_optimising_the_hash.md](08_optimising_the_hash.md) and
-[reports/performance_five_ways_20260703.md](../reports/performance_five_ways_20260703.md)).
+[reports/performance_six_ways_20260713.md](../reports/performance_six_ways_20260713.md)).
 
 ---
 
@@ -151,7 +151,7 @@ scripts/run_report_bench_wsl.sh
 Every number these print is defined in
 [reports/README_metrics_explained.md](../reports/README_metrics_explained.md); the
 current consolidated results are in
-`reports/performance_five_ways_20260703.md`.
+`reports/performance_six_ways_20260713.md`.
 
 Next: how those timing numbers are produced and what each CSV column means →
 [14_benchmark_metrics.md](14_benchmark_metrics.md).

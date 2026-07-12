@@ -326,6 +326,11 @@ GpuCollisionNarrowPhase::GpuCollisionNarrowPhase()
     , d_useSortedGridGeneration(initData(&d_useSortedGridGeneration, false, "useSortedGridGeneration", "EXPERIMENTAL '5th way': replace the dense-grid broad cull with a SORTED-GRID (tiled binning) broad cull for the tri-tri FBP path — expand (cell, triangle) incidences, sort them by cell, generate pairs from each cell's contiguous run with the tool run staged in shared memory. NO per-cell capacity caps (no best-effort drops). Same FBP narrow kernel -> identical contacts. Default off. Precedence: hash > simple hash > sorted grid."))
     , d_sortedGridUseCubSort(initData(&d_sortedGridUseCubSort, false, "sortedGridUseCubSort", "Sorted-grid sort engine: false (default) = hand-rolled one-pass counting sort (CUB-free); true = cub::DeviceRadixSort over the padded incidence buffer."))
     , d_sortedGridUsePairHashDedup(initData(&d_sortedGridUsePairHashDedup, false, "sortedGridUsePairHashDedup", "Sorted-grid dedup: false (default) = home-cell exactly-once emission (no dedup hash table; also pre-culls AABB-disjoint pairs, so candidate counts may be lower while contacts stay identical); true = the same atomicCAS pair-hash as the hash ways (reproduces their candidate set exactly)."))
+    , d_useBigCellFusedGeneration(initData(&d_useBigCellFusedGeneration, false, "useBigCellFusedGeneration", "EXPERIMENTAL '6th way': big-cell / small-cell FUSED generation + narrow phase. Small cells are grouped into big cells (bigCellFactor^3); a per-big-cell CSR table of (triangle, small cell) entries is built, then ONE kernel per mixed big cell stages the tool side (ids + AABBs + vertices) in shared memory and runs the FBP closest-feature math inline — no intermediate pair list, no separate FBP launch. Same home-cell dedup rule as the sorted grid -> identical contacts. Default off. Precedence: big cell > hash > simple hash > sorted grid."))
+    , d_bigCellFactor(initData(&d_bigCellFactor, static_cast<unsigned int>(2), "bigCellFactor", "Big-cell edge length in small cells for useBigCellFusedGeneration. Power of two, at most 4. Default 2 (measured best: factor 4 starves block-level parallelism on blade-concentrated scenes)."))
+    , d_bigCellToolTile(initData(&d_bigCellToolTile, static_cast<unsigned int>(256), "bigCellToolTile", "Tool entries staged in shared memory per chunk for useBigCellFusedGeneration (1..256). Lower values exercise the oversized-big-cell chunk loop."))
+    , d_bigCellUseHashBuild(initData(&d_bigCellUseHashBuild, false, "bigCellUseHashBuild", "Big-cell table build strategy A/B: false (default) = CSR bucket lists (count -> scan -> fill); true = literal per-big-cell open-addressing hash multi-map build."))
+    , d_bigCellHashSlots(initData(&d_bigCellHashSlots, static_cast<unsigned int>(1024), "bigCellHashSlots", "Hash-build only: open-addressing slots per (big cell, side) region. Rounded to a power of two, clamped to [64, 4096]."))
     , d_hashTableSize(initData(&d_hashTableSize, static_cast<unsigned int>(0), "hashTableSize", "Hash table slot count for useHashPrefixSumGeneration / useSimpleHashGeneration. 0 = auto-derive (~4 slots per input triangle). Rounded up to a power of two."))
     , d_useFeatureBasedProximity(initData(&d_useFeatureBasedProximity, false, "useFeatureBasedProximity", "Replace SAT-style exact triangle intersection with feature-based proximity (VF + EE) using Ericson closest-point math. Outputs barycentric weights for a CUDA constraint solver."))
     , d_useVertexTriangleProximity(initData(&d_useVertexTriangleProximity, false, "useVertexTriangleProximity", "When set together with useFeatureBasedProximity, route self-collision pairs (pair.first == pair.second on a CudaTriangleCollisionModel) through the vertex-triangle proximity kernel. Useful for surgical self-collision such as cutting/tearing."))
@@ -1170,7 +1175,30 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                 // with barycentric weights consumable by a CUDA constraint solver.
                 std::vector<backend::ProximityContact> proximityContacts;
                 backend::FeatureBasedProximityStats proximityStats;
-                if (d_useHashPrefixSumGeneration.getValue())
+                if (d_useBigCellFusedGeneration.getValue())
+                {
+                    // 6th way: big-cell / small-cell fused generation + narrow
+                    // phase. Home-cell dedup at small-cell granularity + the
+                    // identical FBP math inline -> contacts match the other paths.
+                    backend::BigCellConfig bigConfig;
+                    bigConfig.bigCellFactor = d_bigCellFactor.getValue();
+                    bigConfig.toolTileCapacity = d_bigCellToolTile.getValue();
+                    bigConfig.useHashTableBuild = d_bigCellUseHashBuild.getValue();
+                    bigConfig.hashSlotsPerBigCell = d_bigCellHashSlots.getValue();
+                    backend::BigCellStats bigStats;
+                    exactSucceeded = backend::computeBigCellFusedProximityContacts(
+                        firstIndexedSurface,
+                        secondIndexedSurface,
+                        denseGridConfig,
+                        bigConfig,
+                        proximityConfig,
+                        proximityContacts,
+                        &proximityStats,
+                        &bigStats,
+                        diagnostic,
+                        &backendStats);
+                }
+                else if (d_useHashPrefixSumGeneration.getValue())
                 {
                     // EXPERIMENTAL: spatial-hash + prefix-sum broad cull instead
                     // of the dense grid. Same FBP narrow kernel -> identical contacts.

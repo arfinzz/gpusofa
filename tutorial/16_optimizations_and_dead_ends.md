@@ -302,6 +302,6 @@ fix is to **reduce the number of loads**, not add warps:
 | Earlier hash (2026-06-09) | ~1.27 ms | 1.2× |
 | **Optimised hash (compact + no-search + scan-drop + pre-reject + graphs)** | **~0.35 ms** | **~4.2×** |
 
-Full current numbers + every scene: `reports/performance_five_ways_20260703.md`.
+Full current numbers + every scene: `reports/performance_six_ways_20260713.md`.
 The kernel/data-structure reference (launch shapes, thread allocation):
 [17_kernels_reference.md](17_kernels_reference.md).

@@ -4,9 +4,9 @@ End-to-end instructions for running, building, profiling, and tuning the
 GPU SOFA collision pipeline. Read top to bottom for a fresh machine; jump
 to a section if you already know the lay of the land.
 
-Last refreshed: 2026-07-03 (five broad-cull ways wired and measured — dense,
-Phase-15 dense, optimised hash, simple hash, sorted grid — plus full per-kernel
-profiling for every mode; see `reports/performance_five_ways_20260703.md`).
+Last refreshed: 2026-07-13 (six broad-cull ways wired and measured — dense,
+Phase-15 dense, optimised hash, simple hash, sorted grid, big-cell fused — plus
+full per-kernel profiling for every mode; see `reports/performance_six_ways_20260713.md`).
 
 ---
 
@@ -200,7 +200,8 @@ needed):
 | `large_tissue_blade.py` | GPU dense-grid FBP, large mesh (~79,520 elements) | fast ~146 FPS / validation ~114 FPS, **8018** contacts (5397/880/1741) |
 | `self_collision_vertex_triangle.py` | **Phase 12 v-t self-collision** | 1300–2100 FPS, **2700 VertexFace** contacts |
 | `cross_model_vertex_triangle.py` | **Phase 12 v-t cross-model** | 1500–4200 FPS, **254 VertexFace** contacts |
-| `hash_prefixsum_large.py` | **Optimised hash broad cull** (large tissue + large tool, ~14,368 elements; reworked 2026-06-17) | hash kernel **~0.5–0.7 ms vs dense ~1.8–2.1 ms (2.5–3× faster)**, **2354** contacts (identical dense vs hash) |
+| `hash_prefixsum_large.py` | **Broad-cull way selector scene** (large tissue + large tool, ~14,368 elements) — all six ways via the `SOFA_USE_*_GENERATION` envs | **2354** contacts identical for every way; narrow kernel: bigcell 0.30 / simple 0.33 / sorted 0.34 / hash 0.34 / dense 1.3–1.5 ms |
+| `collision_xlarge_200k.py` | **Extra-large scale test** (~213k elements: 315×315 tissue grid + subdivided blade; same construction as the other scenes, same env toggles) | **12,178** contacts identical across ways; narrow kernel: bigcell **2.01** / sorted 2.25 / dense 4.12 ms. Bench equivalent: `SOFA_LARGE_TISSUE_NX=316` |
 
 Common scene helpers in `testscenes/dense_collision_benchmark_common.py`:
 
@@ -222,7 +223,10 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 
 | Script | Scene(s) | Default mode |
 |---|---|---|
-| `run_full_benchmark_suite_wsl.sh` | **All five canonical scenes** (small, large, v-t self, v-t cross, hash A/B) in fast + validation modes | 160 steps/leg, writes one summary per leg |
+| `run_full_benchmark_suite_wsl.sh` | **All canonical scenes** (small, large, v-t self, v-t cross, 5-way legs on the 14k scene, 3 xlarge-200k legs) in fast + validation modes | 160 steps/leg, one summary per leg; `SOFA_SUITE_ONLY='<regex>'` runs a filtered batch (useful under a wall-clock cap) |
+| `run_bigcell_parity_wsl.sh` | **Way-6 parity gate** — backend bench across the big-cell toggle matrix (factors 4/2/1, forced chunk loop, hash-build legs) | contacts must equal the FBP leg; `bigcell_pairs_tested` must equal `sortedgrid_unique_pairs` |
+| `run_ncu_bigcell_wsl.sh` | **Nsight Compute on the way-6 kernels** (80k + 200k, factors 2 + 4) | per-kernel SOL/DRAM/occupancy/registers CSVs |
+| `run_mode_comparison_ab_wsl.sh` | **8-leg same-session broad-cull comparison** on `hash_prefixsum_large.py` (dense ×2, hash, simple, sorted ×3, bigcell) | counter-on, prints the kernel-time summary table |
 | `run_fbp_smoke_test_wsl.sh` | **`one_tissue_one_blade.py` with FBP** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
 | `run_fbp_large_tissue_wsl.sh` | **`large_tissue_blade.py` FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
 | `run_vertex_triangle_smoke_wsl.sh` | **`self_collision_vertex_triangle.py`** (Phase 12) | FBP + v-t self, readback on |
@@ -298,11 +302,17 @@ These all default sensibly. Set them only to override.
 | `SOFA_HASH_CUDA_GRAPH` | **1** | **DEFAULT ON (guide/plan.md §5.20).** Replay the hash broad cull's 11-kernel sequence as a captured CUDA Graph each steady-state frame (verified bit-identical, ~−7 % kernel / +10 % FPS). Set to 0 to launch the kernels individually (e.g. to A/B, or under detailed profiling, where it is auto-disabled). Only affects the `useHashPrefixSumGeneration` path |
 | `SOFA_USE_SIMPLE_HASH_GENERATION` | **0** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash for the tri-tri FBP path — triangles stored straight into per-cell hash buckets in one insert pass (no mark/compact/fill), 7 kernels. Read by `testscenes/hash_prefixsum_large.py`; or set the `useSimpleHashGeneration` Data field directly. **Measured tied with the optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow** on the 14,368-element scene. Mutually exclusive with the hash flag (hash wins). Requires FBP on. See `reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md` |
 | `SOFA_SIMPLE_HASH_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the simple-hash 7-kernel sequence as a captured CUDA Graph each steady-state frame (same machinery as `SOFA_HASH_CUDA_GRAPH`, safe fallback). Set to 0 to launch individually. Only affects the `useSimpleHashGeneration` path |
-| `SOFA_USE_SORTED_GRID_GENERATION` | **0** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Sorted-grid (tiled binning) broad cull: incidence expansion → counting sort by cell → block-per-mixed-cell generation with shared-memory staging; home-cell exactly-once dedup doubling as an exact AABB pre-cull. No per-cell caps. **Ties the hashes on the 14,368 scene (~0.35 ms); ~3× faster than everything on the 79,520 bench (0.65 ms), bit-identical.** Read by `testscenes/hash_prefixsum_large.py`, or set the `useSortedGridGeneration` Data field. See `reports/performance_five_ways_20260703.md` |
+| `SOFA_USE_SORTED_GRID_GENERATION` | **0** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Sorted-grid (tiled binning) broad cull: incidence expansion → counting sort by cell → block-per-mixed-cell generation with shared-memory staging; home-cell exactly-once dedup doubling as an exact AABB pre-cull. No per-cell caps. **Ties the hashes on the 14,368 scene (~0.35 ms); ~3× faster than everything on the 79,520 bench (0.65 ms), bit-identical.** Read by `testscenes/hash_prefixsum_large.py`, or set the `useSortedGridGeneration` Data field. See `reports/performance_six_ways_20260713.md` |
 | `SOFA_SORTED_GRID_CUB_SORT` | **0** | Sorted-grid engine A/B: 1 = `cub::DeviceRadixSort` instead of the counting sort (measured slower: 0.48 vs 0.35 ms). Guarded by a frame-0 health probe — on this WSL2 stack CUB intermittently returns success with unsorted output; the probe detects it, prints a notice, and falls back to the counting sort for the process |
 | `SOFA_SORTED_GRID_PAIRHASH_DEDUP` | **0** | Sorted-grid dedup A/B: 1 = atomicCAS pair-hash (like the hash ways; reproduces their 322,560-pair candidate set) instead of home-cell emission (measured slower: 0.51 vs 0.35 ms, and forfeits the pre-cull) |
 | `SOFA_SORTED_GRID_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the sorted-grid 9-kernel sequence as a captured CUDA Graph each steady-state frame. Set to 0 to launch individually |
 | `SOFA_SORTED_GRID_VERIFY` | **0** | Diagnostic: run a device-side verifier over the sorted key stream every frame (ascending + run boundaries match the scanned histogram); violations land in the probe-overflow counter. The frame-0 CUB health probe runs regardless of this flag |
+| `SOFA_USE_BIGCELL_FUSED_GENERATION` | **0** | **EXPERIMENTAL "6th way", DEFAULT OFF (2026-07-12).** Big-cell / small-cell FUSED generation + narrow phase: per-big-cell CSR table, one kernel per mixed big cell stages the tool side (ids + AABBs + vertices) in shared memory via an in-shared counting sort and runs the FBP math inline — no candidate-pair list, no separate FBP launch. Home-cell dedup at small-cell granularity ⇒ pair set identical to way 5's. **Fastest narrow kernel of all 8 configs on the 14,368 scene (0.309 ms); ties way 5 at 200k (1.09 ms).** Read by `testscenes/hash_prefixsum_large.py` + `testscenes/collision_xlarge_200k.py`, or set `useBigCellFusedGeneration` directly. Precedence: bigcell > hash > simple > sorted > dense. See `reports/performance_six_ways_20260713.md` |
+| `SOFA_BIGCELL_FACTOR` | **2** | Big-cell edge in small cells (power of two ≤ 4). Factor 4 measured 40 % slower at 200k — only 48 mixed big cells → block-level parallelism collapse |
+| `SOFA_BIGCELL_TOOL_TILE` | **256** | Tool entries staged in shared memory per chunk (1..256). Oversized big cells loop over chunks; parity-verified down to 32 (~17 % slower) |
+| `SOFA_BIGCELL_HASH_BUILD` | **0** | Build A/B: 1 = literal per-big-cell open-addressing hash multi-map build instead of CSR. **Measured ~2.9× slower** (per-frame slot clear + atomicCAS probing + sparse sweeps); best-effort slot regions with drops reported via `buildOverflowCount` |
+| `SOFA_BIGCELL_HASH_SLOTS` | **1024** | Hash-build slots per (big cell, side) region (pow2, clamped 64–4096). 2048 = zero-overflow on the 80k bench geometry |
+| `SOFA_BIGCELL_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the way-6 sequence (9 kernels CSR / 7 hash-build) as a captured CUDA Graph each steady-state frame |
 
 ### 6.4  Feature-based proximity (Phase 11+12)
 
@@ -478,9 +488,33 @@ pairs, so this scene exercises the FBP grid-stride loop (§5.17 in plan.md).
 wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_full_benchmark_suite_wsl.sh
 ```
 
-Runs small, large, v-t self, v-t cross, and the hash A/B — each in fast-path
-and validation legs — into `output/benchmark_logs/full_suite_<stamp>/<leg>/`.
+Runs small, large, v-t self, v-t cross, the five broad-cull legs on the 14k
+scene, and the three xlarge-200k legs — into
+`output/benchmark_logs/full_suite_<stamp>/<leg>/`. When calling from Windows,
+`wsl.exe` invocations are capped by the caller's timeout — run in batches with
+`SOFA_SUITE_ONLY` (a leg-name regex) sharing one `SOFA_BENCHMARK_LOG_DIR`:
+
+```powershell
+wsl -d wsl-gpu-proj -- bash -c "SOFA_SUITE_ONLY='^xlarge_' SOFA_BENCHMARK_LOG_DIR=/home/arfin/gpu-sofa/output/benchmark_logs/my_run bash /home/arfin/gpu-sofa/scripts/run_full_benchmark_suite_wsl.sh"
+```
+
 The 2026-06-09 run is reported in `reports/archive_pre_20260618/benchmark_suite_20260609.md`.
+
+### 7.10b  Way 6 (big-cell fused) — run + parity
+
+```powershell
+# SOFA scene, way 6 on the 14k selector scene (or collision_xlarge_200k.py for 213k):
+wsl -d wsl-gpu-proj -- bash -c "SOFA_USE_BIGCELL_FUSED_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1 /opt/sofa/install/v25.12/bin/runSofa -g batch -n 160 -l SofaPython3 -l SofaCUDA -l /home/arfin/gpu-sofa/SofaGpuCollision/build-profile/libSofaGpuCollision.so /home/arfin/gpu-sofa/testscenes/hash_prefixsum_large.py"
+# Parity gate (backend bench, factors 4/2/1 + chunk loop + hash-build legs):
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_bigcell_parity_wsl.sh
+# 8-leg same-session comparison (the summary table):
+wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_mode_comparison_ab_wsl.sh
+```
+
+Expected: contacts identical to every other way on the same scene (2354 on the
+14k scene, 12,178 on the xlarge scene); `bigcell_pairs_tested` =
+`sortedgrid_unique_pairs`; way-6 narrow kernel fastest (0.30 ms on 14k,
+2.01 ms on xlarge). Numbers: `reports/performance_six_ways_20260713.md`.
 
 > **Cold-clock caveat.** The *first* leg in a fresh process is contaminated by
 > CUDA-context init + GPU clock ramp (the 1650 Ti idles at a low clock). For a

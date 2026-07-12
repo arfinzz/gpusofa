@@ -435,4 +435,65 @@ SOFA_GPU_COLLISION_API bool computeSortedGridProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats = nullptr);
 
+// Experimental "6th way" (big-cell / small-cell FUSED generation + narrow
+// phase). The small cells are the ordinary dense-grid cells; a big cell groups
+// bigCellFactor^3 of them. A per-big-cell CSR table of (triangle, small cell)
+// entries is built (count -> scan -> fill; the scan input is factor^3 smaller
+// than way 5's), then ONE kernel runs one block per mixed big cell: it stages
+// the tool side into shared memory (ids + AABBs + all three vertices),
+// organizes it into per-small-cell runs with an in-shared counting sort, and
+// sweeps the tissue entries — AABB pre-cull + way-5's home-cell exactly-once
+// rule at small-cell granularity (so the surviving pair set is identical to
+// way 5's), then the identical FBP closest-feature math inline. There is no
+// intermediate candidate-pair list and no separate FBP launch: contacts are
+// appended straight to the single output array.
+struct BigCellConfig
+{
+    // Big cell edge length in small cells. Power of two, at most 4 (a local
+    // small-cell id is packed into 6 bits of each entry). Default 2, measured
+    // 2026-07-12: factor 4 collapses block-level parallelism (48 mixed big
+    // cells on the 200k bench -> 1.52 ms) while factor 2 keeps the GPU fed
+    // (1.09 ms; best or tied-best on both the 80k and 200k benches).
+    std::uint32_t bigCellFactor { 2 };
+    // Tool entries staged in shared memory per chunk (1..256). Oversized big
+    // cells loop over chunks; forcing this low exercises the chunk path.
+    std::uint32_t toolTileCapacity { 256 };
+    // Entry buffer capacity = scale * (firstTris + secondTris), same sizing
+    // rationale as SortedGridConfig::incidenceCapacityScale.
+    std::uint32_t entryCapacityScale { 16 };
+    // false (default) = CSR bucket lists (count -> scan -> fill; the big-cell
+    // id is a perfect direct index). true = literal per-big-cell open-
+    // addressing hash multi-map build, kept as a toggle so the two build
+    // strategies can be A/B'd with numbers.
+    bool useHashTableBuild { false };
+    // Hash-build only: open-addressing slots per (big cell, side) region.
+    // Rounded up to a power of two, clamped to [64, 4096]. A region that fills
+    // up drops entries (BigCellStats::buildOverflowCount) — the fixed-capacity
+    // memory waste is inherent to the per-big-cell hash layout and is part of
+    // what the A/B measures.
+    std::uint32_t hashSlotsPerBigCell { 1024 };
+};
+
+struct BigCellStats
+{
+    std::uint32_t bigCellCount { 0 };
+    std::uint32_t entryCount { 0 };            // (small cell, triangle) entries this frame
+    std::uint32_t mixedBigCellCount { 0 };     // big cells holding both tissue and tool
+    std::uint32_t pairsTestedCount { 0 };      // pairs surviving AABB + home-cell (parity: way-5 uniquePairCount)
+    std::uint32_t entryOverflowCount { 0 };    // dropped entries (capacity)
+    std::uint32_t buildOverflowCount { 0 };    // hash-build slot-region overflow (0 on CSR)
+};
+
+SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    const DenseGridConfig& gridConfig,
+    const BigCellConfig& bigConfig,
+    const FeatureBasedProximityConfig& proximityConfig,
+    std::vector<ProximityContact>& contacts,
+    FeatureBasedProximityStats* proximityStats,
+    BigCellStats* bigStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats = nullptr);
+
 } // namespace SofaGpuCollision::backend

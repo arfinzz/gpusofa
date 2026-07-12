@@ -59,6 +59,11 @@ private:
     DataBool d_useSortedGridGeneration;
     DataBool d_sortedGridUseCubSort;
     DataBool d_sortedGridUsePairHashDedup;
+    DataBool d_useBigCellFusedGeneration;
+    DataUInt d_bigCellFactor;
+    DataUInt d_bigCellToolTile;
+    DataBool d_bigCellUseHashBuild;
+    DataUInt d_bigCellHashSlots;
     DataUInt d_hashTableSize;
     DataBool d_useFeatureBasedProximity;
     DataBool d_useVertexTriangleProximity;       // routes self-collision pairs through computeFeatureBasedVertexTriangleContacts

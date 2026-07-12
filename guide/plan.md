@@ -10,7 +10,7 @@ Last refreshed: **2026-06-18**. Since 2026-06-09 the hash cull was optimised and
 merged to `main` (§5.19), three more hash opts + CUDA graphs landed (§5.20), and an
 FBP-kernel occupancy optimization was attempted and reverted as a measured regression
 (§5.21). Current numbers + the full optimization/failed-methods history:
-`reports/performance_five_ways_20260703.md`.
+`reports/performance_six_ways_20260713.md`.
 
 ---
 
@@ -993,7 +993,7 @@ narrow kernel does coalesced 128-bit loads reused across a triangle's many candi
 pairs (a pre-pass kernel + buffers + CUDA-graph integration — scoped, not yet done).
 
 **Methods that DO NOT work (do not retry)** — full table in
-`reports/performance_five_ways_20260703.md` §6: FBP `__launch_bounds__` /
+`reports/performance_six_ways_20260713.md` §6: FBP `__launch_bounds__` /
 register-reduction / `__ldg` (LSU-bound, regression); `compactActiveCells` (scanned
 all cells, regressed → replaced by Phase 15); `batchTriangleInsert` (breaks
 tissue-before-tool ordering); warp-aggregated atomics (atomics not the bottleneck,
@@ -1057,7 +1057,7 @@ opt-hash 0.347 / simple 0.336 / **sorted 0.352 ms** (tied with the hashes). Back
 faster than every other way**, because the home-cell pre-cull starves the load-bound FBP
 kernel of 86 % of its pairs. The §"radix sort will likely lose" prediction was wrong; the
 sort roughly ties at binning, and the *dedup strategy the sorted layout enables* is what
-wins. Report: `reports/performance_five_ways_20260703.md`; parity tool:
+wins. Report: `reports/performance_six_ways_20260713.md`; parity tool:
 `scripts/run_sorted_grid_parity_wsl.sh`.
 
 **Environment gotchas fenced off (do not re-debug):**
@@ -1108,6 +1108,51 @@ shows 72 % identical lines but across **42 interleaved hunks** — packed-host
 vs indexed-zero-copy are genuinely different data paths sharing a skeleton, and
 a merged function would be an if-forest worse than the duplication. They are
 also the baseline every comparison rests on. Revisit only with a concrete need.
+
+### 5.25  Big-cell FUSED generation + narrow phase — the "6th way" — LANDED 2026-07-12
+
+Origin: the user's two-level-grid brainstorm ("small cells grouped into big cells,
+per-big-cell table pulled into block shared memory"). Design bends applied and A/B'd
+rather than assumed. New module `cuda/detail/BigCellGrid.cuh` (8th umbrella include),
+API `computeBigCellFusedProximityContacts`, report
+**`reports/performance_six_ways_20260713.md`** (full numbers).
+
+- **Build:** per-big-cell CSR table of packed `(triId << 6) | localSmallCellId` entries,
+  count → scan → fill. The scan input is `bigCellFactor`³ smaller than way 5's, so the
+  413 µs single-block-scan bottleneck is sidestepped (52 µs at factor 2) — way 6 never
+  needed the multi-block scan.
+- **Fused kernel:** one block per mixed big cell stages the tool side — ids + AABBs +
+  **all three vertices** (~18 KB shared) — organizes it into per-small-cell runs with an
+  in-shared 64-bin counting sort, then sweeps the tissue entries: inflated-AABB overlap →
+  **home-cell exactly-once at small-cell granularity** (pair set provably identical to
+  way 5's — verified: 43,584 / 89,856 pairs reproduced exactly) → the FBP math **inline**
+  (extracted verbatim into `fbpComputeClosestFeatureContact`/`fbpEmitContact`, shared with
+  the classic FBP kernel). No candidate-pair list, no separate FBP launch.
+- **Measured (all contact-identical, zero overflow):** 14,368 SOFA scene, 8-leg same
+  session — **way 6 fastest narrow kernel of every configuration: 0.309 ms** (sorted
+  0.337, simple 0.332, hash 0.339, dense 1.30–1.54); full suite reproduces every
+  historical fingerprint (56/8018/2700/254/2354). New ~213k-element size: bench — way 6
+  factor 2 1.093 ms ≈ way 5 1.082 (tie), dense/hash ways 4.7–5.0; **SOFA
+  `collision_xlarge_200k.py` scene — way 6 2.011 ms vs way 5 2.247 vs dense 4.125**
+  (12,178 contacts ×3 legs).
+- **Factor sweep:** `bigCellFactor` default **2** (measured). Factor 4 collapses
+  block-level parallelism on blade-concentrated scenes (48 mixed big cells at the 200k
+  bench → 1.52 ms, +40 %); factor 1 ≈ factor 2. Lesson: the *fusion* + shared vertex
+  staging are the win, not the two-level grouping itself.
+- **Build-strategy A/B** (`bigCellUseHashBuild`): the literal per-big-cell
+  open-addressing hash multi-map build measured **~2.9× slower** than CSR (2.02–2.17 vs
+  0.71 ms full pipeline at 80k) — per-frame slot-region clearing, atomicCAS probe chains,
+  and sparse region sweeps. Needs `bigCellHashSlots=2048` for zero-overflow on the 80k
+  bench (1024 dropped 256 entries; contacts matched only by luck — best-effort like way 4,
+  reported via `buildOverflowCount`). This closes the "wouldn't a hash table be faster?"
+  question with numbers.
+- **ncu:** fused kernel 122 regs → 43.5 % occupancy, SM 18.7 % / DRAM 1.5 %. Register
+  pressure is the top follow-up lever; the §5.21 "don't retry `__launch_bounds__`"
+  verdict applied to the load-bound standalone FBP kernel — the fused shape is different
+  enough that a retest is justified. Second follow-up: work-splitting inside heavy big
+  cells (attacks the factor-4 collapse directly).
+- Dispatch precedence: **bigcell > hash > simple > sorted > dense**. Suite script gained
+  `SOFA_SUITE_ONLY` (regex leg filter) so the 15-leg suite can run in <10-min batches.
 
 ---
 

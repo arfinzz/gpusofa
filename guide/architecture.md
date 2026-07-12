@@ -5,7 +5,16 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: **2026-07-03**. A fifth broad-cull "way" — the **sorted-grid / tiled
+Last refreshed: **2026-07-12**. A sixth way — the **big-cell FUSED generation + narrow
+phase** (`useBigCellFusedGeneration`: small cells grouped into `bigCellFactor`³ big cells,
+per-big-cell CSR table, ONE kernel per mixed big cell staging tool ids + AABBs + vertices
+in shared memory and running the FBP closest-feature math inline — no candidate-pair list,
+no separate FBP launch) — joins the five below. Contact-identical everywhere;
+**fastest of all eight measured configurations on the 14,368 scene (0.309 ms narrow
+kernel)** and ties the sorted grid at the 200k bench. The two build strategies are a
+measured A/B: CSR beats a literal per-big-cell open-addressing hash build ~2.9×
+(`bigCellUseHashBuild`). Details: `reports/performance_six_ways_20260713.md`.
+Previously (2026-07-03): a fifth broad-cull "way" — the **sorted-grid / tiled
 binning cull** (`useSortedGridGeneration`: incidence expansion → counting sort by cell →
 block-per-mixed-cell generation with shared-memory staging, home-cell exactly-once dedup,
 no per-cell caps, own CUDA graph) — joins the dense grid, optimised hash, and simple hash.
@@ -13,7 +22,7 @@ Measured bit-identical everywhere; **ties the hashes on the 14,368 scene (~0.35 
 ~3× faster than every other way on the 79,520 bench (0.65 vs 2.0–2.6 ms)** because its
 home-cell dedup doubles as an exact AABB pre-cull (322,560 → 43,584 pairs). 5-way data +
 two environment gotchas (WSL2 CUB radix-sort flakiness with auto-fallback; async-memset
-ordering): `reports/performance_five_ways_20260703.md`, plan §5.23.
+ordering): `reports/performance_six_ways_20260713.md`, plan §5.23.
 The fourth way — a **simple direct-bucket spatial hash** (`useSimpleHashGeneration`,
 single-pass insert, 7 kernels, own CUDA graph) — measured tied with the
 optimised hash (~0.35–0.38 ms, ~5× over dense), bit-identical, zero overflow; the
@@ -25,7 +34,7 @@ kernel than the optimised dense grid on a large tissue, bit-identical contacts),
 the `featureBasedProximityKernel` narrow phase is now the dominant GPU cost (a
 load-throughput-bound kernel; an occupancy optimization was tried and reverted —
 plan.md §5.21). **Current measured numbers + the full optimization history live in
-`reports/performance_five_ways_20260703.md`** (earlier dated reports are under
+`reports/performance_six_ways_20260713.md`** (earlier dated reports are under
 `reports/archive_pre_20260618/`).
 
 ---
@@ -56,8 +65,8 @@ The plugin provides four narrow-phase output modes, each opt-in:
 The choice between them is driven by Data fields on `GpuCollisionNarrowPhase`
 and the type of the collision-model pair the SOFA broad phase emits. The
 **broad cull** feeding the narrow pass is itself selectable for the tri-tri FBP
-path — **five ways** (all bit-identical contacts, see
-`reports/performance_five_ways_20260703.md`):
+path — **six ways** (all bit-identical contacts, see
+`reports/performance_six_ways_20260713.md` + `reports/performance_six_ways_20260713.md`):
 
 | Broad cull | Flag | Regime |
 |---|---|---|
@@ -65,10 +74,14 @@ path — **five ways** (all bit-identical contacts, see
 | 2. optimised dense grid (Phase 15) | *(default)* | small-tool surgical scenes |
 | 3. optimised spatial hash | `useHashPrefixSumGeneration=1` | large tissue + tool |
 | 4. simple direct-bucket hash | `useSimpleHashGeneration=1` | large tissue + tool, fewest kernels |
-| 5. sorted grid (tiled binning) | `useSortedGridGeneration=1` | large + dense pairs (fastest there, no per-cell caps) |
+| 5. sorted grid (tiled binning) | `useSortedGridGeneration=1` | large + dense pairs (no per-cell caps) |
+| 6. big-cell fused gen+narrow | `useBigCellFusedGeneration=1` | fastest on the surgical-scale scene (0.309 ms); ties way 5 at 200k |
 
 The exact-contact and v-t paths always use the dense grid; precedence when
-several flags are set: hash > simple > sorted > dense.
+several flags are set: bigcell > hash > simple > sorted > dense. Way 6 is the
+only way with **no candidate-pair list and no separate FBP launch** — the
+narrow-phase math runs inline in the generation kernel against shared-memory
+staged tool vertices.
 
 ---
 
@@ -279,9 +292,14 @@ output-mode switches and the dense-grid configuration.
 | `useToolActiveCellGeneration` | **true** | **Phase 15, DEFAULT ON.** Generate candidate pairs over tool-occupied (mixed) cells only — active list built during the tool insert (no scan), generation grid-strides over it. 4.3× one-tissue, 1.08× large-tissue, bit-identical output, never a regression |
 | `useHashPrefixSumGeneration` | **false** | **EXPERIMENTAL (branch `experiment/hash-prefixsum-broadphase`), DEFAULT OFF.** Replace the dense grid with a spatial-hash cell structure + prefix-sum work-expansion broad cull for the tri–tri FBP path. Targets the *large-tissue + large-tool* regime where the tool-active-cell asymmetry weakens. Bit-identical contacts; **optimised 2026-06-17 to ~2.5–3× faster kernel than dense** (0.5–0.7 vs 1.8–2.1 ms on 12.8k+1.6k tris; compact buckets, mixed-bucket gen, no binary search, touched-slot clear, CUB scan, 32-bit pairs). See `reports/archive_pre_20260618/hash_optimized_broadphase_20260617.md`. Requires `useFeatureBasedProximity=true` |
 | `useSimpleHashGeneration` | **false** | **EXPERIMENTAL "4th way", DEFAULT OFF (2026-06-26).** Replace the dense grid with a *simple direct-bucket* spatial hash: triangles are stored straight into per-cell hash buckets in a **single insert pass** (no mark/compact/fill — each slot is its own bucket), then mixed-bucket generation + dedup + FBP. **7 kernels** vs the optimised hash's 11; own CUDA graph. Best-effort on per-cell overflow (drops + reports, never triggers on the test scenes). **Measured tied with the optimised hash (~0.35–0.38 ms kernel, ~5× over dense) and bit-identical** on the 14,368-element scene. Mutually exclusive with `useHashPrefixSumGeneration` (hash wins). Requires `useFeatureBasedProximity=true`. See `reports/archive_pre_20260703/four_way_broadcull_comparison_20260626.md` |
-| `useSortedGridGeneration` | **false** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Replace the dense grid with a **sorted-grid (tiled binning)** broad cull: expand (cell, triangle) incidences → sort by cell (counting sort) → contiguous per-cell runs → one block per mixed cell with the tool run staged in **shared memory**. **No per-cell capacity caps** (no best-effort drops); dedup is home-cell exactly-once emission, which doubles as an **exact AABB pre-cull** (322,560 → 43,584 pairs on the large bench). **Measured: ties the hash cluster on the 14,368 scene (~0.35 ms) and is ~3× faster than every other way on the 79,520 bench (0.65 vs 2.0–2.6 ms), bit-identical.** 9 kernels, own CUDA graph. Precedence: hash > simple > sorted. Requires `useFeatureBasedProximity=true`. See `reports/performance_five_ways_20260703.md` |
+| `useSortedGridGeneration` | **false** | **EXPERIMENTAL "5th way", DEFAULT OFF (2026-07-03).** Replace the dense grid with a **sorted-grid (tiled binning)** broad cull: expand (cell, triangle) incidences → sort by cell (counting sort) → contiguous per-cell runs → one block per mixed cell with the tool run staged in **shared memory**. **No per-cell capacity caps** (no best-effort drops); dedup is home-cell exactly-once emission, which doubles as an **exact AABB pre-cull** (322,560 → 43,584 pairs on the large bench). **Measured: ties the hash cluster on the 14,368 scene (~0.35 ms) and is ~3× faster than every other way on the 79,520 bench (0.65 vs 2.0–2.6 ms), bit-identical.** 9 kernels, own CUDA graph. Precedence: hash > simple > sorted. Requires `useFeatureBasedProximity=true`. See `reports/performance_six_ways_20260713.md` |
 | `sortedGridUseCubSort` | **false** | Sorted-grid sort engine: false = hand-rolled one-pass counting sort (CUB-free, **faster**: 0.35 vs 0.48 ms); true = `cub::DeviceRadixSort`. The CUB engine is guarded by a **frame-0 health probe** (this WSL2 stack intermittently returns success with unsorted output ~20–25 % of processes) that auto-falls back to the counting sort |
 | `sortedGridUsePairHashDedup` | **false** | Sorted-grid dedup: false = home-cell exactly-once (no dedup table + exact AABB pre-cull, **faster**: 0.35 vs 0.51 ms); true = the shared atomicCAS pair-hash (reproduces the other ways' candidate set exactly) |
+| `useBigCellFusedGeneration` | **false** | **EXPERIMENTAL "6th way", DEFAULT OFF (2026-07-12).** Big-cell / small-cell **FUSED** generation + narrow phase: small cells grouped into `bigCellFactor`³ big cells; per-big-cell CSR table of packed (triangle, local small cell) entries (count → scan → fill; the scan input is factor³ smaller than way 5's); then **one kernel per mixed big cell** stages the tool side (ids + AABBs + all three **vertices**, ≈18 KB shared) via an in-shared 64-bin counting sort and sweeps the tissue entries — AABB pre-cull + way-5's home-cell exactly-once rule at small-cell granularity (**pair set provably identical to way 5's**) + the identical FBP math inline. No candidate-pair list, no separate FBP launch. **Measured: fastest of all 8 configs on the 14,368 scene (0.309 ms vs sorted 0.337 / simple 0.332 / hash 0.339); ties way 5 at the 200k bench (1.09 ms).** Precedence: bigcell first. Requires `useFeatureBasedProximity=true`. See `reports/performance_six_ways_20260713.md` |
+| `bigCellFactor` | **2** | Big-cell edge in small cells (power of two ≤ 4). **Measured default 2**: factor 4 collapses block-level parallelism (48 mixed big cells at 200k → 1.52 ms vs 1.09 at factor 2) |
+| `bigCellToolTile` | **256** | Tool entries staged in shared per chunk (1..256); oversized big cells loop over chunks (correct at any size; tile 32 costs ~17%) |
+| `bigCellUseHashBuild` | **false** | Build-strategy A/B: false = CSR (count → scan → fill; big-cell id is a perfect direct index); true = **literal per-big-cell open-addressing hash multi-map** (atomicCAS probing into fixed slot regions, cleared each frame). **Measured ~2.9× slower than CSR** (0.71 → 2.02 ms full pipeline at 80k) — kept as the honest answer to "wouldn't a hash table be faster?" |
+| `bigCellHashSlots` | **1024** | Hash-build only: slots per (big cell, side) region (pow2, 64–4096). 1024 dropped 256 entries on the 80k bench (best-effort, reported via `buildOverflowCount`); **2048 = zero-overflow** there |
 | `hashTableSize` | **0** | Slot count for `useHashPrefixSumGeneration` / `useSimpleHashGeneration`. 0 = auto (~4 slots per input triangle, rounded to a power of two) |
 | `useFeatureBasedProximity` | **false** | Phase 11+. Replace SAT exact-contact with VF + EE closest-feature kernel |
 | `useVertexTriangleProximity` | **false** | Phase 12. Route self-collision and (point-model, triangle-model) pairs to v-t |

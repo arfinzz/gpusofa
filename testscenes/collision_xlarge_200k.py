@@ -1,16 +1,17 @@
-"""Hash + prefix-sum broad-cull benchmark — large tissue + large tool.
+"""Extra-large collision benchmark — ~200k triangles, all six broad-cull ways.
 
-EXPERIMENTAL (experiment/hash-prefixsum-broadphase branch).
+Same construction as hash_prefixsum_large.py (static tissue surface grid +
+subdivided blade lying in the tissue plane, no physics — the GPU collision
+pipeline is what gets stressed), scaled to ~200,000 triangles:
+315 x 315 quads x 2 = 198,450 tissue triangles + ~1,568 blade triangles.
 
-Geometry: a large tissue surface (~12,800 triangles) and a large subdivided
-blade tool (~1,500 triangles) sitting in the tissue plane so many cells are
-mixed. This is the regime the spatial-hash + prefix-sum broad cull targets:
-both sides large, so the tool/tissue asymmetry that Phase 15 exploits is weak.
-
-Toggle the broad cull with SOFA_USE_HASH_PREFIXSUM_GENERATION:
-  0 -> dense grid + tool-active-cell generation (the current default)
-  1 -> spatial hash + prefix-sum work expansion (this experiment)
-Both feed the SAME FBP narrow kernel, so contact counts MUST be identical.
+Select the broad cull with the same envs as the other scenes:
+  SOFA_USE_HASH_PREFIXSUM_GENERATION=1   -> way 3 (optimised hash)
+  SOFA_USE_SIMPLE_HASH_GENERATION=1      -> way 4 (simple direct-bucket hash)
+  SOFA_USE_SORTED_GRID_GENERATION=1      -> way 5 (sorted grid)
+  SOFA_USE_BIGCELL_FUSED_GENERATION=1    -> way 6 (big-cell fused gen+narrow)
+  (none)                                 -> dense grid (Phase 15 default)
+All ways feed the same narrow-phase math, so contact counts MUST be identical.
 """
 
 import os
@@ -33,12 +34,11 @@ from dense_collision_benchmark_common import (
 BENCHMARK_LOG_DIR = default_benchmark_log_dir(current_dir)
 BENCHMARK_LABEL_SUFFIX = os.environ.get("SOFA_BENCHMARK_LABEL_SUFFIX", "")
 
-TISSUE_NX = int(os.environ.get("SOFA_HASH_TISSUE_NX", "81"))
-TISSUE_NZ = int(os.environ.get("SOFA_HASH_TISSUE_NZ", "81"))
-# Subdivided blade sized to ~1,500 triangles (4*sx*sy + 4*sx*sz + 4*sy*sz).
-BLADE_SEGMENTS_X = int(os.environ.get("SOFA_HASH_BLADE_SEGMENTS_X", "30"))
-BLADE_SEGMENTS_Y = int(os.environ.get("SOFA_HASH_BLADE_SEGMENTS_Y", "8"))
-BLADE_SEGMENTS_Z = int(os.environ.get("SOFA_HASH_BLADE_SEGMENTS_Z", "4"))
+TISSUE_NX = int(os.environ.get("SOFA_XLARGE_TISSUE_NX", "316"))
+TISSUE_NZ = int(os.environ.get("SOFA_XLARGE_TISSUE_NZ", "316"))
+BLADE_SEGMENTS_X = int(os.environ.get("SOFA_XLARGE_BLADE_SEGMENTS_X", "30"))
+BLADE_SEGMENTS_Y = int(os.environ.get("SOFA_XLARGE_BLADE_SEGMENTS_Y", "8"))
+BLADE_SEGMENTS_Z = int(os.environ.get("SOFA_XLARGE_BLADE_SEGMENTS_Z", "4"))
 WARMUP_STEPS = int(os.environ.get("SOFA_LARGE_WARMUP_STEPS", "10"))
 
 DETAILED_PROFILING = env_flag("SOFA_GPU_DETAILED_PROFILING", False)
@@ -55,6 +55,14 @@ BIGCELL_HASH_SLOTS = int(os.environ.get("SOFA_BIGCELL_HASH_SLOTS", "1024"))
 HASH_TABLE_SIZE = int(os.environ.get("SOFA_HASH_TABLE_SIZE", "0"))
 USE_TOOL_ACTIVE_CELL_GENERATION = env_flag("SOFA_USE_TOOL_ACTIVE_CELL_GENERATION", True)
 PROXIMITY_READ_CONTACT_COUNTER = env_flag("SOFA_PROXIMITY_READ_CONTACT_COUNTER", True)
+
+# At ~200k triangles the per-cell buckets and pair buffers need more headroom
+# than the 14k scene; the grid itself is finer so per-cell occupancy stays sane
+# (triangle edge ~0.025 at NX=316 vs ~0.10 at NX=81).
+GRID_RESOLUTION_X = int(os.environ.get("SOFA_XLARGE_GRID_RESOLUTION_X", "128"))
+GRID_RESOLUTION_Y = int(os.environ.get("SOFA_XLARGE_GRID_RESOLUTION_Y", "8"))
+GRID_RESOLUTION_Z = int(os.environ.get("SOFA_XLARGE_GRID_RESOLUTION_Z", "128"))
+MAX_TRIANGLES_PER_CELL = int(os.environ.get("SOFA_XLARGE_MAX_TRIANGLES_PER_CELL", "256"))
 
 
 def createScene(root):
@@ -74,7 +82,6 @@ def createScene(root):
 
     tissue_positions, tissue_triangles = generate_tissue_surface_grid(
         nx=TISSUE_NX, nz=TISSUE_NZ, sx=8.0, sz=8.0, y=0.0)
-    # Large subdivided blade lying in the tissue plane so it crosses many cells.
     blade_vertices, blade_triangles = create_subdivided_blade_geometry(
         length=5.5, height=0.4, thickness=0.16,
         segments_x=BLADE_SEGMENTS_X, segments_y=BLADE_SEGMENTS_Y, segments_z=BLADE_SEGMENTS_Z)
@@ -116,21 +123,23 @@ def createScene(root):
         minGPUPairCount=1,
         gridMinX=-4.5, gridMinY=-0.5, gridMinZ=-4.5,
         gridMaxX=4.5, gridMaxY=0.5, gridMaxZ=4.5,
-        gridResolutionX=64, gridResolutionY=8, gridResolutionZ=64,
+        gridResolutionX=GRID_RESOLUTION_X,
+        gridResolutionY=GRID_RESOLUTION_Y,
+        gridResolutionZ=GRID_RESOLUTION_Z,
         contactDistance=0.03,
-        maxTissueTrianglesPerCell=128,
-        maxToolTrianglesPerCell=128,
+        maxTissueTrianglesPerCell=MAX_TRIANGLES_PER_CELL,
+        maxToolTrianglesPerCell=MAX_TRIANGLES_PER_CELL,
         maxCandidatePairs=8000000,
     )
     root.addObject('LocalMinDistance', alarmDistance=0.08, contactDistance=0.03, angleCone=0.0)
     root.addObject(
         'GpuPipelineBenchmarkController',
-        name='GpuHashPrefixSumTiming',
-        label='gpu_hash_prefixsum_large' + BENCHMARK_LABEL_SUFFIX,
+        name='GpuXLargeTiming',
+        label='gpu_collision_xlarge_200k' + BENCHMARK_LABEL_SUFFIX,
         outputDir=BENCHMARK_LOG_DIR,
-        pipelinePhase='hash-prefixsum-large-tissue-large-tool',
+        pipelinePhase='xlarge-200k-tissue-blade',
         collisionStateTemplate='CudaVec3f',
-        notes='Large tissue + large tool (~1500 tris). A/B the dense-grid broad cull vs the spatial-hash + prefix-sum broad cull via SOFA_USE_HASH_PREFIXSUM_GENERATION. FBP narrow kernel is identical, so contact counts must match.',
+        notes='Extra-large static benchmark: ~198k tissue tris + ~1.5k blade tris. Same env toggles as hash_prefixsum_large.py; all six ways must produce identical contact counts.',
         collisionVertexCount=len(tissue_positions) + len(blade_vertices),
         collisionElementCount=len(tissue_triangles) + len(blade_triangles),
         warmupSteps=WARMUP_STEPS,
