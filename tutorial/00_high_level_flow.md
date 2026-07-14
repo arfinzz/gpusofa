@@ -197,7 +197,7 @@ bottleneck is in **[15_profiling_and_tuning.md](15_profiling_and_tuning.md)**.
   [15_profiling_and_tuning.md](15_profiling_and_tuning.md).
 - Want the canonical engineering reference (not a tutorial)? See
   `guide/architecture.md`; current measured numbers are in
-  `reports/performance_six_ways_20260713.md`.
+  `reports/performance_all_modes_20260715.md`.
 
 > **One sentence to remember:** *lay a grid over space, keep only triangle pairs
 > that share a box, then let thousands of GPU threads each resolve one pair —

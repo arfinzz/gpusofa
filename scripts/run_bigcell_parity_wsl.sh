@@ -15,8 +15,8 @@ PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null)"
 export LD_LIBRARY_PATH="${B}:${SOFA_ROOT}/lib:${PLP}"
 
 run_combo() {
-    local label="$1" factor="$2" tile="$3" hashbuild="$4" runothers="$5"
-    echo "=== BIGCELL PARITY: ${label} (factor=${factor} tile=${tile} hash_build=${hashbuild}) ==="
+    local label="$1" factor="$2" tile="$3" hashbuild="$4" runothers="$5" sharedbuild="${6:-0}"
+    echo "=== BIGCELL PARITY: ${label} (factor=${factor} tile=${tile} hash_build=${hashbuild} shared_build=${sharedbuild}) ==="
     SOFA_BACKEND_BENCH_CSV="/tmp/bigcell_parity_${label}.csv" \
     SOFA_GPU_DETAILED_PROFILING=0 \
     SOFA_BACKEND_BENCH_RUN_HASH="${runothers}" \
@@ -24,8 +24,9 @@ run_combo() {
     SOFA_BACKEND_BENCH_BIGCELL_FACTOR="${factor}" \
     SOFA_BACKEND_BENCH_BIGCELL_TILE="${tile}" \
     SOFA_BACKEND_BENCH_BIGCELL_HASH_BUILD="${hashbuild}" \
+    SOFA_BACKEND_BENCH_BIGCELL_SHARED_BUILD="${sharedbuild}" \
     "${B}/SofaGpuCollisionDenseGridBackendBench" 2>&1 \
-      | grep -iE 'fbp_contacts|sortedgrid_(unique|contacts)|bigcell_(build|factor|tool_tile|gpu_kernel|pairs_tested|contacts|entry_overflow|build_overflow)' \
+      | grep -iE 'fbp_contacts|sortedgrid_(unique|contacts)|bigcell_(build|shared_build|factor|tool_tile|gpu_kernel|pairs_tested|contacts|entry_overflow|build_overflow|shared_spill)' \
       | grep -v csv
     echo
 }
@@ -36,4 +37,6 @@ run_combo csr_f2_t256   2 256 0 0
 run_combo csr_f1_t256   1 256 0 0
 run_combo hash_f4_t256  4 256 1 0
 run_combo hash_f4_t32   4 32  1 0
+run_combo sharedhash_f2 2 256 0 0 1
+run_combo sharedsort_f2 2 256 0 0 2
 echo BIGCELL_PARITY_DONE

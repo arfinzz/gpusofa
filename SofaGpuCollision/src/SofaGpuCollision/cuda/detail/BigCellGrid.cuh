@@ -69,7 +69,7 @@ struct BigCellWorkspace
     std::uint32_t* mixedBigCellCount { nullptr };
     std::uint32_t* pairsTestedCount { nullptr };  // pairs surviving AABB+home-cell
     std::uint32_t* buildOverflowCount { nullptr };// hash-build slot-region overflow
-    std::uint32_t* unusedOverflowCount { nullptr };// keeps resetSortedGridKernel reusable
+    std::uint32_t* sharedSpillCount { nullptr };// shared-build entries that fell back to the direct global path
     void* proximityContacts { nullptr };
     std::uint32_t* proximityContactCount { nullptr };
     std::uint32_t* proximityOverflowCount { nullptr };
@@ -113,7 +113,7 @@ struct BigCellWorkspace
         cudaFree(entriesPacked); cudaFree(hashSlots);
         cudaFree(firstAabbs); cudaFree(secondAabbs); cudaFree(mixedBigCellIds);
         cudaFree(entryTotalCount); cudaFree(entryOverflowCount); cudaFree(mixedBigCellCount);
-        cudaFree(pairsTestedCount); cudaFree(buildOverflowCount); cudaFree(unusedOverflowCount);
+        cudaFree(pairsTestedCount); cudaFree(buildOverflowCount); cudaFree(sharedSpillCount);
         cudaFree(proximityContacts);
         cudaFree(proximityContactCount); cudaFree(proximityOverflowCount);
         cudaFree(proximityVfCount); cudaFree(proximityFvCount); cudaFree(proximityEeCount);
@@ -126,7 +126,7 @@ struct BigCellWorkspace
         entriesPacked = nullptr; hashSlots = nullptr;
         firstAabbs = nullptr; secondAabbs = nullptr; mixedBigCellIds = nullptr;
         entryTotalCount = nullptr; entryOverflowCount = nullptr; mixedBigCellCount = nullptr;
-        pairsTestedCount = nullptr; buildOverflowCount = nullptr; unusedOverflowCount = nullptr;
+        pairsTestedCount = nullptr; buildOverflowCount = nullptr; sharedSpillCount = nullptr;
         proximityContacts = nullptr;
         proximityContactCount = nullptr; proximityOverflowCount = nullptr;
         proximityVfCount = nullptr; proximityFvCount = nullptr; proximityEeCount = nullptr;
@@ -193,7 +193,7 @@ struct BigCellWorkspace
         if (err == cudaSuccess && mixedBigCellCount == nullptr)    err = cudaMallocTracked(mixedBigCellCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && pairsTestedCount == nullptr)     err = cudaMallocTracked(pairsTestedCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && buildOverflowCount == nullptr)   err = cudaMallocTracked(buildOverflowCount, 1, newlyAllocatedBytes);
-        if (err == cudaSuccess && unusedOverflowCount == nullptr)  err = cudaMallocTracked(unusedOverflowCount, 1, newlyAllocatedBytes);
+        if (err == cudaSuccess && sharedSpillCount == nullptr)  err = cudaMallocTracked(sharedSpillCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityContactCount == nullptr)  err = cudaMallocTracked(proximityContactCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityOverflowCount == nullptr) err = cudaMallocTracked(proximityOverflowCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityVfCount == nullptr)       err = cudaMallocTracked(proximityVfCount, 1, newlyAllocatedBytes);
@@ -299,6 +299,379 @@ __global__ void fillBigCellEntriesKernel(
             continue;
         }
         entriesPacked[pos] = (triangleId << 6u) | bigCellLocalId(x, y, z, bigc);
+    }
+}
+
+// ============================================================================
+// Shared-memory-privatized CSR build ("populate in shared, merge later").
+// Each block owns a FIXED chunk of triangles (spatially blind — the block/
+// triangle assignment cannot know spatial grouping before the structure
+// exists). The block builds its chunk's contribution in shared memory, then
+// merges into the global histogram / CSR entry array with per-bin instead of
+// per-entry global atomics. Two organizations, kept as an A/B:
+//   mode 1: shared HASH TABLE — insert-or-count keyed by bin; entries staged
+//           alongside with their within-bin offset; merge = one global
+//           atomicAdd per occupied slot, then scatter into reserved ranges.
+//   mode 2: shared SORTED LIST — stage (bin, entry) pairs, in-shared bitonic
+//           sort by bin, detect runs, one global reservation per run, the
+//           run-start thread writes its run.
+// Anything that overflows the shared structures falls back to the direct
+// global path (counted in sharedSpillCount) — the entry multiset is identical
+// either way, so contacts are unchanged.
+// ============================================================================
+
+constexpr std::uint32_t kSharedBinTableSize = 1024;   // pow2; keys+counts = 8 KB
+constexpr std::uint32_t kSharedStageCapacity = 2048;  // staged entries per block
+constexpr std::uint32_t kSharedBinEmpty = 0xffffffffu;
+
+// Insert-or-find a bin in the block's shared hash table. Returns the slot, or
+// -1 when the bounded probe fails (caller falls back to the global path).
+__device__ __forceinline__ int bigCellSharedBinSlot(
+    std::uint32_t* sKeys, const std::uint32_t bin)
+{
+    std::uint32_t h = (bin * 2654435761u) & (kSharedBinTableSize - 1u);
+    for (std::uint32_t probe = 0; probe < 32u; ++probe)
+    {
+        const std::uint32_t prev = atomicCAS(&sKeys[h], kSharedBinEmpty, bin);
+        if (prev == kSharedBinEmpty || prev == bin) return static_cast<int>(h);
+        h = (h + 1u) & (kSharedBinTableSize - 1u);
+    }
+    return -1;
+}
+
+// In-shared bitonic sort over a power-of-two array (the classic i^j network).
+// All threads iterate the full index space, so the __syncthreads are uniform.
+template <class KeyT>
+__device__ void bigCellBitonicSortShared(KeyT* keys, const std::uint32_t n)
+{
+    for (std::uint32_t k = 2; k <= n; k <<= 1)
+    {
+        for (std::uint32_t j = k >> 1; j > 0; j >>= 1)
+        {
+            for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+            {
+                const std::uint32_t ixj = i ^ j;
+                if (ixj > i)
+                {
+                    const KeyT a = keys[i];
+                    const KeyT b = keys[ixj];
+                    const bool ascending = ((i & k) == 0u);
+                    if ((a > b) == ascending)
+                    {
+                        keys[i] = b;
+                        keys[ixj] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Mode 1 count: shared hash table of per-bin counts, merged with one global
+// atomicAdd per occupied slot. Also stores the per-triangle AABBs (this kernel
+// replaces countBigCellEntriesKernel when sharedBuildMode==1).
+__global__ void countBigCellEntriesSharedHashKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const std::uint32_t triangleCount,
+    const bool isTool,
+    const DeviceDenseGridConfig config,
+    const DeviceBigCellGridConfig bigc,
+    std::uint32_t* hist,
+    DeviceAabb* triangleAabbs,
+    std::uint32_t* entryTotalCount,
+    std::uint32_t* sharedSpillCount)
+{
+    __shared__ std::uint32_t sKeys[kSharedBinTableSize];
+    __shared__ std::uint32_t sCounts[kSharedBinTableSize];
+    for (std::uint32_t i = threadIdx.x; i < kSharedBinTableSize; i += blockDim.x)
+    {
+        sKeys[i] = kSharedBinEmpty;
+        sCounts[i] = 0u;
+    }
+    __syncthreads();
+
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId < triangleCount)
+    {
+        const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+        const DeviceAabb aabb = triangleAabb(triangle, config.contactDistance);
+        triangleAabbs[triangleId] = aabb;
+        int3 cellMin, cellMax;
+        if (denseGridCellSpan(aabb, config, cellMin, cellMax))
+        {
+            const std::uint32_t span =
+                static_cast<std::uint32_t>(cellMax.x - cellMin.x + 1) *
+                static_cast<std::uint32_t>(cellMax.y - cellMin.y + 1) *
+                static_cast<std::uint32_t>(cellMax.z - cellMin.z + 1);
+            atomicAdd(entryTotalCount, span);
+            for (int z = cellMin.z; z <= cellMax.z; ++z)
+            for (int y = cellMin.y; y <= cellMax.y; ++y)
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t bin = (bigCellIdOfSmall(x, y, z, bigc) << 1) | (isTool ? 1u : 0u);
+                const int slot = bigCellSharedBinSlot(sKeys, bin);
+                if (slot >= 0)
+                {
+                    atomicAdd(&sCounts[slot], 1u);
+                }
+                else
+                {
+                    atomicAdd(&hist[bin], 1u);
+                    atomicAdd(sharedSpillCount, 1u);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < kSharedBinTableSize; i += blockDim.x)
+    {
+        if (sKeys[i] != kSharedBinEmpty && sCounts[i] > 0u)
+        {
+            atomicAdd(&hist[sKeys[i]], sCounts[i]);
+        }
+    }
+}
+
+// Mode 1 fill: stage entries in shared with their within-slot offsets, reserve
+// each occupied bin's range with ONE global atomicAdd, then scatter. Ordering
+// invariant: a slot count is incremented ONLY for a successfully staged entry,
+// so reserved ranges never contain gaps.
+__global__ void fillBigCellEntriesSharedHashKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const std::uint32_t triangleCount,
+    const bool isTool,
+    const DeviceDenseGridConfig config,
+    const DeviceBigCellGridConfig bigc,
+    const std::uint32_t entryCapacity,
+    std::uint32_t* cursors,
+    std::uint32_t* entriesPacked,
+    std::uint32_t* entryOverflowCount,
+    std::uint32_t* sharedSpillCount)
+{
+    __shared__ std::uint32_t sKeys[kSharedBinTableSize];
+    __shared__ std::uint32_t sCounts[kSharedBinTableSize];
+    __shared__ std::uint32_t sBase[kSharedBinTableSize];
+    __shared__ std::uint32_t sPacked[kSharedStageCapacity];
+    __shared__ std::uint32_t sSlotOff[kSharedStageCapacity];  // (slot << 16) | withinSlotOffset
+    __shared__ std::uint32_t sStage;
+    for (std::uint32_t i = threadIdx.x; i < kSharedBinTableSize; i += blockDim.x)
+    {
+        sKeys[i] = kSharedBinEmpty;
+        sCounts[i] = 0u;
+    }
+    if (threadIdx.x == 0) sStage = 0u;
+    __syncthreads();
+
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId < triangleCount)
+    {
+        const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+        const DeviceAabb aabb = triangleAabb(triangle, config.contactDistance);
+        int3 cellMin, cellMax;
+        if (denseGridCellSpan(aabb, config, cellMin, cellMax))
+        {
+            for (int z = cellMin.z; z <= cellMax.z; ++z)
+            for (int y = cellMin.y; y <= cellMax.y; ++y)
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t bin = (bigCellIdOfSmall(x, y, z, bigc) << 1) | (isTool ? 1u : 0u);
+                const std::uint32_t packed = (triangleId << 6u) | bigCellLocalId(x, y, z, bigc);
+                const std::uint32_t pos = atomicAdd(&sStage, 1u);
+                int slot = -1;
+                if (pos < kSharedStageCapacity)
+                {
+                    slot = bigCellSharedBinSlot(sKeys, bin);
+                    if (slot >= 0)
+                    {
+                        const std::uint32_t off = atomicAdd(&sCounts[slot], 1u);
+                        sPacked[pos] = packed;
+                        sSlotOff[pos] = (static_cast<std::uint32_t>(slot) << 16u) | (off & 0xffffu);
+                    }
+                    else
+                    {
+                        sSlotOff[pos] = kSharedBinEmpty;  // hole: staged position unused
+                    }
+                }
+                if (slot < 0)
+                {
+                    // Direct global fallback (staging full or probe failure).
+                    const std::uint32_t gpos = atomicAdd(&cursors[bin], 1u);
+                    if (gpos < entryCapacity) entriesPacked[gpos] = packed;
+                    else atomicAdd(entryOverflowCount, 1u);
+                    atomicAdd(sharedSpillCount, 1u);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < kSharedBinTableSize; i += blockDim.x)
+    {
+        if (sKeys[i] != kSharedBinEmpty && sCounts[i] > 0u)
+        {
+            sBase[i] = atomicAdd(&cursors[sKeys[i]], sCounts[i]);
+        }
+    }
+    __syncthreads();
+    const std::uint32_t staged = min(sStage, kSharedStageCapacity);
+    for (std::uint32_t i = threadIdx.x; i < staged; i += blockDim.x)
+    {
+        const std::uint32_t so = sSlotOff[i];
+        if (so == kSharedBinEmpty) continue;
+        const std::uint32_t pos = sBase[so >> 16u] + (so & 0xffffu);
+        if (pos < entryCapacity) entriesPacked[pos] = sPacked[i];
+        else atomicAdd(entryOverflowCount, 1u);
+    }
+}
+
+// Mode 2 count: stage bins, bitonic-sort them in shared, merge one global
+// atomicAdd per run (the run-start thread walks its run).
+__global__ void countBigCellEntriesSharedSortKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const std::uint32_t triangleCount,
+    const bool isTool,
+    const DeviceDenseGridConfig config,
+    const DeviceBigCellGridConfig bigc,
+    std::uint32_t* hist,
+    DeviceAabb* triangleAabbs,
+    std::uint32_t* entryTotalCount,
+    std::uint32_t* sharedSpillCount)
+{
+    __shared__ std::uint32_t sBins[kSharedStageCapacity];
+    __shared__ std::uint32_t sStage;
+    if (threadIdx.x == 0) sStage = 0u;
+    __syncthreads();
+
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId < triangleCount)
+    {
+        const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+        const DeviceAabb aabb = triangleAabb(triangle, config.contactDistance);
+        triangleAabbs[triangleId] = aabb;
+        int3 cellMin, cellMax;
+        if (denseGridCellSpan(aabb, config, cellMin, cellMax))
+        {
+            const std::uint32_t span =
+                static_cast<std::uint32_t>(cellMax.x - cellMin.x + 1) *
+                static_cast<std::uint32_t>(cellMax.y - cellMin.y + 1) *
+                static_cast<std::uint32_t>(cellMax.z - cellMin.z + 1);
+            atomicAdd(entryTotalCount, span);
+            for (int z = cellMin.z; z <= cellMax.z; ++z)
+            for (int y = cellMin.y; y <= cellMax.y; ++y)
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t bin = (bigCellIdOfSmall(x, y, z, bigc) << 1) | (isTool ? 1u : 0u);
+                const std::uint32_t pos = atomicAdd(&sStage, 1u);
+                if (pos < kSharedStageCapacity)
+                {
+                    sBins[pos] = bin;
+                }
+                else
+                {
+                    atomicAdd(&hist[bin], 1u);
+                    atomicAdd(sharedSpillCount, 1u);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const std::uint32_t staged = min(sStage, kSharedStageCapacity);
+    for (std::uint32_t i = threadIdx.x + staged; i < kSharedStageCapacity; i += blockDim.x)
+    {
+        sBins[i] = kSharedBinEmpty;  // sorts to the tail (real bins < 2^31)
+    }
+    __syncthreads();
+    bigCellBitonicSortShared(sBins, kSharedStageCapacity);
+    for (std::uint32_t i = threadIdx.x; i < staged; i += blockDim.x)
+    {
+        const std::uint32_t bin = sBins[i];
+        if (bin == kSharedBinEmpty) continue;
+        if (i > 0 && sBins[i - 1u] == bin) continue;  // not a run start
+        std::uint32_t j = i + 1u;
+        while (j < staged && sBins[j] == bin) ++j;
+        atomicAdd(&hist[bin], j - i);
+    }
+}
+
+// Mode 2 fill: stage (bin, stagingIndex) 64-bit keys + packed payloads, sort by
+// bin, then the run-start thread reserves the run's range with ONE global
+// atomicAdd and writes the whole run (consecutive global positions).
+__global__ void fillBigCellEntriesSharedSortKernel(
+    const BackendTriangleVertex* __restrict__ positions,
+    const std::uint32_t* __restrict__ triangleIndices,
+    const std::uint32_t triangleCount,
+    const bool isTool,
+    const DeviceDenseGridConfig config,
+    const DeviceBigCellGridConfig bigc,
+    const std::uint32_t entryCapacity,
+    std::uint32_t* cursors,
+    std::uint32_t* entriesPacked,
+    std::uint32_t* entryOverflowCount,
+    std::uint32_t* sharedSpillCount)
+{
+    __shared__ unsigned long long sSortKeys[kSharedStageCapacity];  // (bin << 32) | stagingIndex
+    __shared__ std::uint32_t sPacked[kSharedStageCapacity];
+    __shared__ std::uint32_t sStage;
+    if (threadIdx.x == 0) sStage = 0u;
+    __syncthreads();
+
+    const std::uint32_t triangleId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (triangleId < triangleCount)
+    {
+        const DeviceTriangle triangle = indexedTriangleAt(positions, triangleIndices, triangleId);
+        const DeviceAabb aabb = triangleAabb(triangle, config.contactDistance);
+        int3 cellMin, cellMax;
+        if (denseGridCellSpan(aabb, config, cellMin, cellMax))
+        {
+            for (int z = cellMin.z; z <= cellMax.z; ++z)
+            for (int y = cellMin.y; y <= cellMax.y; ++y)
+            for (int x = cellMin.x; x <= cellMax.x; ++x)
+            {
+                const std::uint32_t bin = (bigCellIdOfSmall(x, y, z, bigc) << 1) | (isTool ? 1u : 0u);
+                const std::uint32_t packed = (triangleId << 6u) | bigCellLocalId(x, y, z, bigc);
+                const std::uint32_t pos = atomicAdd(&sStage, 1u);
+                if (pos < kSharedStageCapacity)
+                {
+                    sPacked[pos] = packed;
+                    sSortKeys[pos] = (static_cast<unsigned long long>(bin) << 32) | pos;
+                }
+                else
+                {
+                    const std::uint32_t gpos = atomicAdd(&cursors[bin], 1u);
+                    if (gpos < entryCapacity) entriesPacked[gpos] = packed;
+                    else atomicAdd(entryOverflowCount, 1u);
+                    atomicAdd(sharedSpillCount, 1u);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const std::uint32_t staged = min(sStage, kSharedStageCapacity);
+    for (std::uint32_t i = threadIdx.x + staged; i < kSharedStageCapacity; i += blockDim.x)
+    {
+        sSortKeys[i] = ~0ull;
+    }
+    __syncthreads();
+    bigCellBitonicSortShared(sSortKeys, kSharedStageCapacity);
+    for (std::uint32_t i = threadIdx.x; i < staged; i += blockDim.x)
+    {
+        const std::uint32_t bin = static_cast<std::uint32_t>(sSortKeys[i] >> 32);
+        if (bin == kSharedBinEmpty) continue;
+        if (i > 0 && static_cast<std::uint32_t>(sSortKeys[i - 1u] >> 32) == bin) continue;
+        std::uint32_t j = i + 1u;
+        while (j < staged && static_cast<std::uint32_t>(sSortKeys[j] >> 32) == bin) ++j;
+        const std::uint32_t runLen = j - i;
+        const std::uint32_t base = atomicAdd(&cursors[bin], runLen);
+        for (std::uint32_t r = 0; r < runLen; ++r)
+        {
+            const std::uint32_t pos = base + r;
+            const std::uint32_t stagingIndex = static_cast<std::uint32_t>(sSortKeys[i + r] & 0xffffffffull);
+            if (pos < entryCapacity) entriesPacked[pos] = sPacked[stagingIndex];
+            else atomicAdd(entryOverflowCount, 1u);
+        }
     }
 }
 
@@ -652,6 +1025,17 @@ bool computeBigCellFusedProximityContacts(
             return false;
         }
     }
+    const std::uint32_t sharedBuildMode = bigConfig.sharedBuildMode;
+    if (sharedBuildMode > 2u)
+    {
+        diagnostic = "Big-cell sharedBuildMode must be 0 (off), 1 (shared hash) or 2 (shared sorted list).";
+        return false;
+    }
+    if (sharedBuildMode != 0u && useHashBuild)
+    {
+        diagnostic = "Big-cell sharedBuildMode privatizes the CSR build; disable useHashTableBuild to use it.";
+        return false;
+    }
 
     auto& ws = bigCellWorkspace();
     std::uint64_t newlyAllocatedBytes = 0;
@@ -713,7 +1097,7 @@ bool computeBigCellFusedProximityContacts(
     {
         resetSortedGridKernel<<<resetBlocks, threads, 0, s>>>(
             ws.hist, binCount, ws.entryTotalCount, ws.entryOverflowCount, ws.mixedBigCellCount,
-            ws.pairsTestedCount, ws.unusedOverflowCount, ws.buildOverflowCount, nullptr);
+            ws.pairsTestedCount, ws.sharedSpillCount, ws.buildOverflowCount, nullptr);
         if (useHashBuild)
         {
             const std::uint32_t totalSlots = binCount * slotsPerBigCell;
@@ -725,6 +1109,38 @@ bool computeBigCellFusedProximityContacts(
             insertBigCellHashEntriesKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 slotsPerBigCell, ws.hashSlots, ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.buildOverflowCount);
+        }
+        else if (sharedBuildMode == 1u)
+        {
+            countBigCellEntriesSharedHashKernel<<<firstBlocks, threads, 0, s>>>(
+                deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
+                ws.hist, ws.firstAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            countBigCellEntriesSharedHashKernel<<<secondBlocks, threads, 0, s>>>(
+                deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
+                ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            exclusiveScanSortedGridBinsKernel<<<1, 1024, 0, s>>>(ws.hist, ws.starts, ws.cursors, binCount);
+            fillBigCellEntriesSharedHashKernel<<<firstBlocks, threads, 0, s>>>(
+                deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
+                entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            fillBigCellEntriesSharedHashKernel<<<secondBlocks, threads, 0, s>>>(
+                deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
+                entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+        }
+        else if (sharedBuildMode == 2u)
+        {
+            countBigCellEntriesSharedSortKernel<<<firstBlocks, threads, 0, s>>>(
+                deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
+                ws.hist, ws.firstAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            countBigCellEntriesSharedSortKernel<<<secondBlocks, threads, 0, s>>>(
+                deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
+                ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            exclusiveScanSortedGridBinsKernel<<<1, 1024, 0, s>>>(ws.hist, ws.starts, ws.cursors, binCount);
+            fillBigCellEntriesSharedSortKernel<<<firstBlocks, threads, 0, s>>>(
+                deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
+                entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            fillBigCellEntriesSharedSortKernel<<<secondBlocks, threads, 0, s>>>(
+                deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
+                entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
         }
         else
         {
@@ -768,7 +1184,7 @@ bool computeBigCellFusedProximityContacts(
         const std::array<std::uint64_t, 6> graphSignature {
             (static_cast<std::uint64_t>(binCount) << 32) | entryCapacity,
             (static_cast<std::uint64_t>(firstSurface.triangleCount) << 32) | secondSurface.triangleCount,
-            (static_cast<std::uint64_t>(proximityConfig.maxContacts) << 32) | (factor << 16) | toolTile,
+            (static_cast<std::uint64_t>(proximityConfig.maxContacts) << 32) | (sharedBuildMode << 24) | (factor << 16) | toolTile,
             (proximityConfig.computeBarycentrics ? 1ull : 0ull) | (useHashBuild ? 2ull : 0ull),
             floatSignatureBits(proximityConfig.contactDistance),
             1ull | (static_cast<std::uint64_t>(slotsPerBigCell) << 8) };  // way tag + hash sizing
@@ -826,14 +1242,16 @@ bool computeBigCellFusedProximityContacts(
         cudaMemcpyAsync(p + 7, ws.proximityVfCount,        sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 8, ws.proximityFvCount,        sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(p + 9, ws.proximityEeCount,        sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(p + 10, ws.sharedSpillCount,       sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
         hostPairsTested = p[0]; hostEntries = p[1]; hostEntryOverflow = p[2]; hostMixed = p[3];
         hostBuildOverflow = p[4]; hostContactCount = p[5];
         hostVf = p[7]; hostFv = p[8]; hostEe = p[9];
+        const std::uint32_t hostSharedSpill = p[10];
         const std::uint32_t hostProxOverflow = p[6];
         if (executionStats != nullptr)
         {
-            executionStats->deviceToHostBytes += 10u * sizeof(std::uint32_t);
+            executionStats->deviceToHostBytes += 11u * sizeof(std::uint32_t);
             executionStats->uniqueCandidateCount += hostPairsTested;
             executionStats->outputCandidateCount += hostPairsTested;
             executionStats->rawCandidateCount += hostEntries;
@@ -861,6 +1279,7 @@ bool computeBigCellFusedProximityContacts(
             bigStats->pairsTestedCount = hostPairsTested;
             bigStats->entryOverflowCount = hostEntryOverflow;
             bigStats->buildOverflowCount = hostBuildOverflow;
+            bigStats->sharedSpillCount = hostSharedSpill;
         }
     }
 

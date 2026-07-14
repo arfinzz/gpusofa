@@ -877,6 +877,7 @@ int main()
         bigConfig.toolTileCapacity = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_TILE", 256));
         bigConfig.useHashTableBuild = envBool("SOFA_BACKEND_BENCH_BIGCELL_HASH_BUILD", false);
         bigConfig.hashSlotsPerBigCell = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_HASH_SLOTS", 1024));
+        bigConfig.sharedBuildMode = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_SHARED_BUILD", 1));
 
         const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
 
@@ -891,6 +892,7 @@ int main()
         int bigMeasured = 0;
         std::uint64_t bigLastContacts = 0, bigLastPairs = 0, bigLastMixed = 0, bigLastEntries = 0;
         std::uint64_t bigLastVf = 0, bigLastFv = 0, bigLastEe = 0, bigLastEntryOf = 0, bigLastBuildOf = 0;
+        std::uint64_t bigLastSharedSpill = 0;
 
         for (int step = 0; step < steps + warmup; ++step)
         {
@@ -922,6 +924,7 @@ int main()
                 bigLastEe = proximityStats.eeContactCount;
                 bigLastEntryOf = bigStatsOut.entryOverflowCount;
                 bigLastBuildOf = bigStatsOut.buildOverflowCount;
+                bigLastSharedSpill = bigStatsOut.sharedSpillCount;
             }
 
             bigCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
@@ -936,6 +939,8 @@ int main()
         }
 
         std::cout << "bigcell_build=" << (bigConfig.useHashTableBuild ? "hash_table" : "csr") << '\n'
+                  << "bigcell_shared_build=" << (bigConfig.sharedBuildMode == 1u ? "shared_hash"
+                                                 : bigConfig.sharedBuildMode == 2u ? "shared_sort" : "off") << '\n'
                   << "bigcell_factor=" << bigConfig.bigCellFactor << '\n'
                   << "bigcell_tool_tile=" << bigConfig.toolTileCapacity << '\n'
                   << "bigcell_measured_steps=" << bigMeasured << '\n'
@@ -947,7 +952,8 @@ int main()
                   << "bigcell_contacts=" << bigLastContacts << " (vf=" << bigLastVf
                   << " fv=" << bigLastFv << " ee=" << bigLastEe << ")\n"
                   << "bigcell_entry_overflow=" << bigLastEntryOf
-                  << " bigcell_build_overflow=" << bigLastBuildOf << '\n'
+                  << " bigcell_build_overflow=" << bigLastBuildOf
+                  << " bigcell_shared_spill=" << bigLastSharedSpill << '\n'
                   << "bigcell_csv=" << bigPath.string() << '\n'
                   << "CORRECTNESS: bigcell_contacts (" << bigLastContacts
                   << ") should equal fbp_contacts above; bigcell_pairs_tested should equal "

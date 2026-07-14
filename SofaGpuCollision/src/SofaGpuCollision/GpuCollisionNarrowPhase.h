@@ -64,6 +64,7 @@ private:
     DataUInt d_bigCellToolTile;
     DataBool d_bigCellUseHashBuild;
     DataUInt d_bigCellHashSlots;
+    DataUInt d_bigCellSharedBuild;
     DataUInt d_hashTableSize;
     DataBool d_useFeatureBasedProximity;
     DataBool d_useVertexTriangleProximity;       // routes self-collision pairs through computeFeatureBasedVertexTriangleContacts

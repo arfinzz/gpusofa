@@ -27,7 +27,7 @@ export SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 mkdir -p "${BASE}"
 
 run_mode() {
-    label="$1"; hashflag="$2"; phase15="$3"; simplehash="${4:-0}"; sorted="${5:-0}"; cub="${6:-0}"; pairdedup="${7:-0}"; bigcell="${8:-0}"
+    label="$1"; hashflag="$2"; phase15="$3"; simplehash="${4:-0}"; sorted="${5:-0}"; cub="${6:-0}"; pairdedup="${7:-0}"; bigcell="${8:-0}"; sharedbuild="${9:-0}"; hashbuild="${10:-0}"
     d="${BASE}/${label}"; mkdir -p "${d}"
     env SOFA_USE_HASH_PREFIXSUM_GENERATION="${hashflag}" \
         SOFA_USE_SIMPLE_HASH_GENERATION="${simplehash}" \
@@ -35,6 +35,9 @@ run_mode() {
         SOFA_SORTED_GRID_CUB_SORT="${cub}" \
         SOFA_SORTED_GRID_PAIRHASH_DEDUP="${pairdedup}" \
         SOFA_USE_BIGCELL_FUSED_GENERATION="${bigcell}" \
+        SOFA_BIGCELL_SHARED_BUILD="${sharedbuild}" \
+        SOFA_BIGCELL_HASH_BUILD="${hashbuild}" \
+        SOFA_BIGCELL_HASH_SLOTS=2048 \
         SOFA_USE_TOOL_ACTIVE_CELL_GENERATION="${phase15}" \
         SOFA_BENCHMARK_LABEL_SUFFIX="_${label}" \
         SOFA_BENCHMARK_LOG_DIR="${d}" \
@@ -44,18 +47,22 @@ run_mode() {
 }
 
 nvidia-smi --query-gpu=temperature.gpu,clocks.gr --format=csv,noheader || true
-run_mode dense_plain     0 0 0 0 0 0 0
-run_mode dense_phase15   0 1 0 0 0 0 0
-run_mode hash_opt        1 1 0 0 0 0 0
-run_mode simple_hash     0 1 1 0 0 0 0
-run_mode sorted_grid     0 1 0 1 0 0 0
-run_mode sorted_cub      0 1 0 1 1 0 0
-run_mode sorted_pairhash 0 1 0 1 0 1 0
-run_mode bigcell_fused   0 1 0 0 0 0 1
+run_mode dense_plain          0 0 0 0 0 0 0 0 0
+run_mode dense_phase15        0 1 0 0 0 0 0 0 0
+run_mode hash_opt             1 1 0 0 0 0 0 0 0
+run_mode simple_hash          0 1 1 0 0 0 0 0 0
+run_mode sorted_grid          0 1 0 1 0 0 0 0 0
+run_mode sorted_cub           0 1 0 1 1 0 0 0 0
+run_mode sorted_pairhash      0 1 0 1 0 1 0 0 0
+run_mode sorted_cub_pairhash  0 1 0 1 1 1 0 0 0
+run_mode bigcell_direct       0 1 0 0 0 0 1 0 0
+run_mode bigcell_sharedhash   0 1 0 0 0 0 1 1 0
+run_mode bigcell_sharedsort   0 1 0 0 0 0 1 2 0
+run_mode bigcell_globalhash   0 1 0 0 0 0 1 0 1
 
 echo
 echo "=== SUMMARY (kernel time is the robust metric) ==="
-for leg in dense_plain dense_phase15 hash_opt simple_hash sorted_grid sorted_cub sorted_pairhash bigcell_fused; do
+for leg in dense_plain dense_phase15 hash_opt simple_hash sorted_grid sorted_cub sorted_pairhash sorted_cub_pairhash bigcell_direct bigcell_sharedhash bigcell_sharedsort bigcell_globalhash; do
     f="$(ls "${BASE}/${leg}"/*summary*.txt 2>/dev/null | head -1)"
     [ -z "${f}" ] && { echo "${leg}: NO SUMMARY (see ${BASE}/${leg}/run.log)"; continue; }
     fps=$(grep -E '^avg_fps=' "${f}"|cut -d= -f2)

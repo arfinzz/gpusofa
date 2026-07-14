@@ -10,7 +10,7 @@ Last refreshed: **2026-06-18**. Since 2026-06-09 the hash cull was optimised and
 merged to `main` (§5.19), three more hash opts + CUDA graphs landed (§5.20), and an
 FBP-kernel occupancy optimization was attempted and reverted as a measured regression
 (§5.21). Current numbers + the full optimization/failed-methods history:
-`reports/performance_six_ways_20260713.md`.
+`reports/performance_all_modes_20260715.md`.
 
 ---
 
@@ -993,7 +993,7 @@ narrow kernel does coalesced 128-bit loads reused across a triangle's many candi
 pairs (a pre-pass kernel + buffers + CUDA-graph integration — scoped, not yet done).
 
 **Methods that DO NOT work (do not retry)** — full table in
-`reports/performance_six_ways_20260713.md` §6: FBP `__launch_bounds__` /
+`reports/performance_all_modes_20260715.md` §6: FBP `__launch_bounds__` /
 register-reduction / `__ldg` (LSU-bound, regression); `compactActiveCells` (scanned
 all cells, regressed → replaced by Phase 15); `batchTriangleInsert` (breaks
 tissue-before-tool ordering); warp-aggregated atomics (atomics not the bottleneck,
@@ -1057,7 +1057,7 @@ opt-hash 0.347 / simple 0.336 / **sorted 0.352 ms** (tied with the hashes). Back
 faster than every other way**, because the home-cell pre-cull starves the load-bound FBP
 kernel of 86 % of its pairs. The §"radix sort will likely lose" prediction was wrong; the
 sort roughly ties at binning, and the *dedup strategy the sorted layout enables* is what
-wins. Report: `reports/performance_six_ways_20260713.md`; parity tool:
+wins. Report: `reports/performance_all_modes_20260715.md`; parity tool:
 `scripts/run_sorted_grid_parity_wsl.sh`.
 
 **Environment gotchas fenced off (do not re-debug):**
@@ -1115,7 +1115,7 @@ Origin: the user's two-level-grid brainstorm ("small cells grouped into big cell
 per-big-cell table pulled into block shared memory"). Design bends applied and A/B'd
 rather than assumed. New module `cuda/detail/BigCellGrid.cuh` (8th umbrella include),
 API `computeBigCellFusedProximityContacts`, report
-**`reports/performance_six_ways_20260713.md`** (full numbers).
+**`reports/performance_all_modes_20260715.md`** (full numbers).
 
 - **Build:** per-big-cell CSR table of packed `(triId << 6) | localSmallCellId` entries,
   count → scan → fill. The scan input is `bigCellFactor`³ smaller than way 5's, so the
@@ -1153,6 +1153,40 @@ API `computeBigCellFusedProximityContacts`, report
   cells (attacks the factor-4 collapse directly).
 - Dispatch precedence: **bigcell > hash > simple > sorted > dense**. Suite script gained
   `SOFA_SUITE_ONLY` (regex leg filter) so the 15-leg suite can run in <10-min batches.
+
+### 5.26  Shared-memory build A/B — hash table vs sorted list — LANDED 2026-07-15
+
+The second half of the two-level-grid brainstorm: each block takes a **fixed chunk of
+triangles** (spatially blind by necessity), **populates its histogram/CSR contribution in
+shared memory, then merges to global** with per-bin instead of per-entry atomics.
+`bigCellSharedBuild` / `SOFA_BIGCELL_SHARED_BUILD`: 0 = direct global atomics,
+1 = shared HASH TABLE (insert-or-count + staged entries), 2 = shared SORTED LIST
+(in-shared bitonic sort + run-writer merge). Staging overflow falls back to the direct
+path (`sharedSpillCount`; zero on all measured scenes) — the entry multiset and therefore
+contacts are identical in every mode (verified: 8-leg parity 8018/43,584, 200k
+17,040/89,856, SOFA 10-leg 2354 everywhere). Report:
+**`reports/archive_pre_20260715/bigcell_shared_build_ab_20260715.md`**.
+
+- **Measured: shared hash WINS everywhere — new DEFAULT (mode 1).** Full pipeline
+  0.598 → 0.525 ms at 80k (−12%), 1.084 → 0.807 ms at 200k (−26%); SOFA 14k scene
+  0.299 → **0.290 ms, the overall record across all 10 configurations**. Way 6 now beats
+  way 5 by 22–26% on the bench (previously a tie at 200k).
+- **Shared sorted list LOSES ~2.6×** (1.54/3.34 ms): the 2048-entry in-shared bitonic sort
+  (count 283 µs @ 77% SM, fill 527 µs @ 52% SM of pure compute) costs far more than every
+  global atomic it avoids. Re-confirms Phase 13 from the other side: the atomics were
+  never the expensive part.
+- **The A/B verdict is the exact mirror of the global-build A/B (§5.25)**: in global
+  memory, sorting won 2.9× (coalescing beats probe latency); in shared memory, hashing
+  wins (probes are ~free, sort-network compute dominates). Same two structures, opposite
+  winners, decided by the memory level they live in.
+- **Second-order finding:** the fused consumer kernel itself sped up 524 → 467 µs under
+  the privatized builds — block-grouped entries land contiguously within each bin run and
+  a chunk's triangles are index-contiguous, so the consumer's vertex gathers get local.
+  Build layout quality is consumer performance. (Cheap open question: would sorting the
+  global CSR runs by triangle id buy mode 0 the same bonus?)
+- ncu (80k, relative): count 57 → 36 µs @ 7.5 → 21.6% SM under the shared hash; fill
+  duration-neutral but 3× SM%. The fastest configuration also had the LOWEST fused-kernel
+  occupancy (30.3%) — occupancy remains the wrong metric for this kernel family.
 
 ---
 

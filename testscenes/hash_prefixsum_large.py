@@ -52,6 +52,7 @@ BIGCELL_FACTOR = int(os.environ.get("SOFA_BIGCELL_FACTOR", "2"))
 BIGCELL_TOOL_TILE = int(os.environ.get("SOFA_BIGCELL_TOOL_TILE", "256"))
 BIGCELL_HASH_BUILD = env_flag("SOFA_BIGCELL_HASH_BUILD", False)
 BIGCELL_HASH_SLOTS = int(os.environ.get("SOFA_BIGCELL_HASH_SLOTS", "1024"))
+BIGCELL_SHARED_BUILD = int(os.environ.get("SOFA_BIGCELL_SHARED_BUILD", "1"))
 HASH_TABLE_SIZE = int(os.environ.get("SOFA_HASH_TABLE_SIZE", "0"))
 USE_TOOL_ACTIVE_CELL_GENERATION = env_flag("SOFA_USE_TOOL_ACTIVE_CELL_GENERATION", True)
 PROXIMITY_READ_CONTACT_COUNTER = env_flag("SOFA_PROXIMITY_READ_CONTACT_COUNTER", True)
@@ -108,6 +109,7 @@ def createScene(root):
         bigCellToolTile=BIGCELL_TOOL_TILE,
         bigCellUseHashBuild=BIGCELL_HASH_BUILD,
         bigCellHashSlots=BIGCELL_HASH_SLOTS,
+        bigCellSharedBuild=BIGCELL_SHARED_BUILD,
         hashTableSize=HASH_TABLE_SIZE,
         proximityComputeBarycentrics=True,
         proximityKeepContactsOnDevice=True,

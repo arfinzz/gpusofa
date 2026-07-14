@@ -472,6 +472,22 @@ struct BigCellConfig
     // memory waste is inherent to the per-big-cell hash layout and is part of
     // what the A/B measures.
     std::uint32_t hashSlotsPerBigCell { 1024 };
+    // CSR-build shared-memory privatization A/B ("populate in shared, merge
+    // later" — each block takes a FIXED chunk of triangles, builds its chunk's
+    // contribution in shared memory, then merges to the global histogram/CSR
+    // with per-bin instead of per-entry global atomics):
+    //   0 = off (direct global atomics, the baseline)
+    //   1 = shared HASH TABLE (insert-or-count keyed by bin, staged entries)
+    //   2 = shared SORTED LIST (stage entries, in-shared bitonic sort by bin,
+    //       one reservation per run, run-writer scatter)
+    // Entries that overflow the shared staging fall back to the direct global
+    // path (BigCellStats::sharedSpillCount) — contacts are identical either
+    // way. Mutually exclusive with useHashTableBuild.
+    // DEFAULT 1 (shared hash) as of 2026-07-15, measured: -12% at 80k / -26%
+    // at 200k full-pipeline vs direct atomics (and the block-grouped entry
+    // order speeds the fused consumer too); the shared SORTED LIST lost ~2.6x
+    // (the in-shared bitonic sort costs more than every atomic it avoids).
+    std::uint32_t sharedBuildMode { 1 };
 };
 
 struct BigCellStats
@@ -482,6 +498,7 @@ struct BigCellStats
     std::uint32_t pairsTestedCount { 0 };      // pairs surviving AABB + home-cell (parity: way-5 uniquePairCount)
     std::uint32_t entryOverflowCount { 0 };    // dropped entries (capacity)
     std::uint32_t buildOverflowCount { 0 };    // hash-build slot-region overflow (0 on CSR)
+    std::uint32_t sharedSpillCount { 0 };      // shared-build entries that fell back to the direct global path
 };
 
 SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(

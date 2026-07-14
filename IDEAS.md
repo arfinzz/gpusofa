@@ -2,10 +2,11 @@
 
 Running record of every optimization idea we have discussed — the good, the bad, and the
 already-buried — so nothing gets re-litigated or re-invented from scratch. Measured numbers
-come from the canonical report ([reports/performance_five_ways_20260703.md](reports/performance_five_ways_20260703.md));
+come from the canonical report ([reports/performance_all_modes_20260715.md](reports/performance_all_modes_20260715.md));
 architecture background lives in [guide/architecture.md](guide/architecture.md).
 
-Last updated: 2026-07-12.
+Last updated: 2026-07-15 (status pass: §2 and §3 are now IMPLEMENTED — see the ✅ blocks
+inside them; ranked list in §11 refreshed).
 
 **Status legend**
 
@@ -32,7 +33,19 @@ latency-bound on atomicCAS dedup chains, not on raw atomic throughput.
 
 ---
 
-## 2. QUEUED — Multi-block scan / multi-block counting sort
+## 2. DONE (2026-07-15, as the way-6 shared build) — Multi-block scan / shared-memory merge
+
+> **✅ IMPLEMENTED + MEASURED.** The "populate locally in shared, merge globally" idea
+> landed as way 6's `bigCellSharedBuild` (0 = direct atomics, 1 = shared hash table,
+> 2 = shared sorted list). **Shared hash won everywhere and is the default** (−12% at 80k,
+> −26% at 200k full pipeline; SOFA record 0.290 ms); the shared **sorted list lost ~2.6×**
+> (the in-shared bitonic sort costs more than every atomic it avoids) — the exact mirror
+> of the global-build A/B, where sorting won. The merge-insight below held exactly:
+> counts/aggregates merge perfectly, sorted payloads merge fine per-run, and the
+> global-memory hash multi-map (way 6's `bigCellUseHashBuild`) merges worst of all.
+> Also: the separate way-5 multi-block scan became moot for way 6 (its scan input is
+> factor³ smaller); it remains open for way 5 itself. Report:
+> `reports/performance_all_modes_20260715.md`.
 
 **What:** Replace the single-block Hillis-Steele scan (one 1024-thread block crawling the
 whole histogram, 413 µs at 3.8% SOL) with the standard multi-block scheme: per-block
@@ -53,7 +66,19 @@ Bonus available in the same rework: per-block shared-histogram aggregation in ex
 one global atomicAdd per (block, non-empty cell) instead of per incidence. Shared atomics
 are fast on Turing; expansion is only 111 µs ×2 today, so this is a side benefit, not a goal.
 
-## 3. PROMISING — Way 5b: big-cell tiled generation + FBP fusion
+## 3. DONE (2026-07-12/15, as "way 6") — Way 5b: big-cell tiled generation + FBP fusion
+
+> **✅ IMPLEMENTED + MEASURED as `useBigCellFusedGeneration` (way 6).** Contact-identical
+> to every other way on every scene. With the shared-hash build it is **the fastest
+> configuration measured on every scene**: 0.290 ms on the 14k SOFA scene, 0.525 ms at
+> the 80k bench, 0.807 ms at 200k — beating way 5 by 22–26% at the bench sizes. Design
+> notes below survived contact with reality except two: `bigCellFactor` defaulted to 2,
+> not 4 (factor 4 collapses block-level parallelism — 48 mixed big cells at 200k), and
+> the "contiguous slice via sort-key remap" became a per-big-cell CSR table (count →
+> small scan → fill), which sidesteps the way-5 scan bottleneck entirely. The literal
+> per-big-cell hash table (the original wording) was also built as an A/B and measured
+> 2.9×–6.5× slower (`bigCellUseHashBuild`). Reports:
+> `reports/performance_all_modes_20260715.md` (+ archived way-6 landing report).
 
 **Origin (user idea):** two-level grid — small cells grouped into big cells; build a
 per-big-cell table of triangle→small-cell; launch one block per big cell; pull the table
@@ -239,13 +264,23 @@ is the bottleneck. The concept is sound; the 35.5 µs ceiling is what kills it *
   (0.352 vs 0.512 ms) *and* keeps the free pre-cull. Kept only as a toggle
   (`SOFA_SORTED_GRID_PAIRHASH_DEDUP`).
 
-## 11. Ranked pending list (snapshot)
+## 11. Ranked pending list (snapshot, refreshed 2026-07-15)
 
-1. **Multi-block scan** (§2) — certain, low-risk, ~413 → ~50 µs. `QUEUED`
-2. **Way 5b big-cell fusion** (§3) — highest ceiling, attacks FBP load-boundedness. `PROMISING`
-3. **Dense touched-slot clearing** — helps the default surgical path (~25% of its kernel
-   budget; dense also pays a hidden ~8 MB pair-table memset/frame). `QUEUED`
-4. **Home-cell AABB pre-cull ported to hash ways** — strictly bigger lever than any probing
-   optimization (−86% of inserts vs ~13% faster inserts). `PROMISING`
-5. Cooperative probing / incremental tables / dirty-region AABBs / normal-cone self-collision
-   culling — `FUTURE`, triggers in §4–7.
+~~Multi-block scan~~ → moot for way 6 (scan input factor³ smaller); still open for way 5
+but way 5 is no longer the frontier. ~~Way 5b big-cell fusion~~ → **DONE = way 6, the new
+champion** (§3). Remaining, ranked:
+
+1. **Fused-kernel register pressure** — 122 regs → 42% occupancy ceiling on the new
+   dominant kernel; `__launch_bounds__` retest justified (the old dead-end verdict was
+   for the differently-shaped standalone FBP kernel). `QUEUED`
+2. **Heavy-big-cell work splitting** — attacks the factor-4-style block imbalance inside
+   the fused kernel. `PROMISING`
+3. **Dense touched-slot clearing** — still helps the production-default dense path.
+   `QUEUED`
+4. **Home-cell AABB pre-cull ported to hash ways** — strictly bigger lever than any
+   probing optimization (−86% of inserts). `PROMISING` (lower value now that ways 5/6
+   dominate)
+5. **Sort global CSR runs by triangle id for way-6 mode 0** — cheap test of the
+   consumer-locality bonus discovered in the shared-build A/B. `PROMISING`
+6. Cooperative probing / incremental tables / dirty-region AABBs / normal-cone
+   self-collision culling — `FUTURE`, triggers in §4–7.
