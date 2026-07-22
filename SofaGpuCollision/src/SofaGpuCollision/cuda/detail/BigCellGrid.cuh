@@ -762,6 +762,15 @@ __global__ void insertBigCellHashEntriesKernel(
 // Dedup/pre-cull is way 5's home-cell rule at SMALL-cell granularity, so the
 // surviving pair set is provably identical to way 5's; each survivor runs the
 // identical FBP math and appends straight to the single contact list.
+__device__ __forceinline__ bool bigCellRawAabbGapExceeds(
+    const DeviceAabb& a, const DeviceAabb& b, const float thresholdSq)
+{
+    const float gx = fmaxf(0.0f, fmaxf(a.minX - b.maxX, b.minX - a.maxX));
+    const float gy = fmaxf(0.0f, fmaxf(a.minY - b.maxY, b.minY - a.maxY));
+    const float gz = fmaxf(0.0f, fmaxf(a.minZ - b.maxZ, b.minZ - a.maxZ));
+    return gx * gx + gy * gy + gz * gz > thresholdSq;
+}
+
 __global__ void fusedBigCellNarrowKernel(
     const std::uint32_t* __restrict__ starts,
     const std::uint32_t* __restrict__ entriesPacked,
@@ -771,7 +780,6 @@ __global__ void fusedBigCellNarrowKernel(
     const std::uint32_t* __restrict__ mixedBigCellIds,
     const std::uint32_t* mixedBigCellCount,
     const DeviceAabb* __restrict__ tissueAabbs,
-    const DeviceAabb* __restrict__ toolAabbs,
     const BackendTriangleVertex* __restrict__ tissuePositions,
     const std::uint32_t* __restrict__ tissueIndices,
     const BackendTriangleVertex* __restrict__ toolPositions,
@@ -880,8 +888,8 @@ __global__ void fusedBigCellNarrowKernel(
                 const std::uint32_t pos = atomicAdd(&sBinCursor[packed & 63u], 1u);
                 const std::uint32_t toolTriId = packed >> 6u;
                 sToolIds[pos] = toolTriId;
-                sToolAabbs[pos] = toolAabbs[toolTriId];
                 const DeviceTriangle tt = indexedTriangleAt(toolPositions, toolIndices, toolTriId);
+                sToolAabbs[pos] = triangleAabb(tt, 0.0f);
                 sToolVerts[3u * pos + 0u] = tt.p0;
                 sToolVerts[3u * pos + 1u] = tt.p1;
                 sToolVerts[3u * pos + 2u] = tt.p2;
@@ -899,7 +907,7 @@ __global__ void fusedBigCellNarrowKernel(
                 const std::uint32_t r1 = sRunStart[local + 1u];
                 if (r0 == r1) continue;
                 const std::uint32_t tissueTriId = packed >> 6u;
-                const DeviceAabb a = tissueAabbs[tissueTriId];
+                const DeviceAabb aInflated = tissueAabbs[tissueTriId];
                 const std::uint32_t mask = bigc.factor - 1u;
                 const int cx = baseX + static_cast<int>(local & mask);
                 const int cy = baseY + static_cast<int>((local >> bigc.factorShift) & mask);
@@ -908,13 +916,18 @@ __global__ void fusedBigCellNarrowKernel(
                 // Tissue vertices load once per (entry, chunk) — not once per pair.
                 const DeviceTriangle ta = indexedTriangleAt(tissuePositions, tissueIndices, tissueTriId);
                 const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
+                const DeviceAabb aRaw = triangleAabb(ta, 0.0f);
                 for (std::uint32_t u = r0; u < r1; ++u)
                 {
-                    const DeviceAabb b = sToolAabbs[u];
-                    const float mx = fmaxf(a.minX, b.minX);
-                    const float my = fmaxf(a.minY, b.minY);
-                    const float mz = fmaxf(a.minZ, b.minZ);
-                    if (mx > fminf(a.maxX, b.maxX) || my > fminf(a.maxY, b.maxY) || mz > fminf(a.maxZ, b.maxZ))
+                    const DeviceAabb bRaw = sToolAabbs[u];
+                    const DeviceAabb bInflated {
+                        bRaw.minX - contactDistance, bRaw.minY - contactDistance, bRaw.minZ - contactDistance,
+                        bRaw.maxX + contactDistance, bRaw.maxY + contactDistance, bRaw.maxZ + contactDistance };
+                    const float mx = fmaxf(aInflated.minX, bInflated.minX);
+                    const float my = fmaxf(aInflated.minY, bInflated.minY);
+                    const float mz = fmaxf(aInflated.minZ, bInflated.minZ);
+                    if (mx > fminf(aInflated.maxX, bInflated.maxX) || my > fminf(aInflated.maxY, bInflated.maxY) ||
+                        mz > fminf(aInflated.maxZ, bInflated.maxZ))
                     {
                         continue;  // inflated AABBs disjoint -> distance > contactDistance
                     }
@@ -925,8 +938,10 @@ __global__ void fusedBigCellNarrowKernel(
                     atomicAdd(pairsTestedCount, 1u);
                     const float3 bV[3] = {
                         sToolVerts[3u * u + 0u], sToolVerts[3u * u + 1u], sToolVerts[3u * u + 2u] };
+                    if (bigCellRawAabbGapExceeds(aRaw, bRaw, distThreshSq)) continue;
                     DeviceProximityContact c;
-                    if (!fbpComputeClosestFeatureContact(aV, bV, distThreshSq, computeBarycentrics, c))
+                    if (!fbpComputeClosestFeatureContact(
+                            aV, bV, distThreshSq, computeBarycentrics, c, true))
                     {
                         continue;
                     }
@@ -1166,7 +1181,7 @@ bool computeBigCellFusedProximityContacts(
         fusedBigCellNarrowKernel<<<kFusedBlocks, threads, 0, s>>>(
             ws.starts, ws.entriesPacked, ws.hashSlots, slotsPerBigCell, useHashBuild,
             ws.mixedBigCellIds, ws.mixedBigCellCount,
-            ws.firstAabbs, ws.secondAabbs,
+            ws.firstAabbs,
             deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices,
             dc, bigc, toolTile, entryCapacity, deviceContacts,
             ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,

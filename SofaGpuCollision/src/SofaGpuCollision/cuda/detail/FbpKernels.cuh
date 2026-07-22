@@ -156,7 +156,8 @@ __device__ __forceinline__ bool fbpComputeClosestFeatureContact(
     const float3 bV[3],
     const float distThreshSq,
     const bool computeBarycentrics,
-    DeviceProximityContact& c)
+    DeviceProximityContact& c,
+    const bool aabbAlreadyRejected = false)
 {
     // Cheap conservative AABB pre-reject (2026-06-17): if the two triangles'
     // axis-aligned boxes are separated by more than contactDistance, their
@@ -164,6 +165,7 @@ __device__ __forceinline__ bool fbpComputeClosestFeatureContact(
     // closest-feature tests. The squared box gap is exact and never drops a real
     // contact (the triangles are contained in their boxes), so output is
     // bit-identical — this only avoids wasted math on far same-cell pairs.
+    if (!aabbAlreadyRejected)
     {
         float3 aMin = aV[0], aMax = aV[0];
         float3 bMin = bV[0], bMax = bV[0];

@@ -892,7 +892,7 @@ int main()
         int bigMeasured = 0;
         std::uint64_t bigLastContacts = 0, bigLastPairs = 0, bigLastMixed = 0, bigLastEntries = 0;
         std::uint64_t bigLastVf = 0, bigLastFv = 0, bigLastEe = 0, bigLastEntryOf = 0, bigLastBuildOf = 0;
-        std::uint64_t bigLastSharedSpill = 0;
+        std::uint64_t bigLastSharedSpill = 0, bigLastTotalOverflow = 0;
 
         for (int step = 0; step < steps + warmup; ++step)
         {
@@ -925,6 +925,7 @@ int main()
                 bigLastEntryOf = bigStatsOut.entryOverflowCount;
                 bigLastBuildOf = bigStatsOut.buildOverflowCount;
                 bigLastSharedSpill = bigStatsOut.sharedSpillCount;
+                bigLastTotalOverflow = stats.overflowCount;
             }
 
             bigCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
@@ -954,6 +955,7 @@ int main()
                   << "bigcell_entry_overflow=" << bigLastEntryOf
                   << " bigcell_build_overflow=" << bigLastBuildOf
                   << " bigcell_shared_spill=" << bigLastSharedSpill << '\n'
+                  << "bigcell_total_overflow=" << bigLastTotalOverflow << '\n'
                   << "bigcell_csv=" << bigPath.string() << '\n'
                   << "CORRECTNESS: bigcell_contacts (" << bigLastContacts
                   << ") should equal fbp_contacts above; bigcell_pairs_tested should equal "
