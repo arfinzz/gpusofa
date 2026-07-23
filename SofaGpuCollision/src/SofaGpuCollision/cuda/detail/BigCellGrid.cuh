@@ -34,6 +34,34 @@ struct DeviceBigCellGridConfig
     std::uint32_t bigResZ;
 };
 
+// Opt-in fused-kernel instrumentation. Major-phase cycle fields sum one
+// wall-clock sample per participating block/tile; filter cycle fields sum
+// participating-thread samples. Neither is a replacement for CUDA-event
+// elapsed time because blocks and threads execute concurrently.
+struct DeviceBigCellFusedProfile
+{
+    unsigned long long bigCellIterations;
+    unsigned long long tileIterations;
+    unsigned long long toolEntriesStaged;
+    unsigned long long tissueEntriesVisited;
+    unsigned long long smallCellPairVisits;
+    unsigned long long inflatedAabbRejects;
+    unsigned long long homeCellRejects;
+    unsigned long long rawAabbRejects;
+    unsigned long long fbpCalls;
+    unsigned long long fbpNoContact;
+    unsigned long long tileSetupBlockCycles;
+    unsigned long long binPrefixBlockCycles;
+    unsigned long long toolGatherBlockCycles;
+    unsigned long long tissueSweepBlockCycles;
+    unsigned long long inflatedAabbThreadCycles;
+    unsigned long long homeCellThreadCycles;
+    unsigned long long rawAabbThreadCycles;
+    unsigned long long fbpThreadCycles;
+};
+
+constexpr std::size_t kBigCellDetailedEventCount = 11;
+
 __device__ __forceinline__ std::uint32_t bigCellIdOfSmall(
     const int x, const int y, const int z, const DeviceBigCellGridConfig& bigc)
 {
@@ -70,6 +98,7 @@ struct BigCellWorkspace
     std::uint32_t* pairsTestedCount { nullptr };  // pairs surviving AABB+home-cell
     std::uint32_t* buildOverflowCount { nullptr };// hash-build slot-region overflow
     std::uint32_t* sharedSpillCount { nullptr };// shared-build entries that fell back to the direct global path
+    DeviceBigCellFusedProfile* fusedProfile { nullptr };
     void* proximityContacts { nullptr };
     std::uint32_t* proximityContactCount { nullptr };
     std::uint32_t* proximityOverflowCount { nullptr };
@@ -102,6 +131,8 @@ struct BigCellWorkspace
     cudaEvent_t startEvent { nullptr };
     cudaEvent_t endEvent { nullptr };
     bool eventsReady { false };
+    cudaEvent_t detailedEvents[kBigCellDetailedEventCount] {};
+    bool detailedEventsReady { false };
     bool firstFrameDone { false };
     CudaGraphReplayer graph;
 
@@ -114,6 +145,7 @@ struct BigCellWorkspace
         cudaFree(firstAabbs); cudaFree(secondAabbs); cudaFree(mixedBigCellIds);
         cudaFree(entryTotalCount); cudaFree(entryOverflowCount); cudaFree(mixedBigCellCount);
         cudaFree(pairsTestedCount); cudaFree(buildOverflowCount); cudaFree(sharedSpillCount);
+        cudaFree(fusedProfile);
         cudaFree(proximityContacts);
         cudaFree(proximityContactCount); cudaFree(proximityOverflowCount);
         cudaFree(proximityVfCount); cudaFree(proximityFvCount); cudaFree(proximityEeCount);
@@ -121,12 +153,14 @@ struct BigCellWorkspace
         cudaFree(firstPositions); cudaFree(secondPositions);
         cudaFreeHost(countersHostPinned);
         if (eventsReady) { cudaEventDestroy(startEvent); cudaEventDestroy(endEvent); }
+        if (detailedEventsReady) for (cudaEvent_t event : detailedEvents) cudaEventDestroy(event);
         graph.release();
         hist = nullptr; starts = nullptr; cursors = nullptr;
         entriesPacked = nullptr; hashSlots = nullptr;
         firstAabbs = nullptr; secondAabbs = nullptr; mixedBigCellIds = nullptr;
         entryTotalCount = nullptr; entryOverflowCount = nullptr; mixedBigCellCount = nullptr;
         pairsTestedCount = nullptr; buildOverflowCount = nullptr; sharedSpillCount = nullptr;
+        fusedProfile = nullptr;
         proximityContacts = nullptr;
         proximityContactCount = nullptr; proximityOverflowCount = nullptr;
         proximityVfCount = nullptr; proximityFvCount = nullptr; proximityEeCount = nullptr;
@@ -134,6 +168,7 @@ struct BigCellWorkspace
         firstPositions = nullptr; secondPositions = nullptr;
         countersHostPinned = nullptr;
         startEvent = nullptr; endEvent = nullptr; eventsReady = false;
+        for (cudaEvent_t& event : detailedEvents) event = nullptr; detailedEventsReady = false;
         histCapacity = 0; startsCapacity = 0; cursorsCapacity = 0;
         entryCapacity = 0; hashSlotCapacity = 0;
         firstAabbCapacity = 0; secondAabbCapacity = 0; mixedBigCellIdCapacity = 0;
@@ -152,6 +187,30 @@ struct BigCellWorkspace
         if (err == cudaSuccess) err = cudaEventCreate(&endEvent);
         eventsReady = (err == cudaSuccess);
         return err;
+    }
+
+    cudaError_t ensureDetailedEvents()
+    {
+        if (detailedEventsReady) return cudaSuccess;
+        std::size_t created = 0;
+        cudaError_t err = cudaSuccess;
+        while (created < kBigCellDetailedEventCount)
+        {
+            err = cudaEventCreate(&detailedEvents[created]);
+            if (err != cudaSuccess) break;
+            ++created;
+        }
+        if (err != cudaSuccess)
+        {
+            for (std::size_t i = 0; i < created; ++i)
+            {
+                cudaEventDestroy(detailedEvents[i]);
+                detailedEvents[i] = nullptr;
+            }
+            return err;
+        }
+        detailedEventsReady = true;
+        return cudaSuccess;
     }
 
     cudaError_t ensure(
@@ -194,6 +253,7 @@ struct BigCellWorkspace
         if (err == cudaSuccess && pairsTestedCount == nullptr)     err = cudaMallocTracked(pairsTestedCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && buildOverflowCount == nullptr)   err = cudaMallocTracked(buildOverflowCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && sharedSpillCount == nullptr)  err = cudaMallocTracked(sharedSpillCount, 1, newlyAllocatedBytes);
+        if (err == cudaSuccess && fusedProfile == nullptr)      err = cudaMallocTracked(fusedProfile, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityContactCount == nullptr)  err = cudaMallocTracked(proximityContactCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityOverflowCount == nullptr) err = cudaMallocTracked(proximityOverflowCount, 1, newlyAllocatedBytes);
         if (err == cudaSuccess && proximityVfCount == nullptr)       err = cudaMallocTracked(proximityVfCount, 1, newlyAllocatedBytes);
@@ -954,6 +1014,293 @@ __global__ void fusedBigCellNarrowKernel(
     }
 }
 
+__device__ __forceinline__ unsigned long long bigCellWarpReduceSum(unsigned long long value)
+{
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ void bigCellProfileWarpAtomicAdd(
+    unsigned long long* target, unsigned long long value)
+{
+    value = bigCellWarpReduceSum(value);
+    if ((threadIdx.x & (warpSize - 1)) == 0 && value != 0ull)
+    {
+        atomicAdd(target, value);
+    }
+}
+__global__ void profiledFusedBigCellNarrowKernel(
+    const std::uint32_t* __restrict__ starts,
+    const std::uint32_t* __restrict__ entriesPacked,
+    const std::uint32_t* __restrict__ hashSlots,      // hash-build source (else unused)
+    const std::uint32_t slotsPerBigCell,
+    const bool useHashBuild,
+    const std::uint32_t* __restrict__ mixedBigCellIds,
+    const std::uint32_t* mixedBigCellCount,
+    const DeviceAabb* __restrict__ tissueAabbs,
+    const BackendTriangleVertex* __restrict__ tissuePositions,
+    const std::uint32_t* __restrict__ tissueIndices,
+    const BackendTriangleVertex* __restrict__ toolPositions,
+    const std::uint32_t* __restrict__ toolIndices,
+    const DeviceDenseGridConfig config,
+    const DeviceBigCellGridConfig bigc,
+    const std::uint32_t toolTile,             // <= 256, runtime-chunked
+    const std::uint32_t entryCapacity,        // clamps CSR runs when the count pass overflowed the buffer
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* pairsTestedCount,
+    std::uint32_t* contactCount,
+    std::uint32_t* overflowCount,
+    std::uint32_t* vfCount,
+    std::uint32_t* fvCount,
+    std::uint32_t* eeCount,
+    const std::uint32_t maxContacts,
+    const float contactDistance,
+    const bool computeBarycentrics,
+    DeviceBigCellFusedProfile* profile)
+{
+    __shared__ std::uint32_t sToolIds[256];       // sorted by local small cell
+    __shared__ DeviceAabb sToolAabbs[256];
+    __shared__ float3 sToolVerts[256 * 3];
+    __shared__ std::uint32_t sScratchPacked[256]; // unsorted staging
+    __shared__ std::uint32_t sRunStart[65];       // per-local run begin (end = next begin)
+    __shared__ std::uint32_t sBinCursor[64];      // histogram, then scatter cursors
+    __shared__ std::uint32_t sTileCount;          // staged entries this chunk (hash mode skips empties)
+
+    unsigned long long localBigCellIterations = 0ull;
+    unsigned long long localTileIterations = 0ull;
+    unsigned long long localToolEntriesStaged = 0ull;
+    unsigned long long localTissueEntriesVisited = 0ull;
+    unsigned long long localSmallCellPairVisits = 0ull;
+    unsigned long long localInflatedAabbRejects = 0ull;
+    unsigned long long localHomeCellRejects = 0ull;
+    unsigned long long localRawAabbRejects = 0ull;
+    unsigned long long localFbpCalls = 0ull;
+    unsigned long long localFbpNoContact = 0ull;
+    unsigned long long localInflatedAabbCycles = 0ull;
+    unsigned long long localHomeCellCycles = 0ull;
+    unsigned long long localRawAabbCycles = 0ull;
+    unsigned long long localFbpCycles = 0ull;
+    unsigned long long blockTileSetupCycles = 0ull;
+    unsigned long long blockBinPrefixCycles = 0ull;
+    unsigned long long blockToolGatherCycles = 0ull;
+    unsigned long long blockTissueSweepCycles = 0ull;
+
+    const float distThreshSq = contactDistance * contactDistance;
+    const std::uint32_t mixedCount = *mixedBigCellCount;
+    for (std::uint32_t m = blockIdx.x; m < mixedCount; m += gridDim.x)
+    {
+        if (threadIdx.x == 0) ++localBigCellIterations;
+        const std::uint32_t bigCell = mixedBigCellIds[m];
+        const std::uint32_t bx = bigCell % bigc.bigResX;
+        const std::uint32_t rem = bigCell / bigc.bigResX;
+        const std::uint32_t by = rem % bigc.bigResY;
+        const std::uint32_t bz = rem / bigc.bigResY;
+        const int baseX = static_cast<int>(bx << bigc.factorShift);
+        const int baseY = static_cast<int>(by << bigc.factorShift);
+        const int baseZ = static_cast<int>(bz << bigc.factorShift);
+        // Entry sources. CSR: contiguous runs from the scanned histogram — the
+        // count pass histograms every entry, so when the total exceeded the
+        // buffer the scanned starts point past it; clamp every run to the
+        // written region (unlike way 5, whose histogram only counts stored
+        // entries; dropped entries are tallied in entryOverflowCount).
+        // Hash build: each side owns a fixed slot region, swept whole with
+        // empty slots skipped — the sparse layout is part of what the A/B
+        // measures.
+        std::uint32_t tis0, tisSpan, tool0, toolSpan;
+        if (useHashBuild)
+        {
+            const std::uint32_t kTissue = bigCell << 1;
+            tis0 = kTissue * slotsPerBigCell;
+            tool0 = (kTissue | 1u) * slotsPerBigCell;
+            tisSpan = slotsPerBigCell;
+            toolSpan = slotsPerBigCell;
+        }
+        else
+        {
+            const std::uint32_t kTissue = bigCell << 1;
+            tis0 = min(starts[kTissue], entryCapacity);
+            tool0 = min(starts[kTissue + 1u], entryCapacity);
+            const std::uint32_t tool1 = min(starts[kTissue + 2u], entryCapacity);
+            tisSpan = tool0 - tis0;
+            toolSpan = tool1 - tool0;
+        }
+
+        // Chunk loop: oversized big cells stage the tool side toolTile entries
+        // at a time and re-sweep the tissue entries per chunk. Each tool entry
+        // lives in exactly one chunk, so no pair is visited twice.
+        for (std::uint32_t tBase = 0; tBase < toolSpan; tBase += toolTile)
+        {
+            const std::uint32_t tile = min(toolTile, toolSpan - tBase);
+            unsigned long long phaseStart = 0ull;
+            __syncthreads();  // previous tile/cell reads are done before rewriting shared
+            if (threadIdx.x == 0) phaseStart = clock64();
+            if (threadIdx.x < 64u) sBinCursor[threadIdx.x] = 0u;
+            if (threadIdx.x == 0) sTileCount = 0u;
+            __syncthreads();
+            if (threadIdx.x < tile)
+            {
+                const std::uint32_t packed = useHashBuild
+                    ? hashSlots[tool0 + tBase + threadIdx.x]
+                    : entriesPacked[tool0 + tBase + threadIdx.x];
+                if (!useHashBuild || packed != kBigCellEmptySlot)
+                {
+                    const std::uint32_t pos = atomicAdd(&sTileCount, 1u);
+                    sScratchPacked[pos] = packed;
+                    atomicAdd(&sBinCursor[packed & 63u], 1u);
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                blockTileSetupCycles += clock64() - phaseStart;
+                ++localTileIterations;
+                localToolEntriesStaged += sTileCount;
+                phaseStart = clock64();
+            }
+            if (sTileCount == 0u) continue;  // uniform: whole chunk empty (hash mode)
+            if (threadIdx.x == 0)
+            {
+                std::uint32_t running = 0;
+                for (std::uint32_t i = 0; i < 64u; ++i)
+                {
+                    sRunStart[i] = running;
+                    running += sBinCursor[i];
+                    sBinCursor[i] = sRunStart[i];
+                }
+                sRunStart[64] = running;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                blockBinPrefixCycles += clock64() - phaseStart;
+                phaseStart = clock64();
+            }
+            for (std::uint32_t i = threadIdx.x; i < sTileCount; i += blockDim.x)
+            {
+                const std::uint32_t packed = sScratchPacked[i];
+                const std::uint32_t pos = atomicAdd(&sBinCursor[packed & 63u], 1u);
+                const std::uint32_t toolTriId = packed >> 6u;
+                sToolIds[pos] = toolTriId;
+                const DeviceTriangle tt = indexedTriangleAt(toolPositions, toolIndices, toolTriId);
+                sToolAabbs[pos] = triangleAabb(tt, 0.0f);
+                sToolVerts[3u * pos + 0u] = tt.p0;
+                sToolVerts[3u * pos + 1u] = tt.p1;
+                sToolVerts[3u * pos + 2u] = tt.p2;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0)
+            {
+                blockToolGatherCycles += clock64() - phaseStart;
+                phaseStart = clock64();
+            }
+
+            for (std::uint32_t li = threadIdx.x; li < tisSpan; li += blockDim.x)
+            {
+                const std::uint32_t packed = useHashBuild
+                    ? hashSlots[tis0 + li]
+                    : entriesPacked[tis0 + li];
+                if (useHashBuild && packed == kBigCellEmptySlot) continue;
+                ++localTissueEntriesVisited;
+                const std::uint32_t local = packed & 63u;
+                const std::uint32_t r0 = sRunStart[local];
+                const std::uint32_t r1 = sRunStart[local + 1u];
+                if (r0 == r1) continue;
+                const std::uint32_t tissueTriId = packed >> 6u;
+                const DeviceAabb aInflated = tissueAabbs[tissueTriId];
+                const std::uint32_t mask = bigc.factor - 1u;
+                const int cx = baseX + static_cast<int>(local & mask);
+                const int cy = baseY + static_cast<int>((local >> bigc.factorShift) & mask);
+                const int cz = baseZ + static_cast<int>(local >> (2u * bigc.factorShift));
+                const std::uint32_t smallCellId = denseCellId(cx, cy, cz, config);
+                // Tissue vertices load once per (entry, chunk) — not once per pair.
+                const DeviceTriangle ta = indexedTriangleAt(tissuePositions, tissueIndices, tissueTriId);
+                const float3 aV[3] = { ta.p0, ta.p1, ta.p2 };
+                const DeviceAabb aRaw = triangleAabb(ta, 0.0f);
+                    for (std::uint32_t u = r0; u < r1; ++u)
+                    {
+                        ++localSmallCellPairVisits;
+                        const DeviceAabb bRaw = sToolAabbs[u];
+                        unsigned long long filterStart = clock64();
+                        const DeviceAabb bInflated {
+                            bRaw.minX - contactDistance, bRaw.minY - contactDistance, bRaw.minZ - contactDistance,
+                            bRaw.maxX + contactDistance, bRaw.maxY + contactDistance, bRaw.maxZ + contactDistance };
+                        const float mx = fmaxf(aInflated.minX, bInflated.minX);
+                        const float my = fmaxf(aInflated.minY, bInflated.minY);
+                        const float mz = fmaxf(aInflated.minZ, bInflated.minZ);
+                        const bool inflatedRejected =
+                            mx > fminf(aInflated.maxX, bInflated.maxX) ||
+                            my > fminf(aInflated.maxY, bInflated.maxY) ||
+                            mz > fminf(aInflated.maxZ, bInflated.maxZ);
+                        localInflatedAabbCycles += clock64() - filterStart;
+                        if (inflatedRejected)
+                        {
+                            ++localInflatedAabbRejects;
+                            continue;
+                        }
+                        filterStart = clock64();
+                        const bool homeCellRejected =
+                            sortedGridClampedCellOfPoint(mx, my, mz, config) != smallCellId;
+                        localHomeCellCycles += clock64() - filterStart;
+                        if (homeCellRejected)
+                        {
+                            ++localHomeCellRejects;
+                            continue;
+                        }
+                        atomicAdd(pairsTestedCount, 1u);
+                        const float3 bV[3] = {
+                            sToolVerts[3u * u + 0u], sToolVerts[3u * u + 1u], sToolVerts[3u * u + 2u] };
+                        filterStart = clock64();
+                        const bool rawAabbRejected = bigCellRawAabbGapExceeds(aRaw, bRaw, distThreshSq);
+                        localRawAabbCycles += clock64() - filterStart;
+                        if (rawAabbRejected)
+                        {
+                            ++localRawAabbRejects;
+                            continue;
+                        }
+                        ++localFbpCalls;
+                        DeviceProximityContact c;
+                        filterStart = clock64();
+                        const bool contactFound = fbpComputeClosestFeatureContact(
+                            aV, bV, distThreshSq, computeBarycentrics, c, true);
+                        localFbpCycles += clock64() - filterStart;
+                        if (!contactFound)
+                        {
+                            ++localFbpNoContact;
+                            continue;
+                        }
+                        c.firstPrimitiveIndex = tissueTriId;
+                        c.secondPrimitiveIndex = sToolIds[u];
+                        fbpEmitContact(c, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+                    }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) blockTissueSweepCycles += clock64() - phaseStart;
+        }
+    }
+
+    bigCellProfileWarpAtomicAdd(&profile->bigCellIterations, localBigCellIterations);
+        bigCellProfileWarpAtomicAdd(&profile->tileIterations, localTileIterations);
+        bigCellProfileWarpAtomicAdd(&profile->toolEntriesStaged, localToolEntriesStaged);
+        bigCellProfileWarpAtomicAdd(&profile->tissueEntriesVisited, localTissueEntriesVisited);
+        bigCellProfileWarpAtomicAdd(&profile->smallCellPairVisits, localSmallCellPairVisits);
+        bigCellProfileWarpAtomicAdd(&profile->inflatedAabbRejects, localInflatedAabbRejects);
+        bigCellProfileWarpAtomicAdd(&profile->homeCellRejects, localHomeCellRejects);
+        bigCellProfileWarpAtomicAdd(&profile->rawAabbRejects, localRawAabbRejects);
+        bigCellProfileWarpAtomicAdd(&profile->fbpCalls, localFbpCalls);
+        bigCellProfileWarpAtomicAdd(&profile->fbpNoContact, localFbpNoContact);
+        bigCellProfileWarpAtomicAdd(&profile->tileSetupBlockCycles, blockTileSetupCycles);
+        bigCellProfileWarpAtomicAdd(&profile->binPrefixBlockCycles, blockBinPrefixCycles);
+        bigCellProfileWarpAtomicAdd(&profile->toolGatherBlockCycles, blockToolGatherCycles);
+        bigCellProfileWarpAtomicAdd(&profile->tissueSweepBlockCycles, blockTissueSweepCycles);
+        bigCellProfileWarpAtomicAdd(&profile->inflatedAabbThreadCycles, localInflatedAabbCycles);
+        bigCellProfileWarpAtomicAdd(&profile->homeCellThreadCycles, localHomeCellCycles);
+        bigCellProfileWarpAtomicAdd(&profile->rawAabbThreadCycles, localRawAabbCycles);
+    bigCellProfileWarpAtomicAdd(&profile->fbpThreadCycles, localFbpCycles);
+}
+
 } // namespace
 
 
@@ -1097,99 +1444,237 @@ bool computeBigCellFusedProximityContacts(
     const std::uint32_t mixedBlocks = (bigCellCount + threads - 1u) / threads;
     constexpr std::uint32_t kFusedBlocks = 1024;
 
-    const bool detailedProfiling = gridConfig.detailedProfiling;
+    const bool profileInternals = bigConfig.profileFusedInternals;
+    const bool detailedProfiling = gridConfig.detailedProfiling || profileInternals;
     const bool totalTiming = proximityConfig.readContactCounter && !detailedProfiling;
-    const bool measure = detailedProfiling || totalTiming;
-    if (measure)
+    if (detailedProfiling)
+    {
+        err = ws.ensureDetailedEvents();
+        if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
+    }
+    else if (totalTiming)
     {
         err = ws.ensureEvents();
         if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
     }
 
+    if (bigStats != nullptr)
+    {
+        bigStats->bigCellCount = bigCellCount;
+        bigStats->fusedGridBlocks = kFusedBlocks;
+        bigStats->fusedBlockThreads = threads;
+    }
+
+    // Runtime occupancy is a launch-limit calculation for the uninstrumented
+    // winner specialization. It complements, but does not replace, achieved
+    // occupancy from Nsight Compute.
+    if (detailedProfiling && bigStats != nullptr)
+    {
+        cudaFuncAttributes attrs {};
+        int activeBlocks = 0;
+        int device = 0;
+        cudaDeviceProp props {};
+        err = cudaFuncGetAttributes(&attrs, fusedBigCellNarrowKernel);
+        if (err == cudaSuccess) err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &activeBlocks, fusedBigCellNarrowKernel, threads, 0);
+        if (err == cudaSuccess) err = cudaGetDevice(&device);
+        if (err == cudaSuccess) err = cudaGetDeviceProperties(&props, device);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Big-cell occupancy query failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+        bigStats->fusedRegistersPerThread = static_cast<std::uint32_t>(attrs.numRegs);
+        bigStats->fusedStaticSharedBytes = static_cast<std::uint32_t>(attrs.sharedSizeBytes);
+        bigStats->fusedLocalBytesPerThread = static_cast<std::uint32_t>(attrs.localSizeBytes);
+        bigStats->fusedMaxThreadsPerBlock = static_cast<std::uint32_t>(attrs.maxThreadsPerBlock);
+        bigStats->fusedActiveBlocksPerSm = static_cast<std::uint32_t>(activeBlocks);
+        bigStats->deviceMultiprocessorCount = static_cast<std::uint32_t>(props.multiProcessorCount);
+        bigStats->deviceMaxThreadsPerSm = static_cast<std::uint32_t>(props.maxThreadsPerMultiProcessor);
+        bigStats->deviceWarpSize = static_cast<std::uint32_t>(props.warpSize);
+        bigStats->deviceClockRateKHz = static_cast<std::uint32_t>(props.clockRate);
+        bigStats->fusedTheoreticalOccupancyPercent = props.maxThreadsPerMultiProcessor > 0
+            ? 100.0 * static_cast<double>(activeBlocks * static_cast<int>(threads)) /
+                static_cast<double>(props.maxThreadsPerMultiProcessor)
+            : 0.0;
+        if (profileInternals)
+        {
+            cudaFuncAttributes profiledAttrs {};
+            int profiledActiveBlocks = 0;
+            err = cudaFuncGetAttributes(&profiledAttrs, profiledFusedBigCellNarrowKernel);
+            if (err == cudaSuccess) err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &profiledActiveBlocks, profiledFusedBigCellNarrowKernel, threads, 0);
+            if (err != cudaSuccess)
+            {
+                diagnostic = std::string("Big-cell instrumented occupancy query failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            bigStats->profiledRegistersPerThread = static_cast<std::uint32_t>(profiledAttrs.numRegs);
+            bigStats->profiledStaticSharedBytes = static_cast<std::uint32_t>(profiledAttrs.sharedSizeBytes);
+            bigStats->profiledLocalBytesPerThread = static_cast<std::uint32_t>(profiledAttrs.localSizeBytes);
+            bigStats->profiledActiveBlocksPerSm = static_cast<std::uint32_t>(profiledActiveBlocks);
+            bigStats->profiledTheoreticalOccupancyPercent = props.maxThreadsPerMultiProcessor > 0
+                ? 100.0 * static_cast<double>(profiledActiveBlocks * static_cast<int>(threads)) /
+                    static_cast<double>(props.maxThreadsPerMultiProcessor)
+                : 0.0;
+        }
+    }
+
     auto* deviceContacts = reinterpret_cast<DeviceProximityContact*>(ws.proximityContacts);
+    cudaError_t detailedEventError = cudaSuccess;
+    cudaError_t profileResetError = cudaSuccess;
+    auto recordDetailedEvent = [&](const std::size_t index, cudaStream_t s)
+    {
+        if (detailedProfiling && detailedEventError == cudaSuccess)
+        {
+            detailedEventError = cudaEventRecord(ws.detailedEvents[index], s);
+        }
+    };
 
     auto launchAll = [&](cudaStream_t s)
     {
         resetSortedGridKernel<<<resetBlocks, threads, 0, s>>>(
             ws.hist, binCount, ws.entryTotalCount, ws.entryOverflowCount, ws.mixedBigCellCount,
             ws.pairsTestedCount, ws.sharedSpillCount, ws.buildOverflowCount, nullptr);
+        recordDetailedEvent(1, s);
         if (useHashBuild)
         {
             const std::uint32_t totalSlots = binCount * slotsPerBigCell;
             const std::uint32_t clearBlocks = std::max(1u, std::min(1024u, (totalSlots + threads - 1u) / threads));
             clearBigCellHashSlotsKernel<<<clearBlocks, threads, 0, s>>>(ws.hashSlots, totalSlots);
+            recordDetailedEvent(2, s);
             insertBigCellHashEntriesKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 slotsPerBigCell, ws.hashSlots, ws.hist, ws.firstAabbs, ws.entryTotalCount, ws.buildOverflowCount);
+            recordDetailedEvent(3, s);
             insertBigCellHashEntriesKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 slotsPerBigCell, ws.hashSlots, ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.buildOverflowCount);
+            recordDetailedEvent(4, s);
+            recordDetailedEvent(5, s);
+            recordDetailedEvent(6, s);
+            recordDetailedEvent(7, s);
         }
         else if (sharedBuildMode == 1u)
         {
+            recordDetailedEvent(2, s);
             countBigCellEntriesSharedHashKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 ws.hist, ws.firstAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            recordDetailedEvent(3, s);
             countBigCellEntriesSharedHashKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            recordDetailedEvent(4, s);
             exclusiveScanSortedGridBinsKernel<<<1, 1024, 0, s>>>(ws.hist, ws.starts, ws.cursors, binCount);
+            recordDetailedEvent(5, s);
             fillBigCellEntriesSharedHashKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            recordDetailedEvent(6, s);
             fillBigCellEntriesSharedHashKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            recordDetailedEvent(7, s);
         }
         else if (sharedBuildMode == 2u)
         {
+            recordDetailedEvent(2, s);
             countBigCellEntriesSharedSortKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 ws.hist, ws.firstAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            recordDetailedEvent(3, s);
             countBigCellEntriesSharedSortKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 ws.hist, ws.secondAabbs, ws.entryTotalCount, ws.sharedSpillCount);
+            recordDetailedEvent(4, s);
             exclusiveScanSortedGridBinsKernel<<<1, 1024, 0, s>>>(ws.hist, ws.starts, ws.cursors, binCount);
+            recordDetailedEvent(5, s);
             fillBigCellEntriesSharedSortKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            recordDetailedEvent(6, s);
             fillBigCellEntriesSharedSortKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount, ws.sharedSpillCount);
+            recordDetailedEvent(7, s);
         }
         else
         {
+            recordDetailedEvent(2, s);
             countBigCellEntriesKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 ws.hist, ws.firstAabbs, ws.entryTotalCount);
+            recordDetailedEvent(3, s);
             countBigCellEntriesKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 ws.hist, ws.secondAabbs, ws.entryTotalCount);
+            recordDetailedEvent(4, s);
             exclusiveScanSortedGridBinsKernel<<<1, 1024, 0, s>>>(ws.hist, ws.starts, ws.cursors, binCount);
+            recordDetailedEvent(5, s);
             fillBigCellEntriesKernel<<<firstBlocks, threads, 0, s>>>(
                 deviceFirstPositions, ws.firstIndices, firstSurface.triangleCount, false, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount);
+            recordDetailedEvent(6, s);
             fillBigCellEntriesKernel<<<secondBlocks, threads, 0, s>>>(
                 deviceSecondPositions, ws.secondIndices, secondSurface.triangleCount, true, dc, bigc,
                 entryCapacity, ws.cursors, ws.entriesPacked, ws.entryOverflowCount);
+            recordDetailedEvent(7, s);
         }
         buildSortedGridMixedCellsKernel<<<mixedBlocks, threads, 0, s>>>(
             ws.hist, bigCellCount, ws.mixedBigCellIds, ws.mixedBigCellCount);
+        recordDetailedEvent(8, s);
+        if (profileInternals)
+        {
+            profileResetError = cudaMemsetAsync(ws.fusedProfile, 0, sizeof(DeviceBigCellFusedProfile), s);
+        }
         resetProximityCountersKernel<<<1, 1, 0, s>>>(
             ws.proximityContactCount, ws.proximityOverflowCount,
             ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount);
-        fusedBigCellNarrowKernel<<<kFusedBlocks, threads, 0, s>>>(
-            ws.starts, ws.entriesPacked, ws.hashSlots, slotsPerBigCell, useHashBuild,
-            ws.mixedBigCellIds, ws.mixedBigCellCount,
-            ws.firstAabbs,
-            deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices,
-            dc, bigc, toolTile, entryCapacity, deviceContacts,
-            ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,
-            ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
-            proximityConfig.maxContacts, proximityConfig.contactDistance, proximityConfig.computeBarycentrics);
+        recordDetailedEvent(9, s);
+        if (profileInternals)
+        {
+            profiledFusedBigCellNarrowKernel<<<kFusedBlocks, threads, 0, s>>>(
+                ws.starts, ws.entriesPacked, ws.hashSlots, slotsPerBigCell, useHashBuild,
+                ws.mixedBigCellIds, ws.mixedBigCellCount,
+                ws.firstAabbs,
+                deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices,
+                dc, bigc, toolTile, entryCapacity, deviceContacts,
+                ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,
+                ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
+                proximityConfig.maxContacts, proximityConfig.contactDistance,
+                proximityConfig.computeBarycentrics, ws.fusedProfile);
+        }
+        else
+        {
+            fusedBigCellNarrowKernel<<<kFusedBlocks, threads, 0, s>>>(
+                ws.starts, ws.entriesPacked, ws.hashSlots, slotsPerBigCell, useHashBuild,
+                ws.mixedBigCellIds, ws.mixedBigCellCount,
+                ws.firstAabbs,
+                deviceFirstPositions, ws.firstIndices, deviceSecondPositions, ws.secondIndices,
+                dc, bigc, toolTile, entryCapacity, deviceContacts,
+                ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,
+                ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
+                proximityConfig.maxContacts, proximityConfig.contactDistance,
+                proximityConfig.computeBarycentrics);
+        }
+        recordDetailedEvent(10, s);
     };
 
-    if (measure) { err = cudaEventRecord(ws.startEvent); if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; } }
+    if (detailedProfiling)
+    {
+        recordDetailedEvent(0, 0);
+        if (detailedEventError != cudaSuccess)
+        {
+            diagnostic = cudaGetErrorString(detailedEventError);
+            return false;
+        }
+    }
+    else if (totalTiming)
+    {
+        err = cudaEventRecord(ws.startEvent);
+        if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
+    }
 
     static const int kGraphMode = []{ const char* e = std::getenv("SOFA_BIGCELL_CUDA_GRAPH"); return e ? std::atoi(e) : 1; }();
     const bool kGraphsEnabled = (kGraphMode != 0);
@@ -1224,21 +1709,113 @@ bool computeBigCellFusedProximityContacts(
     // CSR: reset + count x2 + scan + fill x2 + mixed + counters + fused = 9
     // hash: reset + clear + insert x2 + mixed + counters + fused = 7
     std::uint32_t launchCount = useHashBuild ? 7u : 9u;
+    if (profileResetError != cudaSuccess)
+    {
+        diagnostic = std::string("big-cell profile reset: ") + cudaGetErrorString(profileResetError);
+        return false;
+    }
+    if (detailedEventError != cudaSuccess)
+    {
+        diagnostic = std::string("big-cell detailed event: ") + cudaGetErrorString(detailedEventError);
+        return false;
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess) { diagnostic = std::string("big-cell launch: ") + cudaGetErrorString(err); return false; }
 
     float kernelMs = 0.0f;
-    if (measure)
+    float resetMs = 0.0f, buildClearMs = 0.0f, eventMarkerGapMs = 0.0f;
+    float firstCountMs = 0.0f, secondCountMs = 0.0f, scanMs = 0.0f;
+    float firstFillMs = 0.0f, secondFillMs = 0.0f, mixedMs = 0.0f;
+    float proximityResetMs = 0.0f, fusedMs = 0.0f;
+    if (detailedProfiling)
+    {
+        err = cudaEventSynchronize(ws.detailedEvents[10]);
+        auto elapsed = [&](float& value, const std::size_t from, const std::size_t to)
+        {
+            if (err == cudaSuccess)
+            {
+                err = cudaEventElapsedTime(&value, ws.detailedEvents[from], ws.detailedEvents[to]);
+            }
+        };
+        elapsed(kernelMs, 0, 10);
+        elapsed(resetMs, 0, 1);
+        elapsed(buildClearMs, 1, 2);
+        elapsed(firstCountMs, 2, 3);
+        elapsed(secondCountMs, 3, 4);
+        elapsed(scanMs, 4, 5);
+        elapsed(firstFillMs, 5, 6);
+        elapsed(secondFillMs, 6, 7);
+        elapsed(mixedMs, 7, 8);
+        elapsed(proximityResetMs, 8, 9);
+        elapsed(fusedMs, 9, 10);
+        if (!useHashBuild)
+        {
+            eventMarkerGapMs = buildClearMs;
+            buildClearMs = 0.0f;
+        }
+        if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
+    }
+    else if (totalTiming)
     {
         err = cudaEventRecord(ws.endEvent);
         if (err == cudaSuccess) err = cudaEventSynchronize(ws.endEvent);
         if (err == cudaSuccess) err = cudaEventElapsedTime(&kernelMs, ws.startEvent, ws.endEvent);
         if (err != cudaSuccess) { diagnostic = cudaGetErrorString(err); return false; }
     }
+    if (bigStats != nullptr && detailedProfiling)
+    {
+        bigStats->resetMilliseconds = resetMs;
+        bigStats->buildClearMilliseconds = buildClearMs;
+        bigStats->eventMarkerGapMilliseconds = eventMarkerGapMs;
+        bigStats->firstCountOrInsertMilliseconds = firstCountMs;
+        bigStats->secondCountOrInsertMilliseconds = secondCountMs;
+        bigStats->scanMilliseconds = scanMs;
+        bigStats->firstFillMilliseconds = firstFillMs;
+        bigStats->secondFillMilliseconds = secondFillMs;
+        bigStats->mixedCellBuildMilliseconds = mixedMs;
+        bigStats->proximityResetMilliseconds = proximityResetMs;
+        bigStats->fusedKernelMilliseconds = fusedMs;
+        bigStats->totalPipelineMilliseconds = kernelMs;
+    }
     if (executionStats != nullptr)
     {
         executionStats->kernelLaunchCount += launchCount;
+        executionStats->cudaMemsetCount += profileInternals ? 1u : 0u;
         executionStats->gpuKernelMilliseconds += static_cast<double>(kernelMs);
+        executionStats->featureBasedProximityKernelMilliseconds += static_cast<double>(fusedMs);
+    }
+
+    if (profileInternals)
+    {
+        DeviceBigCellFusedProfile hostProfile {};
+        err = cudaMemcpy(&hostProfile, ws.fusedProfile, sizeof(hostProfile), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("big-cell internal profile readback: ") + cudaGetErrorString(err);
+            return false;
+        }
+        if (executionStats != nullptr) executionStats->deviceToHostBytes += sizeof(hostProfile);
+        if (bigStats != nullptr)
+        {
+            bigStats->profiledBigCellIterations = hostProfile.bigCellIterations;
+            bigStats->profiledTileIterations = hostProfile.tileIterations;
+            bigStats->profiledToolEntriesStaged = hostProfile.toolEntriesStaged;
+            bigStats->profiledTissueEntriesVisited = hostProfile.tissueEntriesVisited;
+            bigStats->profiledSmallCellPairVisits = hostProfile.smallCellPairVisits;
+            bigStats->profiledInflatedAabbRejects = hostProfile.inflatedAabbRejects;
+            bigStats->profiledHomeCellRejects = hostProfile.homeCellRejects;
+            bigStats->profiledRawAabbRejects = hostProfile.rawAabbRejects;
+            bigStats->profiledFbpCalls = hostProfile.fbpCalls;
+            bigStats->profiledFbpNoContact = hostProfile.fbpNoContact;
+            bigStats->profiledTileSetupBlockCycles = hostProfile.tileSetupBlockCycles;
+            bigStats->profiledBinPrefixBlockCycles = hostProfile.binPrefixBlockCycles;
+            bigStats->profiledToolGatherBlockCycles = hostProfile.toolGatherBlockCycles;
+            bigStats->profiledTissueSweepBlockCycles = hostProfile.tissueSweepBlockCycles;
+            bigStats->profiledInflatedAabbThreadCycles = hostProfile.inflatedAabbThreadCycles;
+            bigStats->profiledHomeCellThreadCycles = hostProfile.homeCellThreadCycles;
+            bigStats->profiledRawAabbThreadCycles = hostProfile.rawAabbThreadCycles;
+            bigStats->profiledFbpThreadCycles = hostProfile.fbpThreadCycles;
+        }
     }
 
     std::uint32_t hostPairsTested = 0, hostEntries = 0, hostEntryOverflow = 0, hostMixed = 0;

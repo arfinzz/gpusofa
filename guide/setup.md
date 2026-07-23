@@ -228,6 +228,7 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 | `run_full_benchmark_suite_wsl.sh` | **All canonical scenes** (small, large, v-t self, v-t cross, 5-way legs on the 14k scene, 3 xlarge-200k legs) in fast + validation modes | 160 steps/leg, one summary per leg; `SOFA_SUITE_ONLY='<regex>'` runs a filtered batch (useful under a wall-clock cap) |
 | `run_bigcell_parity_wsl.sh` | **Way-6 parity gate** — backend bench across the big-cell toggle matrix (factors 4/2/1, forced chunk loop, hash-build legs) | contacts must equal the FBP leg; `bigcell_pairs_tested` must equal `sortedgrid_unique_pairs` |
 | `run_ncu_bigcell_wsl.sh` | **Nsight Compute on the way-6 kernels** (80k + 200k, factors 2 + 4) | per-kernel SOL/DRAM/occupancy/registers CSVs |
+| `run_bigcell_detailed_profile_wsl.sh` | **Reproducible winner deep profile** at the 28k / 80k / 213k backend scales | production graph timing, graph-off CUDA-event stage timing, opt-in `clock64()` fused-internal counters/cycles, occupancy/resources, CSVs |
 | `run_mode_comparison_ab_wsl.sh` | **12-leg same-session comparison of EVERY execution mode** on `hash_prefixsum_large.py` (dense ×2, hash, simple, sorted ×4, bigcell ×4 builds) | counter-on, prints the kernel-time summary table |
 | `run_fbp_smoke_test_wsl.sh` | **`one_tissue_one_blade.py` with FBP** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
 | `run_fbp_large_tissue_wsl.sh` | **`large_tissue_blade.py` FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
@@ -316,6 +317,7 @@ These all default sensibly. Set them only to override.
 | `SOFA_BIGCELL_HASH_SLOTS` | **1024** | Hash-build slots per (big cell, side) region (pow2, clamped 64–4096). 2048 = zero-overflow on the 80k bench geometry |
 | `SOFA_BIGCELL_CUDA_GRAPH` | **1** | **DEFAULT ON.** Replay the way-6 sequence (9 kernels CSR / 7 hash-build) as a captured CUDA Graph each steady-state frame |
 | `SOFA_BIGCELL_SHARED_BUILD` | **1** | CSR-build shared-memory privatization A/B (2026-07-15): 0 = direct global atomics; **1 = per-block shared HASH TABLE then merge (DEFAULT — measured −12% at 80k / −26% at 200k full pipeline, and the block-grouped entry order speeds the fused consumer too)**; 2 = per-block shared SORTED LIST via in-shared bitonic sort (measured ~2.6× slower — the sort costs more than every atomic it avoids). Contacts identical in all modes; staging overflow falls back to the direct path (`sharedSpillCount`). See `reports/archive_pre_20260715/bigcell_shared_build_ab_20260715.md` |
+| `SOFA_BIGCELL_PROFILE_INTERNALS` | **0** | Diagnostic-only fused-kernel instrumentation for SOFA scenes: launches a separate diagnostic kernel with `clock64()` phase/filter sampling and rejection counters; implies detailed profiling and disables graph replay. It perturbs registers, occupancy, and time—never use its elapsed time as production performance. Standalone bench equivalent: `SOFA_BACKEND_BENCH_BIGCELL_PROFILE_INTERNALS=1`. |
 
 ### 6.4  Feature-based proximity (Phase 11+12)
 

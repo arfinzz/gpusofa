@@ -488,6 +488,13 @@ struct BigCellConfig
     // order speeds the fused consumer too); the shared SORTED LIST lost ~2.6x
     // (the in-shared bitonic sort costs more than every atomic it avoids).
     std::uint32_t sharedBuildMode { 1 };
+    // Diagnostic-only instrumentation for the fused consumer. This launches a
+    // separately compiled diagnostic kernel that samples clock64() around
+    // major block phases and pair filters and counts every rejection stage.
+    // It intentionally perturbs execution, disables CUDA-graph replay, and is
+    // therefore OFF by default. CUDA-event pipeline timings remain available
+    // through DenseGridConfig::detailedProfiling without enabling this flag.
+    bool profileFusedInternals { false };
 };
 
 struct BigCellStats
@@ -499,6 +506,63 @@ struct BigCellStats
     std::uint32_t entryOverflowCount { 0 };    // dropped entries (capacity)
     std::uint32_t buildOverflowCount { 0 };    // hash-build slot-region overflow (0 on CSR)
     std::uint32_t sharedSpillCount { 0 };      // shared-build entries that fell back to the direct global path
+
+    // CUDA-event elapsed times. Populated when detailedProfiling is enabled
+    // (profileFusedInternals implies it). Values are serialized stream time,
+    // not CPU wall time, and include event-record overhead between stages.
+    double resetMilliseconds { 0.0 };
+    double buildClearMilliseconds { 0.0 };     // hash build only
+    double eventMarkerGapMilliseconds { 0.0 }; // CSR no-op marker: estimates one event boundary cost
+    double firstCountOrInsertMilliseconds { 0.0 };
+    double secondCountOrInsertMilliseconds { 0.0 };
+    double scanMilliseconds { 0.0 };           // CSR only; ~0 for hash build
+    double firstFillMilliseconds { 0.0 };      // CSR only; ~0 for hash build
+    double secondFillMilliseconds { 0.0 };     // CSR only; ~0 for hash build
+    double mixedCellBuildMilliseconds { 0.0 };
+    double proximityResetMilliseconds { 0.0 };
+    double fusedKernelMilliseconds { 0.0 };
+    double totalPipelineMilliseconds { 0.0 };
+
+    // Runtime resource/occupancy data for the production fused specialization.
+    std::uint32_t fusedGridBlocks { 0 };
+    std::uint32_t fusedBlockThreads { 0 };
+    std::uint32_t fusedRegistersPerThread { 0 };
+    std::uint32_t fusedStaticSharedBytes { 0 };
+    std::uint32_t fusedLocalBytesPerThread { 0 };
+    std::uint32_t fusedMaxThreadsPerBlock { 0 };
+    std::uint32_t fusedActiveBlocksPerSm { 0 };
+    std::uint32_t deviceMultiprocessorCount { 0 };
+    std::uint32_t deviceMaxThreadsPerSm { 0 };
+    std::uint32_t deviceWarpSize { 0 };
+    std::uint32_t deviceClockRateKHz { 0 };
+    double fusedTheoreticalOccupancyPercent { 0.0 };
+    std::uint32_t profiledRegistersPerThread { 0 };
+    std::uint32_t profiledStaticSharedBytes { 0 };
+    std::uint32_t profiledLocalBytesPerThread { 0 };
+    std::uint32_t profiledActiveBlocksPerSm { 0 };
+    double profiledTheoreticalOccupancyPercent { 0.0 };
+
+    // Diagnostic specialization counters. Cycle fields are sums over blocks
+    // (major phases) or participating threads (pair filters); they are work
+    // attribution, not elapsed time, because many blocks/threads overlap.
+    std::uint64_t profiledBigCellIterations { 0 };
+    std::uint64_t profiledTileIterations { 0 };
+    std::uint64_t profiledToolEntriesStaged { 0 };
+    std::uint64_t profiledTissueEntriesVisited { 0 };
+    std::uint64_t profiledSmallCellPairVisits { 0 };
+    std::uint64_t profiledInflatedAabbRejects { 0 };
+    std::uint64_t profiledHomeCellRejects { 0 };
+    std::uint64_t profiledRawAabbRejects { 0 };
+    std::uint64_t profiledFbpCalls { 0 };
+    std::uint64_t profiledFbpNoContact { 0 };
+    std::uint64_t profiledTileSetupBlockCycles { 0 };
+    std::uint64_t profiledBinPrefixBlockCycles { 0 };
+    std::uint64_t profiledToolGatherBlockCycles { 0 };
+    std::uint64_t profiledTissueSweepBlockCycles { 0 };
+    std::uint64_t profiledInflatedAabbThreadCycles { 0 };
+    std::uint64_t profiledHomeCellThreadCycles { 0 };
+    std::uint64_t profiledRawAabbThreadCycles { 0 };
+    std::uint64_t profiledFbpThreadCycles { 0 };
 };
 
 SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(

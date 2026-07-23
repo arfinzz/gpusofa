@@ -332,6 +332,7 @@ GpuCollisionNarrowPhase::GpuCollisionNarrowPhase()
     , d_bigCellUseHashBuild(initData(&d_bigCellUseHashBuild, false, "bigCellUseHashBuild", "Big-cell table build strategy A/B: false (default) = CSR bucket lists (count -> scan -> fill); true = literal per-big-cell open-addressing hash multi-map build."))
     , d_bigCellHashSlots(initData(&d_bigCellHashSlots, static_cast<unsigned int>(1024), "bigCellHashSlots", "Hash-build only: open-addressing slots per (big cell, side) region. Rounded to a power of two, clamped to [64, 4096]."))
     , d_bigCellSharedBuild(initData(&d_bigCellSharedBuild, static_cast<unsigned int>(1), "bigCellSharedBuild", "CSR-build shared-memory privatization A/B: 0 = off (direct global atomics), 1 = per-block shared HASH TABLE then merge (DEFAULT since 2026-07-15: -12%/-26% full pipeline at 80k/200k), 2 = per-block shared SORTED LIST (bitonic) then merge (measured ~2.6x slower). Contacts identical in all modes; overflow falls back to the direct path (sharedSpillCount)."))
+    , d_bigCellProfileInternals(initData(&d_bigCellProfileInternals, false, "bigCellProfileInternals", "Diagnostic-only clock64 phase and rejection-counter instrumentation inside the fused big-cell kernel. Perturbs performance and disables CUDA-graph replay; keep false outside profiling runs."))
     , d_hashTableSize(initData(&d_hashTableSize, static_cast<unsigned int>(0), "hashTableSize", "Hash table slot count for useHashPrefixSumGeneration / useSimpleHashGeneration. 0 = auto-derive (~4 slots per input triangle). Rounded up to a power of two."))
     , d_useFeatureBasedProximity(initData(&d_useFeatureBasedProximity, false, "useFeatureBasedProximity", "Replace SAT-style exact triangle intersection with feature-based proximity (VF + EE) using Ericson closest-point math. Outputs barycentric weights for a CUDA constraint solver."))
     , d_useVertexTriangleProximity(initData(&d_useVertexTriangleProximity, false, "useVertexTriangleProximity", "When set together with useFeatureBasedProximity, route self-collision pairs (pair.first == pair.second on a CudaTriangleCollisionModel) through the vertex-triangle proximity kernel. Useful for surgical self-collision such as cutting/tearing."))
@@ -1187,6 +1188,7 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
                     bigConfig.useHashTableBuild = d_bigCellUseHashBuild.getValue();
                     bigConfig.hashSlotsPerBigCell = d_bigCellHashSlots.getValue();
                     bigConfig.sharedBuildMode = d_bigCellSharedBuild.getValue();
+                    bigConfig.profileFusedInternals = d_bigCellProfileInternals.getValue();
                     backend::BigCellStats bigStats;
                     exactSucceeded = backend::computeBigCellFusedProximityContacts(
                         firstIndexedSurface,

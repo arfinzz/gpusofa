@@ -878,6 +878,7 @@ int main()
         bigConfig.useHashTableBuild = envBool("SOFA_BACKEND_BENCH_BIGCELL_HASH_BUILD", false);
         bigConfig.hashSlotsPerBigCell = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_HASH_SLOTS", 1024));
         bigConfig.sharedBuildMode = static_cast<std::uint32_t>(envInt("SOFA_BACKEND_BENCH_BIGCELL_SHARED_BUILD", 1));
+        bigConfig.profileFusedInternals = envBool("SOFA_BACKEND_BENCH_BIGCELL_PROFILE_INTERNALS", false);
 
         const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
 
@@ -886,13 +887,28 @@ int main()
         bigCsv << std::fixed << std::setprecision(9);
         bigCsv << "step,wall_ms,gpu_kernel_ms,h2d_bytes,d2h_bytes,kernel_launch_count,cuda_memset_count,"
                   "big_cells,entries,mixed_big_cells,pairs_tested,emitted_contacts,vf,fv,ee,"
-                  "entry_overflow,build_overflow\n";
+                  "entry_overflow,build_overflow,shared_spill,total_overflow,"
+                  "event_reset_ms,event_build_clear_ms,event_marker_gap_ms,event_first_count_or_insert_ms,"
+                  "event_second_count_or_insert_ms,event_scan_ms,event_first_fill_ms,event_second_fill_ms,"
+                  "event_mixed_ms,event_proximity_reset_ms,event_fused_ms,event_total_ms,"
+                  "prod_grid_blocks,prod_block_threads,prod_registers_per_thread,prod_static_shared_bytes,"
+                  "prod_local_bytes_per_thread,prod_max_threads_per_block,prod_active_blocks_per_sm,"
+                  "device_sms,device_max_threads_per_sm,device_warp_size,device_clock_rate_khz,prod_theoretical_occupancy_pct,"
+                  "profile_registers_per_thread,profile_static_shared_bytes,profile_local_bytes_per_thread,"
+                  "profile_active_blocks_per_sm,profile_theoretical_occupancy_pct,"
+                  "profile_big_cells,profile_tiles,profile_tool_entries_staged,profile_tissue_entries_visited,"
+                  "profile_small_cell_pair_visits,profile_inflated_aabb_rejects,profile_home_cell_rejects,"
+                  "profile_raw_aabb_rejects,profile_fbp_calls,profile_fbp_no_contact,"
+                  "profile_tile_setup_block_cycles,profile_bin_prefix_block_cycles,profile_tool_gather_block_cycles,"
+                  "profile_tissue_sweep_block_cycles,profile_inflated_aabb_thread_cycles,"
+                  "profile_home_cell_thread_cycles,profile_raw_aabb_thread_cycles,profile_fbp_thread_cycles\n";
 
         double bigWallTotal = 0.0, bigKernelTotal = 0.0;
         int bigMeasured = 0;
         std::uint64_t bigLastContacts = 0, bigLastPairs = 0, bigLastMixed = 0, bigLastEntries = 0;
         std::uint64_t bigLastVf = 0, bigLastFv = 0, bigLastEe = 0, bigLastEntryOf = 0, bigLastBuildOf = 0;
         std::uint64_t bigLastSharedSpill = 0, bigLastTotalOverflow = 0;
+        SofaGpuCollision::backend::BigCellStats bigLastStats {}, bigTimingTotals {};
 
         for (int step = 0; step < steps + warmup; ++step)
         {
@@ -926,6 +942,19 @@ int main()
                 bigLastBuildOf = bigStatsOut.buildOverflowCount;
                 bigLastSharedSpill = bigStatsOut.sharedSpillCount;
                 bigLastTotalOverflow = stats.overflowCount;
+                bigLastStats = bigStatsOut;
+                bigTimingTotals.resetMilliseconds += bigStatsOut.resetMilliseconds;
+                bigTimingTotals.buildClearMilliseconds += bigStatsOut.buildClearMilliseconds;
+                bigTimingTotals.eventMarkerGapMilliseconds += bigStatsOut.eventMarkerGapMilliseconds;
+                bigTimingTotals.firstCountOrInsertMilliseconds += bigStatsOut.firstCountOrInsertMilliseconds;
+                bigTimingTotals.secondCountOrInsertMilliseconds += bigStatsOut.secondCountOrInsertMilliseconds;
+                bigTimingTotals.scanMilliseconds += bigStatsOut.scanMilliseconds;
+                bigTimingTotals.firstFillMilliseconds += bigStatsOut.firstFillMilliseconds;
+                bigTimingTotals.secondFillMilliseconds += bigStatsOut.secondFillMilliseconds;
+                bigTimingTotals.mixedCellBuildMilliseconds += bigStatsOut.mixedCellBuildMilliseconds;
+                bigTimingTotals.proximityResetMilliseconds += bigStatsOut.proximityResetMilliseconds;
+                bigTimingTotals.fusedKernelMilliseconds += bigStatsOut.fusedKernelMilliseconds;
+                bigTimingTotals.totalPipelineMilliseconds += bigStatsOut.totalPipelineMilliseconds;
             }
 
             bigCsv << step << ',' << wallMs << ',' << stats.gpuKernelMilliseconds << ','
@@ -936,7 +965,33 @@ int main()
                    << proximityStats.emittedContactCount << ','
                    << proximityStats.vfContactCount << ',' << proximityStats.fvContactCount << ','
                    << proximityStats.eeContactCount << ','
-                   << bigStatsOut.entryOverflowCount << ',' << bigStatsOut.buildOverflowCount << '\n';
+                   << bigStatsOut.entryOverflowCount << ',' << bigStatsOut.buildOverflowCount << ','
+                   << bigStatsOut.sharedSpillCount << ',' << stats.overflowCount << ','
+                   << bigStatsOut.resetMilliseconds << ',' << bigStatsOut.buildClearMilliseconds << ','
+                   << bigStatsOut.eventMarkerGapMilliseconds << ','
+                   << bigStatsOut.firstCountOrInsertMilliseconds << ',' << bigStatsOut.secondCountOrInsertMilliseconds << ','
+                   << bigStatsOut.scanMilliseconds << ',' << bigStatsOut.firstFillMilliseconds << ','
+                   << bigStatsOut.secondFillMilliseconds << ',' << bigStatsOut.mixedCellBuildMilliseconds << ','
+                   << bigStatsOut.proximityResetMilliseconds << ',' << bigStatsOut.fusedKernelMilliseconds << ','
+                   << bigStatsOut.totalPipelineMilliseconds << ','
+                   << bigStatsOut.fusedGridBlocks << ',' << bigStatsOut.fusedBlockThreads << ','
+                   << bigStatsOut.fusedRegistersPerThread << ',' << bigStatsOut.fusedStaticSharedBytes << ','
+                   << bigStatsOut.fusedLocalBytesPerThread << ',' << bigStatsOut.fusedMaxThreadsPerBlock << ','
+                   << bigStatsOut.fusedActiveBlocksPerSm << ',' << bigStatsOut.deviceMultiprocessorCount << ','
+                   << bigStatsOut.deviceMaxThreadsPerSm << ',' << bigStatsOut.deviceWarpSize << ','
+                   << bigStatsOut.deviceClockRateKHz << ',' << bigStatsOut.fusedTheoreticalOccupancyPercent << ','
+                   << bigStatsOut.profiledRegistersPerThread << ',' << bigStatsOut.profiledStaticSharedBytes << ','
+                   << bigStatsOut.profiledLocalBytesPerThread << ',' << bigStatsOut.profiledActiveBlocksPerSm << ','
+                   << bigStatsOut.profiledTheoreticalOccupancyPercent << ','
+                   << bigStatsOut.profiledBigCellIterations << ',' << bigStatsOut.profiledTileIterations << ','
+                   << bigStatsOut.profiledToolEntriesStaged << ',' << bigStatsOut.profiledTissueEntriesVisited << ','
+                   << bigStatsOut.profiledSmallCellPairVisits << ',' << bigStatsOut.profiledInflatedAabbRejects << ','
+                   << bigStatsOut.profiledHomeCellRejects << ',' << bigStatsOut.profiledRawAabbRejects << ','
+                   << bigStatsOut.profiledFbpCalls << ',' << bigStatsOut.profiledFbpNoContact << ','
+                   << bigStatsOut.profiledTileSetupBlockCycles << ',' << bigStatsOut.profiledBinPrefixBlockCycles << ','
+                   << bigStatsOut.profiledToolGatherBlockCycles << ',' << bigStatsOut.profiledTissueSweepBlockCycles << ','
+                   << bigStatsOut.profiledInflatedAabbThreadCycles << ',' << bigStatsOut.profiledHomeCellThreadCycles << ','
+                   << bigStatsOut.profiledRawAabbThreadCycles << ',' << bigStatsOut.profiledFbpThreadCycles << '\n';
         }
 
         std::cout << "bigcell_build=" << (bigConfig.useHashTableBuild ? "hash_table" : "csr") << '\n'
@@ -947,6 +1002,52 @@ int main()
                   << "bigcell_measured_steps=" << bigMeasured << '\n'
                   << "bigcell_wall_avg_ms=" << (bigMeasured > 0 ? bigWallTotal / bigMeasured : 0.0) << '\n'
                   << "bigcell_gpu_kernel_avg_ms=" << (bigMeasured > 0 ? bigKernelTotal / bigMeasured : 0.0) << '\n'
+                  << "bigcell_profile_internals=" << (bigConfig.profileFusedInternals ? 1 : 0) << '\n'
+                  << "bigcell_event_reset_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.resetMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_build_clear_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.buildClearMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_marker_gap_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.eventMarkerGapMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_first_count_or_insert_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.firstCountOrInsertMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_second_count_or_insert_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.secondCountOrInsertMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_scan_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.scanMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_first_fill_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.firstFillMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_second_fill_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.secondFillMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_mixed_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.mixedCellBuildMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_proximity_reset_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.proximityResetMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_fused_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.fusedKernelMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_event_total_avg_ms=" << (bigMeasured > 0 ? bigTimingTotals.totalPipelineMilliseconds / bigMeasured : 0.0) << '\n'
+                  << "bigcell_prod_launch=" << bigLastStats.fusedGridBlocks << "x" << bigLastStats.fusedBlockThreads << '\n'
+                  << "bigcell_prod_resources=regs:" << bigLastStats.fusedRegistersPerThread
+                  << " static_shared_bytes:" << bigLastStats.fusedStaticSharedBytes
+                  << " local_bytes_per_thread:" << bigLastStats.fusedLocalBytesPerThread << '\n'
+                  << "bigcell_prod_occupancy=active_blocks_per_sm:" << bigLastStats.fusedActiveBlocksPerSm
+                  << " theoretical_pct:" << bigLastStats.fusedTheoreticalOccupancyPercent << '\n'
+                  << "bigcell_profile_resources=regs:" << bigLastStats.profiledRegistersPerThread
+                  << " static_shared_bytes:" << bigLastStats.profiledStaticSharedBytes
+                  << " local_bytes_per_thread:" << bigLastStats.profiledLocalBytesPerThread << '\n'
+                  << "bigcell_profile_occupancy=active_blocks_per_sm:" << bigLastStats.profiledActiveBlocksPerSm
+                  << " theoretical_pct:" << bigLastStats.profiledTheoreticalOccupancyPercent << '\n'
+                  << "bigcell_device=sms:" << bigLastStats.deviceMultiprocessorCount
+                  << " max_threads_per_sm:" << bigLastStats.deviceMaxThreadsPerSm
+                  << " warp_size:" << bigLastStats.deviceWarpSize
+                  << " clock_rate_khz:" << bigLastStats.deviceClockRateKHz << '\n'
+                  << "bigcell_profile_work=big_cells:" << bigLastStats.profiledBigCellIterations
+                  << " tiles:" << bigLastStats.profiledTileIterations
+                  << " tool_staged:" << bigLastStats.profiledToolEntriesStaged
+                  << " tissue_visited:" << bigLastStats.profiledTissueEntriesVisited
+                  << " pair_visits:" << bigLastStats.profiledSmallCellPairVisits << '\n'
+                  << "bigcell_profile_rejects=inflated_aabb:" << bigLastStats.profiledInflatedAabbRejects
+                  << " home_cell:" << bigLastStats.profiledHomeCellRejects
+                  << " raw_aabb:" << bigLastStats.profiledRawAabbRejects
+                  << " fbp_calls:" << bigLastStats.profiledFbpCalls
+                  << " fbp_no_contact:" << bigLastStats.profiledFbpNoContact << '\n'
+                  << "bigcell_profile_block_cycles=tile_setup:" << bigLastStats.profiledTileSetupBlockCycles
+                  << " bin_prefix:" << bigLastStats.profiledBinPrefixBlockCycles
+                  << " tool_gather:" << bigLastStats.profiledToolGatherBlockCycles
+                  << " tissue_sweep:" << bigLastStats.profiledTissueSweepBlockCycles << '\n'
+                  << "bigcell_profile_thread_cycles=inflated_aabb:" << bigLastStats.profiledInflatedAabbThreadCycles
+                  << " home_cell:" << bigLastStats.profiledHomeCellThreadCycles
+                  << " raw_aabb:" << bigLastStats.profiledRawAabbThreadCycles
+                  << " fbp:" << bigLastStats.profiledFbpThreadCycles << '\n'
                   << "bigcell_entries=" << bigLastEntries << '\n'
                   << "bigcell_mixed_big_cells=" << bigLastMixed << '\n'
                   << "bigcell_pairs_tested=" << bigLastPairs << '\n'
