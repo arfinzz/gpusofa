@@ -56,7 +56,7 @@ to emit the identical contact set. Every mode pair above is such an A/B.
 | bench "80k" | 181×181 tissue grid (64,800 tris) + subdivided blade (14,720 tris), generated in-process | 79,520 | kernel-only timing, ncu profiling |
 | bench "200k" | 316×316 tissue grid (198,450) + same blade | 213,170 | scale behavior |
 | `testscenes/hash_prefixsum_large.py` | 81×81 tissue + blade, static, in SOFA | 14,368 | end-to-end SOFA timing (the surgical-scale scene) |
-| `testscenes/collision_xlarge_200k.py` | 316×316 tissue + blade in SOFA | ~213k | end-to-end at scale |
+| `testscenes/collision_xlarge_200k.py` | 316×316 tissue grid (198,450 tris) + 1,568-triangle blade in SOFA | **200,018** | end-to-end at scale |
 | `one_tissue_one_blade.py` / `large_tissue_blade.py` / v-t scenes | see guide/setup.md §4 | 12,812 / 79,520 / — | full-suite regression legs |
 
 The geometry generators are deterministic (no randomness), and a comparison run launches

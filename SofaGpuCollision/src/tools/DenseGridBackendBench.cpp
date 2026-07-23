@@ -901,7 +901,9 @@ int main()
                   "profile_raw_aabb_rejects,profile_fbp_calls,profile_fbp_no_contact,"
                   "profile_tile_setup_block_cycles,profile_bin_prefix_block_cycles,profile_tool_gather_block_cycles,"
                   "profile_tissue_sweep_block_cycles,profile_inflated_aabb_thread_cycles,"
-                  "profile_home_cell_thread_cycles,profile_raw_aabb_thread_cycles,profile_fbp_thread_cycles\n";
+                  "profile_home_cell_thread_cycles,profile_raw_aabb_thread_cycles,profile_fbp_thread_cycles,"
+                  "profile_tool_sort_scatter_thread_cycles,profile_tool_data_load_thread_cycles,"
+                  "profile_contact_emit_thread_cycles\n";
 
         double bigWallTotal = 0.0, bigKernelTotal = 0.0;
         int bigMeasured = 0;
@@ -991,7 +993,10 @@ int main()
                    << bigStatsOut.profiledTileSetupBlockCycles << ',' << bigStatsOut.profiledBinPrefixBlockCycles << ','
                    << bigStatsOut.profiledToolGatherBlockCycles << ',' << bigStatsOut.profiledTissueSweepBlockCycles << ','
                    << bigStatsOut.profiledInflatedAabbThreadCycles << ',' << bigStatsOut.profiledHomeCellThreadCycles << ','
-                   << bigStatsOut.profiledRawAabbThreadCycles << ',' << bigStatsOut.profiledFbpThreadCycles << '\n';
+                   << bigStatsOut.profiledRawAabbThreadCycles << ',' << bigStatsOut.profiledFbpThreadCycles << ','
+                   << bigStatsOut.profiledToolSortScatterThreadCycles << ','
+                   << bigStatsOut.profiledToolDataLoadThreadCycles << ','
+                   << bigStatsOut.profiledContactEmitThreadCycles << '\n';
         }
 
         std::cout << "bigcell_build=" << (bigConfig.useHashTableBuild ? "hash_table" : "csr") << '\n'
@@ -1047,7 +1052,10 @@ int main()
                   << "bigcell_profile_thread_cycles=inflated_aabb:" << bigLastStats.profiledInflatedAabbThreadCycles
                   << " home_cell:" << bigLastStats.profiledHomeCellThreadCycles
                   << " raw_aabb:" << bigLastStats.profiledRawAabbThreadCycles
-                  << " fbp:" << bigLastStats.profiledFbpThreadCycles << '\n'
+                  << " fbp:" << bigLastStats.profiledFbpThreadCycles
+                  << " tool_sort_scatter:" << bigLastStats.profiledToolSortScatterThreadCycles
+                  << " tool_data_load:" << bigLastStats.profiledToolDataLoadThreadCycles
+                  << " contact_emit:" << bigLastStats.profiledContactEmitThreadCycles << '\n'
                   << "bigcell_entries=" << bigLastEntries << '\n'
                   << "bigcell_mixed_big_cells=" << bigLastMixed << '\n'
                   << "bigcell_pairs_tested=" << bigLastPairs << '\n'

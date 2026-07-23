@@ -5,13 +5,19 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: **2026-07-15**. All **12 execution modes** (6 ways × their toggle combos)
+Last refreshed: **2026-07-23**. All **12 execution modes** (6 ways × their toggle combos)
 are measured with identical contacts everywhere; the champion is way 6 with the
 **shared-memory hash build** (`bigcell_sharedhash`: 0.290 ms narrow kernel on the 14k
 scene, 0.564 / 0.806 ms at the 80k / 200k benches — 16–26% ahead of way 5 and ~5× the
 production dense default). Canonical data + per-kernel profiles for every mode:
 `reports/performance_all_modes_20260715.md`; mode explainers:
 `reports/README_execution_modes.md`.
+2026-07-23 profiling clarification: the canonical SOFA inputs are exactly 14,368 and
+200,018 elements; the historical standalone 28k and “bench 200k” inputs are separate
+27,520 and 213,170-element geometries. The diagnostic fused specialization now separates
+tool sort-scatter, tool triangle/AABB/vertex load, FBP computation, and contact emission
+cycles. Current wall/GPU/FPS/Nsight interpretation:
+`reports/bigcell_fused_profile_clarification_20260723.md`.
 Previously (2026-07-12): a sixth way — the **big-cell FUSED generation + narrow
 phase** (`useBigCellFusedGeneration`: small cells grouped into `bigCellFactor`³ big cells,
 per-big-cell CSR table, ONE kernel per mixed big cell staging tool ids + AABBs + vertices

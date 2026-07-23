@@ -1,5 +1,7 @@
 # Winning big-cell fused algorithm: detailed CUDA profile
 
+> Size-label, wall-time, production-FPS, corrected Nsight, and finer in-kernel timing clarification: `reports/bigcell_fused_profile_clarification_20260723.md`. The original 28k/80k/213k campaign below is retained as a valid profile of those standalone inputs.
+
 Date: 2026-07-23
 Hardware: NVIDIA GeForce GTX 1650 Ti (Turing, sm_75), 16 SMs
 Configuration: big-cell factor 2, 256-entry tool tile, CSR table, shared-hash build/merge, fused raw-AABB reuse enabled
@@ -100,7 +102,7 @@ Important distinction:
 
 - CUDA-event milliseconds are serialized GPU elapsed time between stream markers.
 - Block cycles are summed over blocks; thread cycles are summed over threads. Concurrent work overlaps, so summed cycles must not be converted into wall time.
-- Theoretical occupancy is a resource-limit calculation. Achieved occupancy requires a hardware-counter profiler. `ncu` is not installed in the current WSL image, so this run does not claim a new achieved-occupancy measurement. The prior Nsight result remains documented in `reports/performance_all_modes_20260715.md`.
+- Theoretical occupancy is a resource-limit calculation. Achieved occupancy requires a hardware-counter profiler. A corrected environment probe found Nsight Compute at `/usr/bin/ncu`; current 14k/80k/200k achieved-occupancy results are in `reports/bigcell_fused_profile_clarification_20260723.md`.
 
 ## 4. Correctness gates
 

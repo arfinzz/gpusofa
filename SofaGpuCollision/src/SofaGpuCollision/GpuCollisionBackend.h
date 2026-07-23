@@ -563,6 +563,9 @@ struct BigCellStats
     std::uint64_t profiledHomeCellThreadCycles { 0 };
     std::uint64_t profiledRawAabbThreadCycles { 0 };
     std::uint64_t profiledFbpThreadCycles { 0 };
+    std::uint64_t profiledToolSortScatterThreadCycles { 0 };
+    std::uint64_t profiledToolDataLoadThreadCycles { 0 };
+    std::uint64_t profiledContactEmitThreadCycles { 0 };
 };
 
 SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(

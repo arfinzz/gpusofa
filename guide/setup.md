@@ -4,7 +4,7 @@ End-to-end instructions for running, building, profiling, and tuning the
 GPU SOFA collision pipeline. Read top to bottom for a fresh machine; jump
 to a section if you already know the lay of the land.
 
-Last refreshed: 2026-07-15 (all **12 execution modes** measured — dense ×2, optimised
+Last refreshed: 2026-07-23 (all **12 execution modes** measured — dense ×2, optimised
 hash, simple hash, sorted grid ×4 toggle combos, big-cell fused ×4 build strategies —
 with per-kernel profiling for every mode. Champion: `bigcell_sharedhash`. Canonical
 numbers: `reports/performance_all_modes_20260715.md`; mode/metric explainers:
@@ -203,7 +203,7 @@ needed):
 | `self_collision_vertex_triangle.py` | **Phase 12 v-t self-collision** | 1300–2100 FPS, **2700 VertexFace** contacts |
 | `cross_model_vertex_triangle.py` | **Phase 12 v-t cross-model** | 1500–4200 FPS, **254 VertexFace** contacts |
 | `hash_prefixsum_large.py` | **Broad-cull way selector scene** (large tissue + large tool, ~14,368 elements) — all six ways via the `SOFA_USE_*_GENERATION` envs | **2354** contacts identical for every way; narrow kernel: bigcell 0.30 / simple 0.33 / sorted 0.34 / hash 0.34 / dense 1.3–1.5 ms |
-| `collision_xlarge_200k.py` | **Extra-large scale test** (~213k elements: 315×315 tissue grid + subdivided blade; same construction as the other scenes, same env toggles) | **12,178** contacts identical across ways; narrow kernel: bigcell **2.01** / sorted 2.25 / dense 4.12 ms. Bench equivalent: `SOFA_LARGE_TISSUE_NX=316` |
+| `collision_xlarge_200k.py` | **Extra-large canonical scene** (exactly 200,018 elements: 198,450 tissue + 1,568 blade triangles; same env toggles) | **12,178** contacts identical across ways. The historical standalone `SOFA_LARGE_TISSUE_NX=316` with its default 14,720-triangle tool is a different 213,170-element benchmark; set blade segments to 30/8/4 for the 200,018-count standalone analogue. |
 
 Common scene helpers in `testscenes/dense_collision_benchmark_common.py`:
 
@@ -227,8 +227,8 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 |---|---|---|
 | `run_full_benchmark_suite_wsl.sh` | **All canonical scenes** (small, large, v-t self, v-t cross, 5-way legs on the 14k scene, 3 xlarge-200k legs) in fast + validation modes | 160 steps/leg, one summary per leg; `SOFA_SUITE_ONLY='<regex>'` runs a filtered batch (useful under a wall-clock cap) |
 | `run_bigcell_parity_wsl.sh` | **Way-6 parity gate** — backend bench across the big-cell toggle matrix (factors 4/2/1, forced chunk loop, hash-build legs) | contacts must equal the FBP leg; `bigcell_pairs_tested` must equal `sortedgrid_unique_pairs` |
-| `run_ncu_bigcell_wsl.sh` | **Nsight Compute on the way-6 kernels** (80k + 200k, factors 2 + 4) | per-kernel SOL/DRAM/occupancy/registers CSVs |
-| `run_bigcell_detailed_profile_wsl.sh` | **Reproducible winner deep profile** at the 28k / 80k / 213k backend scales | production graph timing, graph-off CUDA-event stage timing, opt-in `clock64()` fused-internal counters/cycles, occupancy/resources, CSVs |
+| `run_ncu_bigcell_wsl.sh` | **Nsight Compute on the winning way-6 kernel** at the 14k / 80k / 200k triangle-count scales (standalone analogues) | fused duration, SM/DRAM throughput, achieved occupancy, and registers for every scale |
+| `run_bigcell_detailed_profile_wsl.sh` | **Reproducible winner deep profile** at the 14k / 80k / 200k triangle-count scales (standalone analogues) | production graph timing, graph-off CUDA-event stage timing, opt-in `clock64()` fused-internal counters/cycles, occupancy/resources, CSVs |
 | `run_mode_comparison_ab_wsl.sh` | **12-leg same-session comparison of EVERY execution mode** on `hash_prefixsum_large.py` (dense ×2, hash, simple, sorted ×4, bigcell ×4 builds) | counter-on, prints the kernel-time summary table |
 | `run_fbp_smoke_test_wsl.sh` | **`one_tissue_one_blade.py` with FBP** (Phase 11) | FBP, detection-only, readback off, tool-active-cell default-on |
 | `run_fbp_large_tissue_wsl.sh` | **`large_tissue_blade.py` FBP** (Phase 15 large A/B) | FBP, detection-only, tool-active-cell default-on |
@@ -508,7 +508,7 @@ The 2026-06-09 run is reported in `reports/archive_pre_20260618/benchmark_suite_
 ### 7.10b  Way 6 (big-cell fused) — run + parity
 
 ```powershell
-# SOFA scene, way 6 on the 14k selector scene (or collision_xlarge_200k.py for 213k):
+# SOFA scene, way 6 on the 14,368 selector scene (or collision_xlarge_200k.py for exactly 200,018):
 wsl -d wsl-gpu-proj -- bash -c "SOFA_USE_BIGCELL_FUSED_GENERATION=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=1 /opt/sofa/install/v25.12/bin/runSofa -g batch -n 160 -l SofaPython3 -l SofaCUDA -l /home/arfin/gpu-sofa/SofaGpuCollision/build-profile/libSofaGpuCollision.so /home/arfin/gpu-sofa/testscenes/hash_prefixsum_large.py"
 # Parity gate (backend bench, factors 4/2/1 + chunk loop + hash-build legs):
 wsl -d wsl-gpu-proj -- bash /home/arfin/gpu-sofa/scripts/run_bigcell_parity_wsl.sh

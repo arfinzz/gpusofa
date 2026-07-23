@@ -58,6 +58,9 @@ struct DeviceBigCellFusedProfile
     unsigned long long homeCellThreadCycles;
     unsigned long long rawAabbThreadCycles;
     unsigned long long fbpThreadCycles;
+    unsigned long long toolSortScatterThreadCycles;
+    unsigned long long toolDataLoadThreadCycles;
+    unsigned long long contactEmitThreadCycles;
 };
 
 constexpr std::size_t kBigCellDetailedEventCount = 11;
@@ -1083,6 +1086,9 @@ __global__ void profiledFusedBigCellNarrowKernel(
     unsigned long long localHomeCellCycles = 0ull;
     unsigned long long localRawAabbCycles = 0ull;
     unsigned long long localFbpCycles = 0ull;
+    unsigned long long localToolSortScatterCycles = 0ull;
+    unsigned long long localToolDataLoadCycles = 0ull;
+    unsigned long long localContactEmitCycles = 0ull;
     unsigned long long blockTileSetupCycles = 0ull;
     unsigned long long blockBinPrefixCycles = 0ull;
     unsigned long long blockToolGatherCycles = 0ull;
@@ -1181,14 +1187,18 @@ __global__ void profiledFusedBigCellNarrowKernel(
             for (std::uint32_t i = threadIdx.x; i < sTileCount; i += blockDim.x)
             {
                 const std::uint32_t packed = sScratchPacked[i];
+                unsigned long long operationStart = clock64();
                 const std::uint32_t pos = atomicAdd(&sBinCursor[packed & 63u], 1u);
                 const std::uint32_t toolTriId = packed >> 6u;
                 sToolIds[pos] = toolTriId;
+                localToolSortScatterCycles += clock64() - operationStart;
+                operationStart = clock64();
                 const DeviceTriangle tt = indexedTriangleAt(toolPositions, toolIndices, toolTriId);
                 sToolAabbs[pos] = triangleAabb(tt, 0.0f);
                 sToolVerts[3u * pos + 0u] = tt.p0;
                 sToolVerts[3u * pos + 1u] = tt.p1;
                 sToolVerts[3u * pos + 2u] = tt.p2;
+                localToolDataLoadCycles += clock64() - operationStart;
             }
             __syncthreads();
             if (threadIdx.x == 0)
@@ -1273,7 +1283,9 @@ __global__ void profiledFusedBigCellNarrowKernel(
                         }
                         c.firstPrimitiveIndex = tissueTriId;
                         c.secondPrimitiveIndex = sToolIds[u];
+                        filterStart = clock64();
                         fbpEmitContact(c, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+                        localContactEmitCycles += clock64() - filterStart;
                     }
             }
             __syncthreads();
@@ -1282,23 +1294,26 @@ __global__ void profiledFusedBigCellNarrowKernel(
     }
 
     bigCellProfileWarpAtomicAdd(&profile->bigCellIterations, localBigCellIterations);
-        bigCellProfileWarpAtomicAdd(&profile->tileIterations, localTileIterations);
-        bigCellProfileWarpAtomicAdd(&profile->toolEntriesStaged, localToolEntriesStaged);
-        bigCellProfileWarpAtomicAdd(&profile->tissueEntriesVisited, localTissueEntriesVisited);
-        bigCellProfileWarpAtomicAdd(&profile->smallCellPairVisits, localSmallCellPairVisits);
-        bigCellProfileWarpAtomicAdd(&profile->inflatedAabbRejects, localInflatedAabbRejects);
-        bigCellProfileWarpAtomicAdd(&profile->homeCellRejects, localHomeCellRejects);
-        bigCellProfileWarpAtomicAdd(&profile->rawAabbRejects, localRawAabbRejects);
-        bigCellProfileWarpAtomicAdd(&profile->fbpCalls, localFbpCalls);
-        bigCellProfileWarpAtomicAdd(&profile->fbpNoContact, localFbpNoContact);
-        bigCellProfileWarpAtomicAdd(&profile->tileSetupBlockCycles, blockTileSetupCycles);
-        bigCellProfileWarpAtomicAdd(&profile->binPrefixBlockCycles, blockBinPrefixCycles);
-        bigCellProfileWarpAtomicAdd(&profile->toolGatherBlockCycles, blockToolGatherCycles);
-        bigCellProfileWarpAtomicAdd(&profile->tissueSweepBlockCycles, blockTissueSweepCycles);
-        bigCellProfileWarpAtomicAdd(&profile->inflatedAabbThreadCycles, localInflatedAabbCycles);
-        bigCellProfileWarpAtomicAdd(&profile->homeCellThreadCycles, localHomeCellCycles);
-        bigCellProfileWarpAtomicAdd(&profile->rawAabbThreadCycles, localRawAabbCycles);
+    bigCellProfileWarpAtomicAdd(&profile->tileIterations, localTileIterations);
+    bigCellProfileWarpAtomicAdd(&profile->toolEntriesStaged, localToolEntriesStaged);
+    bigCellProfileWarpAtomicAdd(&profile->tissueEntriesVisited, localTissueEntriesVisited);
+    bigCellProfileWarpAtomicAdd(&profile->smallCellPairVisits, localSmallCellPairVisits);
+    bigCellProfileWarpAtomicAdd(&profile->inflatedAabbRejects, localInflatedAabbRejects);
+    bigCellProfileWarpAtomicAdd(&profile->homeCellRejects, localHomeCellRejects);
+    bigCellProfileWarpAtomicAdd(&profile->rawAabbRejects, localRawAabbRejects);
+    bigCellProfileWarpAtomicAdd(&profile->fbpCalls, localFbpCalls);
+    bigCellProfileWarpAtomicAdd(&profile->fbpNoContact, localFbpNoContact);
+    bigCellProfileWarpAtomicAdd(&profile->tileSetupBlockCycles, blockTileSetupCycles);
+    bigCellProfileWarpAtomicAdd(&profile->binPrefixBlockCycles, blockBinPrefixCycles);
+    bigCellProfileWarpAtomicAdd(&profile->toolGatherBlockCycles, blockToolGatherCycles);
+    bigCellProfileWarpAtomicAdd(&profile->tissueSweepBlockCycles, blockTissueSweepCycles);
+    bigCellProfileWarpAtomicAdd(&profile->inflatedAabbThreadCycles, localInflatedAabbCycles);
+    bigCellProfileWarpAtomicAdd(&profile->homeCellThreadCycles, localHomeCellCycles);
+    bigCellProfileWarpAtomicAdd(&profile->rawAabbThreadCycles, localRawAabbCycles);
     bigCellProfileWarpAtomicAdd(&profile->fbpThreadCycles, localFbpCycles);
+    bigCellProfileWarpAtomicAdd(&profile->toolSortScatterThreadCycles, localToolSortScatterCycles);
+    bigCellProfileWarpAtomicAdd(&profile->toolDataLoadThreadCycles, localToolDataLoadCycles);
+    bigCellProfileWarpAtomicAdd(&profile->contactEmitThreadCycles, localContactEmitCycles);
 }
 
 } // namespace
@@ -1815,6 +1830,9 @@ bool computeBigCellFusedProximityContacts(
             bigStats->profiledHomeCellThreadCycles = hostProfile.homeCellThreadCycles;
             bigStats->profiledRawAabbThreadCycles = hostProfile.rawAabbThreadCycles;
             bigStats->profiledFbpThreadCycles = hostProfile.fbpThreadCycles;
+            bigStats->profiledToolSortScatterThreadCycles = hostProfile.toolSortScatterThreadCycles;
+            bigStats->profiledToolDataLoadThreadCycles = hostProfile.toolDataLoadThreadCycles;
+            bigStats->profiledContactEmitThreadCycles = hostProfile.contactEmitThreadCycles;
         }
     }
 

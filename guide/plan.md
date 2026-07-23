@@ -6,11 +6,11 @@ paragraph, the measured outcome, and (where rejected) an explanation of the
 alternative that was considered. New work appends; finished phases stay so
 their rationale remains discoverable.
 
-Last refreshed: **2026-06-18**. Since 2026-06-09 the hash cull was optimised and
-merged to `main` (§5.19), three more hash opts + CUDA graphs landed (§5.20), and an
-FBP-kernel occupancy optimization was attempted and reverted as a measured regression
-(§5.21). Current numbers + the full optimization/failed-methods history:
-`reports/performance_all_modes_20260715.md`.
+Last refreshed: **2026-07-23**. The six-way campaign, big-cell fused path (§5.25),
+shared-hash producer win (§5.26), rejected fused-kernel experiments, and the final winner
+are implemented. Exact 14k/80k/200k size reconciliation plus current production,
+CUDA-event, in-kernel, and Nsight results:
+`reports/bigcell_fused_profile_clarification_20260723.md`.
 
 ---
 
@@ -1131,9 +1131,9 @@ API `computeBigCellFusedProximityContacts`, report
 - **Measured (all contact-identical, zero overflow):** 14,368 SOFA scene, 8-leg same
   session — **way 6 fastest narrow kernel of every configuration: 0.309 ms** (sorted
   0.337, simple 0.332, hash 0.339, dense 1.30–1.54); full suite reproduces every
-  historical fingerprint (56/8018/2700/254/2354). New ~213k-element size: bench — way 6
-  factor 2 1.093 ms ≈ way 5 1.082 (tie), dense/hash ways 4.7–5.0; **SOFA
-  `collision_xlarge_200k.py` scene — way 6 2.011 ms vs way 5 2.247 vs dense 4.125**
+  historical fingerprint (56/8018/2700/254/2354). New standalone 213,170-element bench: way 6
+  factor 2 1.093 ms ≈ way 5 1.082 (tie), dense/hash ways 4.7–5.0; **the separate,
+  exact-200,018-element SOFA `collision_xlarge_200k.py` scene — way 6 2.011 ms vs way 5 2.247 vs dense 4.125**
   (12,178 contacts ×3 legs).
 - **Factor sweep:** `bigCellFactor` default **2** (measured). Factor 4 collapses
   block-level parallelism on blade-concentrated scenes (48 mixed big cells at the 200k
