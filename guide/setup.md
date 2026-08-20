@@ -507,6 +507,30 @@ wsl -d wsl-gpu-proj -- bash -c "SOFA_SUITE_ONLY='^xlarge_' SOFA_BENCHMARK_LOG_DI
 
 The 2026-06-09 run is reported in `reports/archive_pre_20260618/benchmark_suite_20260609.md`.
 
+> ### ⚠ Windows→WSL quoting can leave a process hung FOREVER
+>
+> Observed 2026-08-20: a one-liner of the form
+> `wsl.exe -d wsl-gpu-proj -- bash -c 'grep -nE "a|b|c" $FILE | head'`
+> had its **inner double quotes eaten by PowerShell**, so bash received
+> `grep -nE a` — a pattern with **no file argument**. `grep` with no file reads
+> **stdin**, and in a detached `wsl.exe` process stdin never reaches EOF, so it
+> blocked for **1 h 50 m** until killed manually. Its parent shell waited on it.
+>
+> Two things made this hard to spot:
+> * the *other* fragments of the mangled command did emit output (`command not
+>   found`), so the log looked like the command had finished;
+> * a check for `pgrep -af 'runSofa|Bench|ncu|nsys'` cannot match a process
+>   called `grep` or `bash`. **Verifying with a method that cannot detect the
+>   failure is not verification.**
+>
+> Rules that prevent it:
+> 1. **Always use the script-file pattern** — write a `.sh`, copy it in, run it.
+>    Never inline quotes/pipes/`$(...)` through `wsl.exe`.
+> 2. Redirect stdin on anything that could read it: `... < /dev/null`.
+> 3. To check for strays, list *everything* and exclude the known-good, rather
+>    than grepping for names you expect:
+>    `ps -eo pid,etime,stat,args --no-headers | grep -vE '\[|/init|plan9'`
+
 ### 7.10b  Way 6 (big-cell fused) — run + parity
 
 ```powershell
