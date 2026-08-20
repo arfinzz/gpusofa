@@ -280,29 +280,30 @@ bool resolveContactHandle(
     bool& outSwapped,
     std::string& diagnostic)
 {
-    const RecordedContactHandle& handle = lastContactHandle();
-    if (!handle.valid)
+    out = findContactHandle(firstSurfaceId, secondSurfaceId, outSwapped);
+    if (out != nullptr)
     {
-        diagnostic = "No device contact handle recorded — run a proximity computation first.";
-        return false;
-    }
-    if (handle.firstSurfaceId == firstSurfaceId && handle.secondSurfaceId == secondSurfaceId)
-    {
-        outSwapped = false;
-        out = &handle;
         return true;
     }
-    if (handle.firstSurfaceId == secondSurfaceId && handle.secondSurfaceId == firstSurfaceId)
+
+    const ContactHandleRegistry& registry = contactHandleRegistry();
+    std::string recorded;
+    std::size_t liveCount = 0;
+    for (const auto& handle : registry.slots)
     {
-        outSwapped = true;
-        out = &handle;
-        return true;
+        if (!handle.valid) continue;
+        ++liveCount;
+        if (!recorded.empty()) recorded += ", ";
+        recorded += std::to_string(handle.firstSurfaceId) + "/" + std::to_string(handle.secondSurfaceId);
     }
-    diagnostic =
-        "Recorded contact handle belongs to a different surface pair (requested " +
-        std::to_string(firstSurfaceId) + "/" + std::to_string(secondSurfaceId) +
-        ", recorded " + std::to_string(handle.firstSurfaceId) + "/" +
-        std::to_string(handle.secondSurfaceId) + ").";
+    diagnostic = liveCount == 0
+        ? "No device contact handle recorded — run a proximity computation first."
+        : "No contact handle for surface pair " + std::to_string(firstSurfaceId) + "/" +
+          std::to_string(secondSurfaceId) + " (recorded pairs: " + recorded + ")." +
+          (registry.evictions > 0
+              ? " NOTE: " + std::to_string(registry.evictions) +
+                " handle eviction(s) so far — more live collision pairs than registry slots."
+              : std::string());
     return false;
 }
 
@@ -586,6 +587,59 @@ bool validateContactPenaltyForces(
         }
     }
 
+    // ---- Gate 1b: reconstruct each contact point from the decoded weights ----
+    // Independent of the force math entirely: if the weights address the right
+    // vertices with the right coefficients, then sum(w_i * vertexPosition_i)
+    // must reproduce the contact point that the collision kernel computed via
+    // closest-feature math. A wrong convention (wrong vertex, swapped edge
+    // endpoints, face-vs-vertex confusion) breaks this immediately, whereas the
+    // force comparison alone would not.
+    double maxPointError = 0.0;
+    double maxWeightSumError = 0.0;
+    bool pointCheckRan = false;
+    if (firstSurface.positions != nullptr && secondSurface.positions != nullptr)
+    {
+        pointCheckRan = true;
+        const auto reconstruct = [](const BackendTriangleVertex* positions,
+                                    const std::vector<std::uint32_t>& indices,
+                                    const std::uint32_t triangleId,
+                                    const float w[3], float out[3]) {
+            out[0] = out[1] = out[2] = 0.0f;
+            for (int k = 0; k < 3; ++k)
+            {
+                if (w[k] == 0.0f) continue;
+                const std::uint32_t v = indices[3u * triangleId + k];
+                out[0] += positions[v].x * w[k];
+                out[1] += positions[v].y * w[k];
+                out[2] += positions[v].z * w[k];
+            }
+        };
+        for (const auto& c : hostContacts)
+        {
+            float wa[3], wb[3];
+            hostWeights(c.featureKind, c.firstFeatureLocalIndex, c.firstBary, true, wa);
+            hostWeights(c.featureKind, c.secondFeatureLocalIndex, c.secondBary, false, wb);
+
+            maxWeightSumError = std::max(maxWeightSumError,
+                static_cast<double>(std::fabs((wa[0] + wa[1] + wa[2]) - 1.0f)));
+            maxWeightSumError = std::max(maxWeightSumError,
+                static_cast<double>(std::fabs((wb[0] + wb[1] + wb[2]) - 1.0f)));
+
+            float pa[3], pb[3];
+            reconstruct(firstSurface.positions, hostFirstIndices, c.firstPrimitiveIndex, wa, pa);
+            reconstruct(secondSurface.positions, hostSecondIndices, c.secondPrimitiveIndex, wb, pb);
+
+            maxPointError = std::max(maxPointError, static_cast<double>(std::sqrt(
+                (pa[0] - c.pointOnFirst.x) * (pa[0] - c.pointOnFirst.x) +
+                (pa[1] - c.pointOnFirst.y) * (pa[1] - c.pointOnFirst.y) +
+                (pa[2] - c.pointOnFirst.z) * (pa[2] - c.pointOnFirst.z))));
+            maxPointError = std::max(maxPointError, static_cast<double>(std::sqrt(
+                (pb[0] - c.pointOnSecond.x) * (pb[0] - c.pointOnSecond.x) +
+                (pb[1] - c.pointOnSecond.y) * (pb[1] - c.pointOnSecond.y) +
+                (pb[2] - c.pointOnSecond.z) * (pb[2] - c.pointOnSecond.z))));
+        }
+    }
+
     double maxErr = 0.0;
     double maxRef = 0.0;
     double netX = 0.0, netY = 0.0, netZ = 0.0;
@@ -616,6 +670,9 @@ bool validateContactPenaltyForces(
         validation->maxReferenceMagnitude = maxRef;
         validation->netForceMagnitude = std::sqrt(netX * netX + netY * netY + netZ * netZ);
         validation->totalForceMagnitude = totalMag;
+        validation->maxContactPointError = maxPointError;
+        validation->maxWeightSumError = maxWeightSumError;
+        validation->contactPointCheckRan = pointCheckRan;
     }
 
     diagnostic.clear();

@@ -146,11 +146,13 @@ void CudaContactPenaltyForceField::addForce(
     {
         m_lastContactCount = stats.contactCount;
         m_lastActiveContactCount = stats.activeContactCount;
-        // Log on change so a run shows the contact history without one line per frame.
-        static std::uint32_t lastLogged = 0xffffffffu;
-        if (m_lastActiveContactCount != lastLogged)
+        // Log on change so a run shows the contact history without one line per
+        // frame. Per-INSTANCE state: a function-local `static` would be shared by
+        // every force field in the scene and would survive a scene reload,
+        // silently suppressing another instance's first report.
+        if (m_lastActiveContactCount != m_lastLoggedActiveCount)
         {
-            lastLogged = m_lastActiveContactCount;
+            m_lastLoggedActiveCount = m_lastActiveContactCount;
             msg_info() << "contacts=" << m_lastContactCount
                        << " active=" << m_lastActiveContactCount;
         }

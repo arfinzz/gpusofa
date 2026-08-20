@@ -1133,23 +1133,33 @@ int main()
 
             const bool gate1 = relError < 1e-5;
             const bool gate2 = relNet < 1e-5;
-            allPassed = allPassed && gate1 && gate2;
+            // Gate 1b: the decoded weights must reproduce the collision kernel's
+            // own contact points, and must sum to 1. Scale-free geometric test —
+            // 1e-4 is generous against a scene of order 1 unit.
+            const bool gate1b = validation.contactPointCheckRan &&
+                                validation.maxContactPointError < 1e-4 &&
+                                validation.maxWeightSumError < 1e-5;
+            allPassed = allPassed && gate1 && gate2 && gate1b;
 
             std::cout << "contactforce_k=" << stiffness
                       << " contacts=" << validation.contactCount
                       << " active=" << validation.activeContactCount
-                      << " max_abs_err=" << validation.maxAbsErrorVsReference
-                      << " max_ref=" << validation.maxReferenceMagnitude
                       << " rel_err=" << relError << (gate1 ? " [GATE1 PASS]" : " [GATE1 FAIL]")
-                      << " net_force=" << validation.netForceMagnitude
-                      << " total_force=" << validation.totalForceMagnitude
                       << " rel_net=" << relNet << (gate2 ? " [GATE2 PASS]" : " [GATE2 FAIL]")
+                      << " max_point_err=" << validation.maxContactPointError
+                      << " max_weightsum_err=" << validation.maxWeightSumError
+                      << (validation.contactPointCheckRan
+                              ? (gate1b ? " [GATE1b PASS]" : " [GATE1b FAIL]")
+                              : " [GATE1b SKIPPED: no host positions]")
                       << '\n';
         }
 
         std::cout << "CONTACT_FORCE_GATES=" << (allPassed ? "PASS" : "FAIL") << '\n'
-                  << "  gate 1 = GPU forces match an independent host reference computed from the same contacts\n"
-                  << "  gate 2 = sum of all forces over both bodies is zero (Newton's third law)\n";
+                  << "  gate 1  = GPU forces match a host reference computed from the same contacts\n"
+                  << "  gate 1b = decoded barycentric weights reproduce the COLLISION kernel's own\n"
+                  << "            contact points (independent of the force math, so it catches a\n"
+                  << "            wrong VF/FV/EE convention that gate 1 alone would share and miss)\n"
+                  << "  gate 2  = sum of all forces over both bodies is zero (Newton's third law)\n";
         if (!allPassed) return 11;
     }
 

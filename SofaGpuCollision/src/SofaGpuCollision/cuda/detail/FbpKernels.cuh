@@ -32,9 +32,12 @@ struct DeviceProximityContact
 // index arrays, because turning a contact into vertex forces needs to know
 // which vertices each contacted triangle owns.
 //
-// Single-slot (last pair wins) rather than a map: the narrow phase computes a
-// pair and consumes it before moving on, and the surface ids let the consumer
-// verify it is reading the pair it asked for.
+// A small REGISTRY keyed by the surface-id pair, not a single slot. A single
+// slot silently breaks any scene with more than one colliding pair: the last
+// pair computed would overwrite the others, and every force field except the
+// lucky one would find a mismatched pair and apply NO force — quiet, wrong, and
+// invisible without per-pair diagnostics. Entries are matched and replaced by
+// id pair, so a steady scene reuses the same slots forever with no churn.
 // ============================================================================
 struct RecordedContactHandle
 {
@@ -48,10 +51,42 @@ struct RecordedContactHandle
     bool valid { false };
 };
 
-RecordedContactHandle& lastContactHandle()
+constexpr std::size_t kContactHandleSlots = 16;
+
+struct ContactHandleRegistry
 {
-    static RecordedContactHandle handle;
-    return handle;
+    RecordedContactHandle slots[kContactHandleSlots];
+    std::size_t nextSlot { 0 };
+    std::uint64_t evictions { 0 };   ///< non-zero => more live pairs than slots
+};
+
+ContactHandleRegistry& contactHandleRegistry()
+{
+    static ContactHandleRegistry registry;
+    return registry;
+}
+
+// Find a handle for (a, b) in EITHER order. SOFA's broad phase emits collision
+// pairs in its own order, which is frequently the reverse of scene order.
+const RecordedContactHandle* findContactHandle(
+    const std::uint64_t a, const std::uint64_t b, bool& outSwapped)
+{
+    const ContactHandleRegistry& registry = contactHandleRegistry();
+    for (const auto& handle : registry.slots)
+    {
+        if (!handle.valid) continue;
+        if (handle.firstSurfaceId == a && handle.secondSurfaceId == b)
+        {
+            outSwapped = false;
+            return &handle;
+        }
+        if (handle.firstSurfaceId == b && handle.secondSurfaceId == a)
+        {
+            outSwapped = true;
+            return &handle;
+        }
+    }
+    return nullptr;
 }
 
 void recordContactHandle(
@@ -63,16 +98,37 @@ void recordContactHandle(
     const std::uint64_t firstSurfaceId,
     const std::uint64_t secondSurfaceId)
 {
-    RecordedContactHandle& handle = lastContactHandle();
-    handle.contacts = static_cast<const DeviceProximityContact*>(contacts);
-    handle.countDevice = countDevice;
-    handle.capacity = capacity;
-    handle.firstIndices = firstIndices;
-    handle.secondIndices = secondIndices;
-    handle.firstSurfaceId = firstSurfaceId;
-    handle.secondSurfaceId = secondSurfaceId;
-    handle.valid = (handle.contacts != nullptr && countDevice != nullptr &&
-                    firstIndices != nullptr && secondIndices != nullptr);
+    ContactHandleRegistry& registry = contactHandleRegistry();
+
+    // Reuse this pair's existing slot if it has one, so a steady scene never
+    // evicts and slot order stays stable across frames.
+    RecordedContactHandle* target = nullptr;
+    for (auto& handle : registry.slots)
+    {
+        if (handle.valid &&
+            handle.firstSurfaceId == firstSurfaceId &&
+            handle.secondSurfaceId == secondSurfaceId)
+        {
+            target = &handle;
+            break;
+        }
+    }
+    if (target == nullptr)
+    {
+        target = &registry.slots[registry.nextSlot];
+        if (target->valid) ++registry.evictions;
+        registry.nextSlot = (registry.nextSlot + 1u) % kContactHandleSlots;
+    }
+
+    target->contacts = static_cast<const DeviceProximityContact*>(contacts);
+    target->countDevice = countDevice;
+    target->capacity = capacity;
+    target->firstIndices = firstIndices;
+    target->secondIndices = secondIndices;
+    target->firstSurfaceId = firstSurfaceId;
+    target->secondSurfaceId = secondSurfaceId;
+    target->valid = (target->contacts != nullptr && countDevice != nullptr &&
+                     firstIndices != nullptr && secondIndices != nullptr);
 }
 
 // Ericson 5.1.5 — closest point on triangle (a,b,c) to point p, in barycentrics.

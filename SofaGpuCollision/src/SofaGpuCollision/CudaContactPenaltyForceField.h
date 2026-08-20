@@ -97,6 +97,7 @@ private:
     bool m_reportedFailure { false };
     std::uint32_t m_lastContactCount { 0 };
     std::uint32_t m_lastActiveContactCount { 0 };
+    std::uint32_t m_lastLoggedActiveCount { 0xffffffffu };
 };
 
 } // namespace SofaGpuCollision

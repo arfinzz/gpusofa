@@ -650,6 +650,17 @@ struct ContactForceValidation
     double maxReferenceMagnitude { 0.0 };
     double netForceMagnitude { 0.0 };      // |sum of every force vector|
     double totalForceMagnitude { 0.0 };    // sum of |force| — the scale to judge the two above against
+    // Gate 1b — INDEPENDENT validation of the barycentric-weight decoding.
+    // Gate 1 alone is partly circular: the host reference re-uses the same
+    // VF/FV/EE weight convention as the kernel, so a wrong convention would pass
+    // both. This instead reconstructs each contact point from the decoded
+    // weights and the triangle's vertex positions, and compares it against the
+    // pointOnFirst / pointOnSecond that the COLLISION kernel computed by a
+    // completely different route (closest-feature math). Agreement means the
+    // weights genuinely address the right vertices with the right coefficients.
+    double maxContactPointError { 0.0 };
+    double maxWeightSumError { 0.0 };      // weights must be a partition of unity
+    bool contactPointCheckRan { false };   // false when host positions were unavailable
 };
 
 SOFA_GPU_COLLISION_API bool validateContactPenaltyForces(
