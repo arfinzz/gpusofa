@@ -204,6 +204,7 @@ needed):
 | `cross_model_vertex_triangle.py` | **Phase 12 v-t cross-model** | 1500–4200 FPS, **254 VertexFace** contacts |
 | `hash_prefixsum_large.py` | **Broad-cull way selector scene** (large tissue + large tool, ~14,368 elements) — all six ways via the `SOFA_USE_*_GENERATION` envs | **2354** contacts identical for every way; narrow kernel: bigcell 0.30 / simple 0.33 / sorted 0.34 / hash 0.34 / dense 1.3–1.5 ms |
 | `collision_xlarge_200k.py` | **Extra-large canonical scene** (exactly 200,018 elements: 198,450 tissue + 1,568 blade triangles; same env toggles) | **12,178** contacts identical across ways. The historical standalone `SOFA_LARGE_TISSUE_NX=316` with its default 14,720-triangle tool is a different 213,170-element benchmark; set blade segments to 30/8/4 for the 200,018-count standalone analogue. |
+| `gpu_resident_fem_contact.py` | **The first scene that actually simulates** (Tier 1, 2026-08-20): tet FEM tissue + `UniformMass` + `CudaFixedProjectiveConstraint` + falling blade + GPU collision + `CudaContactPenaltyForceField`, all under ONE solver so contact couples implicitly | `GPU residency ... violations=0` (zero device→host transfer of x/v/f), contact count rising as the blade settles, stable run. Envs: `SOFA_CONTACT_STIFFNESS`, `SOFA_BLADE_DROP_HEIGHT`, `SOFA_CONTACT_REPORT_STATS`, `SOFA_RESIDENCY_FAIL_FAST`. See `reports/tier1_gpu_resident_loop_20260820.md` |
 
 Common scene helpers in `testscenes/dense_collision_benchmark_common.py`:
 
@@ -226,6 +227,7 @@ Every benchmark scene has a wrapper script in `scripts/` that sets the
 | Script | Scene(s) | Default mode |
 |---|---|---|
 | `run_full_benchmark_suite_wsl.sh` | **All canonical scenes** (small, large, v-t self, v-t cross, 5-way legs on the 14k scene, 3 xlarge-200k legs) in fast + validation modes | 160 steps/leg, one summary per leg; `SOFA_SUITE_ONLY='<regex>'` runs a filtered batch (useful under a wall-clock cap) |
+| `run_gpu_resident_scene_wsl.sh` | **The fully GPU-resident scene** (`gpu_resident_fem_contact.py`): FEM tissue + GPU collision + GPU contact response | prints the Gate-5 residency verdict, contact activity and timing |
 | `run_bigcell_parity_wsl.sh` | **Way-6 parity gate** — backend bench across the big-cell toggle matrix (factors 4/2/1, forced chunk loop, hash-build legs) | contacts must equal the FBP leg; `bigcell_pairs_tested` must equal `sortedgrid_unique_pairs` |
 | `run_ncu_bigcell_wsl.sh` | **Nsight Compute on the winning way-6 kernel** at the 14k / 80k / 200k triangle-count scales (standalone analogues) | fused duration, SM/DRAM throughput, achieved occupancy, and registers for every scale |
 | `run_bigcell_detailed_profile_wsl.sh` | **Reproducible winner deep profile** at the 14k / 80k / 200k triangle-count scales (standalone analogues) | production graph timing, graph-off CUDA-event stage timing, opt-in `clock64()` fused-internal counters/cycles, occupancy/resources, CSVs |

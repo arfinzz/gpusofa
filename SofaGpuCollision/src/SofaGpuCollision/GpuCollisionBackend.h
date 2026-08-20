@@ -568,6 +568,97 @@ struct BigCellStats
     std::uint64_t profiledContactEmitThreadCycles { 0 };
 };
 
+// ============================================================================
+// Contact consumption (Tier 1, 2026-07-15)
+// ----------------------------------------------------------------------------
+// Every proximity entry point above leaves its contacts in a DEVICE buffer and
+// records a handle to it. `accumulateContactPenaltyForces` turns that buffer
+// into forces on the two surfaces' vertices WITHOUT the contacts ever reaching
+// the host: one kernel decodes each contact's feature (VF/FV/EE) into per-
+// triangle-vertex weights, evaluates a proximity penalty law, and scatter-adds
+// into the caller's device force vectors.
+//
+// The caller passes DEVICE pointers to SOFA's CudaVec3f force/velocity vectors
+// (obtained via CudaVector::deviceWrite()/deviceRead() — never the host
+// accessors, which would copy the state back and defeat the whole point).
+//
+// The contact struct layout stays private to the CUDA translation unit (the
+// §7 API-boundary rule): callers never see a contact, only the resulting forces.
+// ============================================================================
+struct ContactPenaltyConfig
+{
+    // Penalty law: F = stiffness * max(0, contactDistance - distance)
+    //                - damping * (relative normal velocity), clamped to >= 0.
+    // contactDistance must match the value the contacts were generated with,
+    // otherwise the force turns on at the wrong separation.
+    float stiffness { 1000.0f };
+    float damping { 0.0f };
+    float contactDistance { 0.03f };
+};
+
+struct ContactPenaltyStats
+{
+    std::uint32_t contactCount { 0 };        // contacts in the device buffer
+    std::uint32_t activeContactCount { 0 };  // those actually producing force
+};
+
+// Accumulate penalty forces from the last proximity result for (firstSurfaceId,
+// secondSurfaceId). Returns false (with a diagnostic) if no handle was recorded
+// for that pair this frame — e.g. the pair produced no contacts, or a different
+// pair ran last.
+//
+// deviceFirstForces / deviceSecondForces: Vec3f* device pointers, accumulated
+// into (never overwritten). Velocity pointers may be null when damping == 0.
+SOFA_GPU_COLLISION_API bool accumulateContactPenaltyForces(
+    const ContactPenaltyConfig& config,
+    std::uint64_t firstSurfaceId,
+    std::uint64_t secondSurfaceId,
+    void* deviceFirstForces,
+    void* deviceSecondForces,
+    const void* deviceFirstVelocities,
+    const void* deviceSecondVelocities,
+    ContactPenaltyStats* stats,
+    std::string& diagnostic);
+
+// Stiffness-times-dx for implicit integration (SOFA's addDForce). Applies
+// K = kFactor * stiffness * (n outer n) for each active contact, projected
+// through the same per-vertex weights.
+SOFA_GPU_COLLISION_API bool accumulateContactPenaltyDForces(
+    const ContactPenaltyConfig& config,
+    std::uint64_t firstSurfaceId,
+    std::uint64_t secondSurfaceId,
+    float kFactor,
+    void* deviceFirstDForces,
+    void* deviceSecondDForces,
+    const void* deviceFirstDx,
+    const void* deviceSecondDx,
+    std::string& diagnostic);
+
+// Self-validation for the contact-force path (Gates 1 and 2). Runs the GPU
+// penalty kernel into freshly allocated device force vectors, recomputes the
+// same forces on the host from the downloaded contacts, and reports:
+//   * maxAbsErrorVsReference  — GPU vs CPU reference (Gate 1: must be ~0)
+//   * netForceMagnitude       — sum of ALL forces over both bodies
+//                               (Gate 2, Newton's third law: must be ~0)
+// Only used by tests/benchmarks: it synchronises and allocates, so it is not on
+// any simulation path.
+struct ContactForceValidation
+{
+    std::uint32_t contactCount { 0 };
+    std::uint32_t activeContactCount { 0 };
+    double maxAbsErrorVsReference { 0.0 };
+    double maxReferenceMagnitude { 0.0 };
+    double netForceMagnitude { 0.0 };      // |sum of every force vector|
+    double totalForceMagnitude { 0.0 };    // sum of |force| — the scale to judge the two above against
+};
+
+SOFA_GPU_COLLISION_API bool validateContactPenaltyForces(
+    const ContactPenaltyConfig& config,
+    const TriangleIndexedSurface& firstSurface,
+    const TriangleIndexedSurface& secondSurface,
+    ContactForceValidation* validation,
+    std::string& diagnostic);
+
 SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(
     const TriangleIndexedSurface& firstSurface,
     const TriangleIndexedSurface& secondSurface,

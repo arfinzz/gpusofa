@@ -1188,6 +1188,48 @@ contacts are identical in every mode (verified: 8-leg parity 8018/43,584, 200k
   duration-neutral but 3× SM%. The fastest configuration also had the LOWEST fused-kernel
   occupancy (30.3%) — occupancy remains the wrong metric for this kernel family.
 
+### 5.27  Tier 1 — closing the GPU loop (contact CONSUMER) — LANDED 2026-08-20
+
+Until now the collision pipeline had a producer and no consumer: contacts were computed on
+the device and then either sat unread or were copied into SOFA's host `DetectionOutput`,
+and every test scene was collision-only (no solver, no mass, no force field). This closes
+the loop. Report: **`reports/tier1_gpu_resident_loop_20260820.md`**.
+
+- **`cuda/detail/ContactForces.cuh`** (9th umbrella include, the consumer):
+  `contactVertexWeights` decodes a contact's feature (VF/FV/EE) + local index +
+  barycentrics into weights on the triangle's 3 vertices — factored out deliberately,
+  because the future constraint path needs exactly this to build Jacobian rows. Penalty
+  force kernel `F = max(0, k·(contactDistance − d) − c·vₙ)` scatters onto the 6 owning
+  vertices with `atomicAdd`; `addDForce` applies `K = k·(n⊗n)` for implicit integration.
+- **`RecordedContactHandle`**: all five proximity drivers record where their contacts live
+  plus the device triangle indices needed to resolve owning vertices. The contact struct
+  stays private to the CUDA TU (§7 boundary rule) — callers pass device force pointers.
+- **`CudaContactPenaltyForceField`** + **`GpuResidencyChecker`** components, and
+  **`testscenes/gpu_resident_fem_contact.py`**, the first scene in the repo with a solver,
+  mass, FEM and boundary conditions.
+- **The accessor rule everything rests on:** `ReadAccessor`/`WriteAccessor` call
+  `hostRead()`/`hostWrite()`, which copy the entire state vector to the host and mark the
+  device copy stale. All new code uses `deviceRead()`/`deviceWrite()` exclusively.
+- **Verified:** Gate 1 — GPU forces match an independent host reference to **2.5e-7
+  relative** across k = 100/1,000/25,000 (absolute error scales with k, relative stays
+  flat ⇒ float32 rounding, not logic). Gate 2 — Newton's third law to **7e-9**. Gate 3 —
+  contacts rise 27→85 as the blade settles, stable. **Gate 5 — `violations=0`: zero
+  device→host transfer of x/v/f, asserted every frame via
+  `vector_device::isHostValid()`, naming the offending vector on failure.**
+- **Bugs found:** (1) `sync_and_build_wsl.sh` never synced `CMakeLists.txt`, so new source
+  files produced a GREEN build that silently omitted them — caught only by checking
+  exported symbols, now fixed with a sync marker; (2) `MeshMatrixMass<CudaVec3f,CudaVec3f>`
+  segfaults in `copyVertexMass()` inside SOFA v25.12 itself (backtrace confirmed) — use
+  `UniformMass`; (3) two ODE solvers cannot couple through an interaction force field, so
+  both bodies must share one solver; (4) SOFA emits broad-phase pairs in its own order, so
+  the backend now accepts either surface order and swaps bindings internally; (5) the stub
+  backend was missing sorted-grid/big-cell entries — a latent CPU-only build break.
+- **Not claimed:** penalty response is not accurate contact physics (it interpenetrates by
+  construction, no true friction). That is the documented price of staying on the GPU;
+  constraint response remains CPU-bound until a GPU constraint solver exists.
+- **Next:** Tier 3 (Ogden hyperelastic + SLS-Ogden viscoelastic on GPU), planned in
+  `PLAN_TIER1_TIER3.md` including the `1/(λᵢ²−λⱼ²)` degenerate-stretch trap and Gate 4c.
+
 ---
 
 ## 6. Phase 11/12 follow-ups (landed 2026-05-25)

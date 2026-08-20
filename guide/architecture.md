@@ -5,7 +5,16 @@ works end to end. It is intended to be readable cold — if you have never seen
 the codebase before, start here. Sections build on each other; you can skim
 the headings to navigate.
 
-Last refreshed: **2026-07-23**. All **12 execution modes** (6 ways × their toggle combos)
+Last refreshed: **2026-08-20**. **Tier 1 landed: the GPU loop is closed.** Contacts no
+longer dead-end in a device buffer — `CudaContactPenaltyForceField` consumes them on the
+device and scatters forces straight into SOFA's `CudaVec3f` force vectors, so a frame runs
+FEM + collision + contact response with **zero device-to-host transfer of simulation
+state**. Proven by assertion (`GpuResidencyChecker` reads `vector_device::isHostValid()`
+each frame → `violations=0`) and numerically (GPU forces match an independent host
+reference to ~2.5e-7 relative; Newton's third law to ~7e-9). See
+`reports/tier1_gpu_resident_loop_20260820.md`; first simulating scene is
+`testscenes/gpu_resident_fem_contact.py`.
+Previously (2026-07-23): all **12 execution modes** (6 ways × their toggle combos)
 are measured with identical contacts everywhere; the champion is way 6 with the
 **shared-memory hash build** (`bigcell_sharedhash`: 0.290 ms narrow kernel on the 14k
 scene, 0.564 / 0.806 ms at the 80k / 200k benches — 16–26% ahead of way 5 and ~5× the

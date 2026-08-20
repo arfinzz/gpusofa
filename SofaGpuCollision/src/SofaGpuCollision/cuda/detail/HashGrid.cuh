@@ -1335,6 +1335,10 @@ bool computeHashPrefixSumProximityContacts(
         executionStats->gridCellCount = cellCount;
     }
 
+    recordContactHandle(
+        ws.proximityContacts, ws.proximityContactCount, proximityConfig.maxContacts,
+        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId);
+
     diagnostic.clear();
     return true;
 }

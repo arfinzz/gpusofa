@@ -25,6 +25,56 @@ struct DeviceProximityContact
     float         signedDistance;
 };
 
+// ============================================================================
+// Device contact handle (Tier 1). Every proximity driver records where its
+// contacts live so the contact-consuming kernels (ContactForces.cuh) can read
+// them WITHOUT a host round trip. The handle also carries the device triangle
+// index arrays, because turning a contact into vertex forces needs to know
+// which vertices each contacted triangle owns.
+//
+// Single-slot (last pair wins) rather than a map: the narrow phase computes a
+// pair and consumes it before moving on, and the surface ids let the consumer
+// verify it is reading the pair it asked for.
+// ============================================================================
+struct RecordedContactHandle
+{
+    const DeviceProximityContact* contacts { nullptr };
+    const std::uint32_t* countDevice { nullptr };
+    std::uint32_t capacity { 0 };
+    const std::uint32_t* firstIndices { nullptr };   // 3 per triangle, device
+    const std::uint32_t* secondIndices { nullptr };
+    std::uint64_t firstSurfaceId { 0 };
+    std::uint64_t secondSurfaceId { 0 };
+    bool valid { false };
+};
+
+RecordedContactHandle& lastContactHandle()
+{
+    static RecordedContactHandle handle;
+    return handle;
+}
+
+void recordContactHandle(
+    const void* contacts,
+    const std::uint32_t* countDevice,
+    const std::uint32_t capacity,
+    const std::uint32_t* firstIndices,
+    const std::uint32_t* secondIndices,
+    const std::uint64_t firstSurfaceId,
+    const std::uint64_t secondSurfaceId)
+{
+    RecordedContactHandle& handle = lastContactHandle();
+    handle.contacts = static_cast<const DeviceProximityContact*>(contacts);
+    handle.countDevice = countDevice;
+    handle.capacity = capacity;
+    handle.firstIndices = firstIndices;
+    handle.secondIndices = secondIndices;
+    handle.firstSurfaceId = firstSurfaceId;
+    handle.secondSurfaceId = secondSurfaceId;
+    handle.valid = (handle.contacts != nullptr && countDevice != nullptr &&
+                    firstIndices != nullptr && secondIndices != nullptr);
+}
+
 // Ericson 5.1.5 — closest point on triangle (a,b,c) to point p, in barycentrics.
 // Returns make_float3(u,v,w) with u+v+w==1 such that closest = u*a + v*b + w*c.
 __device__ __forceinline__ float3 closestPointOnTriangleBary(
@@ -859,6 +909,11 @@ bool computeFeatureBasedProximityContacts(
         executionStats->outputContactCount = hostContactCount;
         if (hostOverflowCount > 0) executionStats->overflowCount += hostOverflowCount;
     }
+
+    recordContactHandle(
+        workspace.proximityContacts, workspace.proximityContactCount, proximityConfig.maxContacts,
+        workspace.indexedTissueIndices, workspace.indexedToolIndices,
+        firstSurface.surfaceId, secondSurface.surfaceId);
 
     diagnostic.clear();
     return true;

@@ -160,4 +160,104 @@ bool computeHashPrefixSumProximityContacts(
     return false;
 }
 
+bool computeSimpleHashProximityContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const HashPrefixSumConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    HashPrefixSumStats* hashStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr) *executionStats = BackendExecutionStats {};
+    if (proximityStats != nullptr) *proximityStats = FeatureBasedProximityStats {};
+    if (hashStats != nullptr) *hashStats = HashPrefixSumStats {};
+    diagnostic = "GPU simple-hash proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool computeSortedGridProximityContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const SortedGridConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    SortedGridStats* sortedStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr) *executionStats = BackendExecutionStats {};
+    if (proximityStats != nullptr) *proximityStats = FeatureBasedProximityStats {};
+    if (sortedStats != nullptr) *sortedStats = SortedGridStats {};
+    diagnostic = "GPU sorted-grid proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool computeBigCellFusedProximityContacts(
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    const DenseGridConfig&,
+    const BigCellConfig&,
+    const FeatureBasedProximityConfig&,
+    std::vector<ProximityContact>&,
+    FeatureBasedProximityStats* proximityStats,
+    BigCellStats* bigStats,
+    std::string& diagnostic,
+    BackendExecutionStats* executionStats)
+{
+    if (executionStats != nullptr) *executionStats = BackendExecutionStats {};
+    if (proximityStats != nullptr) *proximityStats = FeatureBasedProximityStats {};
+    if (bigStats != nullptr) *bigStats = BigCellStats {};
+    diagnostic = "GPU big-cell fused proximity is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool validateContactPenaltyForces(
+    const ContactPenaltyConfig&,
+    const TriangleIndexedSurface&,
+    const TriangleIndexedSurface&,
+    ContactForceValidation* validation,
+    std::string& diagnostic)
+{
+    if (validation != nullptr) *validation = ContactForceValidation {};
+    diagnostic = "Contact-force validation is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool accumulateContactPenaltyForces(
+    const ContactPenaltyConfig&,
+    std::uint64_t,
+    std::uint64_t,
+    void*,
+    void*,
+    const void*,
+    const void*,
+    ContactPenaltyStats* stats,
+    std::string& diagnostic)
+{
+    if (stats != nullptr) *stats = ContactPenaltyStats {};
+    diagnostic = "GPU contact penalty forces are unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+bool accumulateContactPenaltyDForces(
+    const ContactPenaltyConfig&,
+    std::uint64_t,
+    std::uint64_t,
+    float,
+    void*,
+    void*,
+    const void*,
+    const void*,
+    std::string& diagnostic)
+{
+    diagnostic = "GPU contact penalty dforces are unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
 } // namespace SofaGpuCollision::backend

@@ -32,7 +32,8 @@
 // byte-identical to the pre-split monolith), so the modules below are textual
 // includes, NOT separate compilation units. Include order is dependency order:
 // common device math -> dense grid (owns the shared cell math + pair dedup) ->
-// legacy paths -> FBP kernels -> hash -> simple hash -> sorted grid.
+// legacy paths -> FBP kernels -> hash -> simple hash -> sorted grid ->
+// big-cell fused -> contact forces (the CONSUMER, needs every producer above).
 // Each module holds one concern's workspace + kernels + host driver(s).
 // ============================================================================
 
@@ -44,3 +45,4 @@
 #include "detail/SimpleHash.cuh"
 #include "detail/SortedGrid.cuh"
 #include "detail/BigCellGrid.cuh"
+#include "detail/ContactForces.cuh"

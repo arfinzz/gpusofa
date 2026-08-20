@@ -7,3 +7,6 @@ SofaGpuCollision/build-wsl*/
 
 output/*
 !output/README.md
+
+# Separate checkout that lives inside the working tree; not part of this repo.
+labsofa-git/

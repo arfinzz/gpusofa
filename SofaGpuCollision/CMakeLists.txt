@@ -31,6 +31,18 @@ set(SOURCE_FILES
     src/SofaGpuCollision/GpuPipelineProfiling.cpp
 )
 
+# Tier 1 contact-consumer components. They include SofaCUDA headers directly
+# (CudaTypes / CudaTriangleModel), so they only build in the CUDA configuration;
+# the CPU-only build keeps the stub backend and simply omits them.
+set(CUDA_COMPONENT_HEADER_FILES
+    src/SofaGpuCollision/CudaContactPenaltyForceField.h
+    src/SofaGpuCollision/GpuResidencyChecker.h
+)
+set(CUDA_COMPONENT_SOURCE_FILES
+    src/SofaGpuCollision/CudaContactPenaltyForceField.cpp
+    src/SofaGpuCollision/GpuResidencyChecker.cpp
+)
+
 if(SOFAGPUCOLLISION_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -69,6 +81,8 @@ if(SOFAGPUCOLLISION_ENABLE_CUDA)
         message(FATAL_ERROR "SOFAGPUCOLLISION_ENABLE_CUDA requires the installed SofaCUDA headers and library.")
     endif()
     list(REMOVE_ITEM SOURCE_FILES src/SofaGpuCollision/GpuCollisionBackendStub.cpp)
+    list(APPEND HEADER_FILES ${CUDA_COMPONENT_HEADER_FILES})
+    list(APPEND SOURCE_FILES ${CUDA_COMPONENT_SOURCE_FILES})
     list(APPEND SOURCE_FILES src/SofaGpuCollision/cuda/GpuCollisionBackend.cu)
 endif()
 

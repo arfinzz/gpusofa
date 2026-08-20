@@ -11,6 +11,9 @@ echo "SRC=${SRC}"
 echo "DST=${DST}"
 
 rsync -a "${SRC}/SofaGpuCollision/src/" "${DST}/SofaGpuCollision/src/"
+# CMakeLists must sync too: adding a source file on Windows and forgetting this
+# produced a GREEN build that silently omitted the new components (2026-07-15).
+rsync -a "${SRC}/SofaGpuCollision/CMakeLists.txt" "${DST}/SofaGpuCollision/CMakeLists.txt"
 rsync -a "${SRC}/testscenes/"           "${DST}/testscenes/"
 rsync -a "${SRC}/scripts/"              "${DST}/scripts/"
 
@@ -18,6 +21,7 @@ echo "--- sync markers (expect non-zero) ---"
 grep -c computeSimpleHashProximityContacts "${DST}/SofaGpuCollision/src/SofaGpuCollision/cuda/GpuCollisionBackend.cu"
 grep -c useSimpleHashGeneration            "${DST}/SofaGpuCollision/src/SofaGpuCollision/GpuCollisionNarrowPhase.cpp"
 grep -c computeSimpleHashProximityContacts "${DST}/SofaGpuCollision/src/tools/DenseGridBackendBench.cpp"
+grep -c CudaContactPenaltyForceField       "${DST}/SofaGpuCollision/CMakeLists.txt"
 
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 BUILD="${DST}/SofaGpuCollision/build-profile"

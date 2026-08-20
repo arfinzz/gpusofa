@@ -1071,5 +1071,87 @@ int main()
                   << "sortedgrid_unique_pairs (home-cell rule at the same small-cell granularity).\n";
     }
 
+    if (envBool("SOFA_BACKEND_BENCH_RUN_CONTACT_FORCES", true))
+    {
+        std::cout << "\n--- gate 1+2: GPU contact forces vs host reference (Tier 1) ---\n";
+        const auto tissueIndexed = packedToIndexed(tissue);
+        const auto bladeIndexed = packedToIndexed(blade);
+
+        const TriangleIndexedSurface tissueSurface = makeIndexedSurface(tissueIndexed, tissue.size(), 0xC001ull);
+        const TriangleIndexedSurface bladeSurface = makeIndexedSurface(bladeIndexed, blade.size(), 0xC002ull);
+
+        // Generate contacts with the default (fastest) way, then validate the
+        // forces derived from them.
+        SofaGpuCollision::backend::BigCellConfig bigConfig;
+        const FeatureBasedProximityConfig fbpConfig = makeBenchFbpConfig(config);
+
+        std::vector<ProximityContact> ignored;
+        FeatureBasedProximityStats proximityStats;
+        SofaGpuCollision::backend::BigCellStats bigStatsOut;
+        SofaGpuCollision::backend::BackendExecutionStats stats;
+        std::string diagnostic;
+
+        const bool contactsOk = SofaGpuCollision::backend::computeBigCellFusedProximityContacts(
+            tissueSurface, bladeSurface, config, bigConfig, fbpConfig,
+            ignored, &proximityStats, &bigStatsOut, diagnostic, &stats);
+        if (!contactsOk)
+        {
+            std::cerr << "Contact-force gate: contact generation failed: " << diagnostic << "\n";
+            return 9;
+        }
+
+        // Sweep stiffness: the penalty law is linear in k, so the reference must
+        // track the GPU at every scale (catches clamping / precision surprises
+        // that a single stiffness would hide).
+        const float stiffnesses[] = { 100.0f, 1000.0f, 25000.0f };
+        bool allPassed = true;
+        for (const float stiffness : stiffnesses)
+        {
+            SofaGpuCollision::backend::ContactPenaltyConfig penaltyConfig;
+            penaltyConfig.stiffness = stiffness;
+            penaltyConfig.damping = 0.0f;
+            penaltyConfig.contactDistance = config.contactDistance;
+
+            SofaGpuCollision::backend::ContactForceValidation validation;
+            const bool ok = SofaGpuCollision::backend::validateContactPenaltyForces(
+                penaltyConfig, tissueSurface, bladeSurface, &validation, diagnostic);
+            if (!ok)
+            {
+                std::cerr << "Contact-force gate failed at k=" << stiffness << ": " << diagnostic << "\n";
+                return 10;
+            }
+
+            // Gate 1: GPU == host reference. Compared relative to the largest
+            // reference force so the threshold means the same thing at any k.
+            const double relError = validation.maxReferenceMagnitude > 0.0
+                ? validation.maxAbsErrorVsReference / validation.maxReferenceMagnitude
+                : validation.maxAbsErrorVsReference;
+            // Gate 2: Newton's third law, relative to the total force magnitude.
+            const double relNet = validation.totalForceMagnitude > 0.0
+                ? validation.netForceMagnitude / validation.totalForceMagnitude
+                : validation.netForceMagnitude;
+
+            const bool gate1 = relError < 1e-5;
+            const bool gate2 = relNet < 1e-5;
+            allPassed = allPassed && gate1 && gate2;
+
+            std::cout << "contactforce_k=" << stiffness
+                      << " contacts=" << validation.contactCount
+                      << " active=" << validation.activeContactCount
+                      << " max_abs_err=" << validation.maxAbsErrorVsReference
+                      << " max_ref=" << validation.maxReferenceMagnitude
+                      << " rel_err=" << relError << (gate1 ? " [GATE1 PASS]" : " [GATE1 FAIL]")
+                      << " net_force=" << validation.netForceMagnitude
+                      << " total_force=" << validation.totalForceMagnitude
+                      << " rel_net=" << relNet << (gate2 ? " [GATE2 PASS]" : " [GATE2 FAIL]")
+                      << '\n';
+        }
+
+        std::cout << "CONTACT_FORCE_GATES=" << (allPassed ? "PASS" : "FAIL") << '\n'
+                  << "  gate 1 = GPU forces match an independent host reference computed from the same contacts\n"
+                  << "  gate 2 = sum of all forces over both bodies is zero (Newton's third law)\n";
+        if (!allPassed) return 11;
+    }
+
     return 0;
 }
