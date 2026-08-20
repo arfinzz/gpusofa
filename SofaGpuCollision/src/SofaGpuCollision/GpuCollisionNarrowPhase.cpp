@@ -729,6 +729,13 @@ void GpuCollisionNarrowPhase::init()
 {
     sofa::component::collision::detection::algorithm::BVHNarrowPhase::init();
 
+    // Contact handles are keyed by collision-model POINTER and live in a
+    // process-wide registry. A reloaded scene can allocate a new model at a
+    // recycled address, which would match a stale entry and hand the contact
+    // force kernel dangling device pointers from the previous scene. Dropping
+    // them here makes scene (re)build the single point where that can happen.
+    backend::clearRecordedContactHandles();
+
     const auto status = backend::probe();
     m_backendAvailable = status.available;
     m_reportedFallback = false;

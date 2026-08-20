@@ -663,6 +663,12 @@ struct ContactForceValidation
     bool contactPointCheckRan { false };   // false when host positions were unavailable
 };
 
+// Drop every recorded contact handle. MUST be called when the scene is (re)built:
+// handles are keyed by collision-model POINTER, and a reloaded scene can allocate
+// a new model at the same address, which would match a stale entry and hand the
+// force kernel dangling device pointers from the previous scene.
+SOFA_GPU_COLLISION_API void clearRecordedContactHandles();
+
 SOFA_GPU_COLLISION_API bool validateContactPenaltyForces(
     const ContactPenaltyConfig& config,
     const TriangleIndexedSurface& firstSurface,

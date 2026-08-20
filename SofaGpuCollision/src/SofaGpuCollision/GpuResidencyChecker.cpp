@@ -3,6 +3,7 @@
 #include <sofa/core/ObjectFactory.h>
 #include <sofa/core/behavior/MechanicalState.h>
 #include <sofa/helper/logging/Messaging.h>
+#include <sofa/simulation/AnimateBeginEvent.h>
 #include <sofa/simulation/AnimateEndEvent.h>
 
 #include <sstream>
@@ -39,7 +40,7 @@ void GpuResidencyChecker::init()
     this->f_listening.setValue(true);
 }
 
-void GpuResidencyChecker::checkFrame()
+void GpuResidencyChecker::checkFrame(const char* phase)
 {
     // Every CudaVec3f mechanical state below this component's context.
     std::vector<sofa::core::behavior::MechanicalState<DataTypes>*> states;
@@ -81,7 +82,7 @@ void GpuResidencyChecker::checkFrame()
         {
             m_reportedViolation = true;
             const std::string message =
-                "DEVICE->HOST TRANSFER DETECTED at frame " + std::to_string(m_frame) +
+                std::string("DEVICE->HOST TRANSFER DETECTED at ") + phase + " of frame " + std::to_string(m_frame) +
                 ". These vectors were copied to the host: " + offenders.str() +
                 ". A CPU component is reading GPU state (helper::ReadAccessor / operator[] / "
                 "hostRead all trigger this). Further occurrences suppressed; a summary follows at the end.";
@@ -104,12 +105,32 @@ void GpuResidencyChecker::checkFrame()
 
 void GpuResidencyChecker::handleEvent(sofa::core::objectmodel::Event* event)
 {
-    if (sofa::simulation::AnimateEndEvent::checkEventType(event))
+    // Sample at BOTH ends of the step, not just the end.
+    //
+    // A single end-of-frame sample can be fooled: hostRead() sets hostIsValid
+    // true but leaves deviceIsValid true, so a CPU component that reads state
+    // mid-frame and is FOLLOWED by any deviceWrite() (e.g. the contact force
+    // field) leaves hostIsValid false again by frame end — the transfer happened
+    // and the end-of-frame check would still report clean. Sampling at the start
+    // of the step catches exactly that window, because nothing has written to
+    // the device yet to mask it.
+    //
+    // This still cannot prove the absence of a mid-step read that is masked
+    // before BOTH sample points; that would need memcpy-level interception in
+    // SofaCUDA. Documented rather than overclaimed.
+    if (sofa::simulation::AnimateBeginEvent::checkEventType(event))
+    {
+        if (m_frame >= static_cast<std::uint64_t>(d_startFrame.getValue()))
+        {
+            checkFrame("frame-begin");
+        }
+    }
+    else if (sofa::simulation::AnimateEndEvent::checkEventType(event))
     {
         ++m_frame;
         if (m_frame >= static_cast<std::uint64_t>(d_startFrame.getValue()))
         {
-            checkFrame();
+            checkFrame("frame-end");
         }
     }
     sofa::core::objectmodel::BaseObject::handleEvent(event);

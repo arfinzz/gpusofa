@@ -94,6 +94,11 @@ private:
     /// pointer, so this component resolves the same way.
     std::uint64_t resolveSurfaceId(const sofa::core::behavior::MechanicalState<DataTypes>* state, bool first) const;
 
+    /// Resolved once in init(): resolveSurfaceId walks the scene graph, which is
+    /// far too expensive to repeat twice per addForce, every frame.
+    std::uint64_t m_firstSurfaceId { 0 };
+    std::uint64_t m_secondSurfaceId { 0 };
+
     bool m_reportedFailure { false };
     std::uint32_t m_lastContactCount { 0 };
     std::uint32_t m_lastActiveContactCount { 0 };

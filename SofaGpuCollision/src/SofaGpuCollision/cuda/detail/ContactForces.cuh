@@ -447,6 +447,17 @@ bool accumulateContactPenaltyDForces(
 // force vectors over BOTH bodies must give ~0 regardless of the penalty law —
 // it tests only the scatter, which is where sign and index errors live.
 // ----------------------------------------------------------------------------
+void clearRecordedContactHandles()
+{
+    ContactHandleRegistry& registry = contactHandleRegistry();
+    for (auto& handle : registry.slots)
+    {
+        handle = RecordedContactHandle {};
+    }
+    registry.nextSlot = 0;
+    registry.evictions = 0;
+}
+
 bool validateContactPenaltyForces(
     const ContactPenaltyConfig& config,
     const TriangleIndexedSurface& firstSurface,

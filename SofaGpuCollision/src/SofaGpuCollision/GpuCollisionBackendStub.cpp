@@ -217,6 +217,10 @@ bool computeBigCellFusedProximityContacts(
     return false;
 }
 
+void clearRecordedContactHandles()
+{
+}
+
 bool validateContactPenaltyForces(
     const ContactPenaltyConfig&,
     const TriangleIndexedSurface&,

@@ -60,7 +60,7 @@ private:
     DataUInt d_reportInterval;  ///< 0 = report only violations
     DataBool d_failFast;        ///< msg_error (visible + test-failing) instead of msg_warning
 
-    void checkFrame();
+    void checkFrame(const char* phase);
 
     std::uint64_t m_frame { 0 };
     std::uint64_t m_violationFrames { 0 };

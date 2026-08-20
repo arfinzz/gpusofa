@@ -73,8 +73,13 @@ void CudaContactPenaltyForceField::init()
 {
     Inherit::init();
 
-    const auto firstId = resolveSurfaceId(this->mstate1, true);
-    const auto secondId = resolveSurfaceId(this->mstate2, false);
+    // Resolve ONCE. resolveSurfaceId walks the scene graph (get<T>(SearchDown)),
+    // which is far too expensive to repeat twice per addForce, every frame.
+    m_firstSurfaceId = resolveSurfaceId(this->mstate1, true);
+    m_secondSurfaceId = resolveSurfaceId(this->mstate2, false);
+
+    const auto firstId = m_firstSurfaceId;
+    const auto secondId = m_secondSurfaceId;
     if (firstId == 0u || secondId == 0u)
     {
         msg_warning() << "Could not resolve both surface ids from context "
@@ -90,8 +95,8 @@ void CudaContactPenaltyForceField::addForce(
     const DataVecCoord& /*x1*/, const DataVecCoord& /*x2*/,
     const DataVecDeriv& v1, const DataVecDeriv& v2)
 {
-    const auto firstId = resolveSurfaceId(this->mstate1, true);
-    const auto secondId = resolveSurfaceId(this->mstate2, false);
+    const auto firstId = m_firstSurfaceId;
+    const auto secondId = m_secondSurfaceId;
     if (firstId == 0u || secondId == 0u)
     {
         return;
@@ -164,8 +169,8 @@ void CudaContactPenaltyForceField::addDForce(
     DataVecDeriv& df1, DataVecDeriv& df2,
     const DataVecDeriv& dx1, const DataVecDeriv& dx2)
 {
-    const auto firstId = resolveSurfaceId(this->mstate1, true);
-    const auto secondId = resolveSurfaceId(this->mstate2, false);
+    const auto firstId = m_firstSurfaceId;
+    const auto secondId = m_secondSurfaceId;
     if (firstId == 0u || secondId == 0u)
     {
         return;

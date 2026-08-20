@@ -60,6 +60,18 @@ BLADE_MASS = float(os.environ.get("SOFA_BLADE_MASS", "0.05"))
 BLADE_DROP_HEIGHT = float(os.environ.get("SOFA_BLADE_DROP_HEIGHT", "0.6"))
 
 CONTACT_REPORT_STATS = env_flag("SOFA_CONTACT_REPORT_STATS", False)
+# Diagnostic: drop the collision models + pipeline entirely. Used to attribute a
+# device->host transfer of `position` seen at frame-begin: if it disappears with
+# collision off, the culprit is SOFA's collision-model bookkeeping (namely
+# TriangleCollisionModel::computeBoundingTree, for which SofaCUDA provides no
+# GPU override) rather than the solver or the force fields.
+NO_COLLISION = env_flag("SOFA_DIAG_NO_COLLISION", False)
+# Diagnostic bisect: drop the benchmark controller / the FEM force field /
+# the topology geometry algorithms, to attribute the frame-begin position
+# transfer to a specific component.
+NO_BENCH = env_flag("SOFA_DIAG_NO_BENCH", False)
+NO_FEM = env_flag("SOFA_DIAG_NO_FEM", False)
+NO_GEOMALGO = env_flag("SOFA_DIAG_NO_GEOMALGO", False)
 RESIDENCY_FAIL_FAST = env_flag("SOFA_RESIDENCY_FAIL_FAST", False)
 RESIDENCY_START_FRAME = int(os.environ.get("SOFA_RESIDENCY_START_FRAME", "5"))
 DETAILED_PROFILING = env_flag("SOFA_GPU_DETAILED_PROFILING", False)
@@ -100,10 +112,11 @@ def createScene(root):
 
     # collision -> integrate ordering; the contact buffer is consumed during the solve.
     root.addObject('DefaultAnimationLoop')
-    root.addObject('CollisionPipeline')
-    root.addObject('GpuCollisionBroadPhase', enableGPU=True, allowCPUFallback=True,
+    if not NO_COLLISION:
+      root.addObject('CollisionPipeline')
+      root.addObject('GpuCollisionBroadPhase', enableGPU=True, allowCPUFallback=True,
                    logBackendStatus=True, useObjectAabbCulling=False)
-    root.addObject(
+      root.addObject(
         'GpuCollisionNarrowPhase',
         enableGPU=True,
         allowCPUFallback=True,
@@ -132,8 +145,8 @@ def createScene(root):
         maxToolTrianglesPerCell=128,
         maxCandidatePairs=4000000,
     )
-    root.addObject('LocalMinDistance', alarmDistance=CONTACT_DISTANCE * 2.0,
-                   contactDistance=CONTACT_DISTANCE, angleCone=0.0)
+      root.addObject('LocalMinDistance', alarmDistance=CONTACT_DISTANCE * 2.0,
+                     contactDistance=CONTACT_DISTANCE, angleCone=0.0)
 
     # ---- ONE solver over both bodies ----------------------------------------
     # Tissue and blade share a single ODE + linear solver so the contact force
@@ -155,7 +168,8 @@ def createScene(root):
                      position=tissue_positions)
     tissue.addObject('TetrahedronSetTopologyContainer', name='topo',
                      tetrahedra=tissue_tets)
-    tissue.addObject('TetrahedronSetGeometryAlgorithms', template='CudaVec3f')
+    if not NO_GEOMALGO:
+        tissue.addObject('TetrahedronSetGeometryAlgorithms', template='CudaVec3f')
     # NOTE: MeshMatrixMass<CudaVec3f,CudaVec3f> SEGFAULTS in copyVertexMass()
     # during init in this SOFA build (v25.12) — verified with a backtrace, and it
     # is a fault inside SOFA's own component, not in this scene. UniformMass is
@@ -163,7 +177,8 @@ def createScene(root):
     # Gate-3 equilibrium prediction easier to reason about.
     tissue.addObject('UniformMass', template='CudaVec3f',
                      name='mass', totalMass=TISSUE_TOTAL_MASS)
-    tissue.addObject('TetrahedronFEMForceField', template='CudaVec3f', name='fem',
+    if not NO_FEM:
+      tissue.addObject('TetrahedronFEMForceField', template='CudaVec3f', name='fem',
                      method='large', youngModulus=TISSUE_YOUNG, poissonRatio=TISSUE_POISSON)
     tissue.addObject('FixedProjectiveConstraint', template='CudaVec3f',
                      name='fixed', indices=fixed_indices)
@@ -172,7 +187,8 @@ def createScene(root):
     # (the surface triangles index the same vertices — no mapping needed).
     tissue_surface_node = tissue.addChild('TissueSurface')
     tissue_surface_node.addObject('MeshTopology', name='surftopo', triangles=tissue_surface)
-    tissue_surface_node.addObject('TriangleCollisionModel', name='tissueCM', selfCollision=False)
+    if not NO_COLLISION:
+        tissue_surface_node.addObject('TriangleCollisionModel', name='tissueCM', selfCollision=False)
 
     # ---- tool: blade falling under gravity ----
     blade = sim.addChild('Blade')
@@ -181,13 +197,15 @@ def createScene(root):
     blade.addObject('MeshTopology', name='topo', triangles=blade_tris)
     blade.addObject('UniformMass', template='CudaVec3f', name='mass',
                     totalMass=BLADE_MASS)
-    blade.addObject('TriangleCollisionModel', name='bladeCM', selfCollision=False)
+    if not NO_COLLISION:
+        blade.addObject('TriangleCollisionModel', name='bladeCM', selfCollision=False)
 
     # ---- the contact consumer: device contacts -> device forces ----
     # Inside the solver node so the solver sees it; it resolves each surface id
     # from the CudaTriangleCollisionModel in that state's context, matching the
     # ids the narrow phase recorded alongside the contacts.
-    sim.addObject(
+    if not NO_COLLISION:
+      sim.addObject(
         'CudaContactPenaltyForceField',
         name='contactForces',
         object1='@Tissue/dofs',
@@ -216,7 +234,8 @@ def createScene(root):
         printLog=True,   # so the clean/violation tally is visible in the log
     )
 
-    root.addObject(
+    if not NO_BENCH:
+      root.addObject(
         'GpuPipelineBenchmarkController',
         name='GpuResidentTiming',
         label='gpu_resident_fem_contact' + BENCHMARK_LABEL_SUFFIX,
