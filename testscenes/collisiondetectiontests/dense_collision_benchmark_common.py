@@ -194,4 +194,6 @@ def build_blade_grid(rows=4, cols=4, spacing_x=3.1, spacing_z=3.1, start_y=3.6):
 
 
 def default_benchmark_log_dir(base_dir):
-    return os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(base_dir, "output", "benchmark_logs"))
+    # Scenes live in <repo>/testscenes/<group>/, so default to the repo's git-ignored output/.
+    repo_root = os.path.abspath(os.path.join(base_dir, os.pardir, os.pardir))
+    return os.environ.get("SOFA_BENCHMARK_LOG_DIR", os.path.join(repo_root, "output", "benchmark_logs"))

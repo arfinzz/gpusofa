@@ -6,4 +6,4 @@ This folder is the local home for generated run output:
 - `report_render_profiles/` for browser render profiles used while producing reports.
 - `scene_size_scaling/` for generated scaling CSV/SVG result assets.
 
-The folder contents are intentionally ignored by git except for this README. Keep durable written analysis in `reports/` and operational source-of-truth docs in `guide/`.
+The folder contents are intentionally ignored by git except for this README. Keep durable written analysis in `reports/` and the operational source of truth in the root `README.md`.

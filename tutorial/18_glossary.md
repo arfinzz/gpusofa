@@ -339,11 +339,10 @@ elements, ~322,560 candidate pairs, 8,018 contacts (5397 VF / 880 FV / 1741 EE),
 
 ## Where to go deeper
 
-- `guide/architecture.md` — the full reference (every struct, every kernel,
-  every dispatch branch, with source line references).
-- `guide/plan.md` — the project's build history, why each decision was made.
-- `guide/setup.md` — how to build, run, and profile on your machine.
-- `reports/gpu_collision_phase11_12_kernel_profile_20260525.md` — the Nsight
+- the root `README.md` — the source-of-truth reference: how everything works,
+  every setting, how to build, run and profile, and the current results.
+- `IDEAS.md` and the dated reports in `reports/` — why each decision was made.
+- `reports/archive_pre_20260525/gpu_collision_phase11_12_kernel_profile_20260525.md` — the Nsight
   kernel-level findings.
 
 You've now traced the entire pipeline from the Python scene to the GPU contacts

@@ -3,7 +3,7 @@
 Running record of every optimization idea we have discussed — the good, the bad, and the
 already-buried — so nothing gets re-litigated or re-invented from scratch. Measured numbers
 come from the canonical report ([reports/performance_all_modes_20260715.md](reports/performance_all_modes_20260715.md));
-architecture background lives in [guide/architecture.md](guide/architecture.md).
+architecture background lives in the root [README.md](README.md).
 
 Last updated: 2026-07-15 (status pass: §2 and §3 are now IMPLEMENTED — see the ✅ blocks
 inside them; ranked list in §11 refreshed).

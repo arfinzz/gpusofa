@@ -1,0 +1,6 @@
+# Scripts and scenes run inside WSL (Linux). They must keep LF line endings on
+# Windows too: bash fails on a CR at the end of a line (for example
+# "syntax error near unexpected token $'do\r'"), and the sync script copies the
+# Windows working files into WSL as-is.
+*.sh    text eol=lf
+*.py    text eol=lf

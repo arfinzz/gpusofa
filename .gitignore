@@ -1,9 +1,8 @@
 __pycache__/
 *.pyc
 
-SofaGpuCollision/build-mingw/
-SofaGpuCollision/build-wsl/
-SofaGpuCollision/build-wsl*/
+# Local build folders (the real build lives in WSL: SofaGpuCollision/build-profile/).
+SofaGpuCollision/build*/
 
 output/*
 !output/README.md

@@ -3,7 +3,7 @@
 This tutorial explains, from the ground up, **exactly** what this project does and how —
 assuming **no prior knowledge** of SOFA, GPUs, or CUDA. Every claim is grounded in the
 real code (file and function names are given). It is the gentle, example-driven
-companion to `guide/architecture.md` (the terse reference).
+companion to the root `README.md` (the reference).
 
 It reflects the **current** state of the project: the **five broad-cull ways** (dense,
 Phase-15 dense, optimised hash, simple direct-bucket hash, sorted grid), the four
@@ -59,7 +59,7 @@ chapters are **references** (look-up tables, not bedtime reading): 17 and 18.
 > [reports/README_metrics_explained.md](../reports/README_metrics_explained.md) defines
 > every benchmark number; the current measured results + full optimization history are in
 > [reports/performance_all_modes_20260715.md](../reports/performance_all_modes_20260715.md);
-> `guide/architecture.md` and `guide/plan.md` are the terse engineering references.
+> the root `README.md` is the engineering reference and the source of truth.
 
 > **Diagrams.** Chapters 00, 07, 08, 13, 15, 16 use ```mermaid``` blocks — they render as
 > real flowcharts on GitHub, VS Code, and most markdown viewers. Chapters 07–08 also embed

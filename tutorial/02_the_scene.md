@@ -1,6 +1,6 @@
 # 02 — The Scene File, Line by Line
 
-We'll read `testscenes/one_tissue_one_blade.py` from top to
+We'll read `testscenes/collisiondetectiontests/one_tissue_one_blade.py` from top to
 bottom. This is the file SOFA loads to build the benchmark. Open it alongside
 this tutorial.
 

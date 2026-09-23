@@ -11,7 +11,7 @@
 #   hash       large tissue + large tool     (dense vs hash+prefix-sum A/B)
 #
 # Each leg writes its own summary under $RUNDIR/<leg>/. Compare against the
-# documented historical numbers in guide/plan.md.
+# expected contact counts in README.md (section 10).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,12 +56,12 @@ run_leg() {
             "${scene}"
 }
 
-SMALL="${REPO_DIR}/testscenes/one_tissue_one_blade.py"
-LARGE="${REPO_DIR}/testscenes/large_tissue_blade.py"
-VT_SELF="${REPO_DIR}/testscenes/self_collision_vertex_triangle.py"
-VT_CROSS="${REPO_DIR}/testscenes/cross_model_vertex_triangle.py"
-HASH="${REPO_DIR}/testscenes/hash_prefixsum_large.py"
-XLARGE="${REPO_DIR}/testscenes/collision_xlarge_200k.py"
+SMALL="${REPO_DIR}/testscenes/collisiondetectiontests/one_tissue_one_blade.py"
+LARGE="${REPO_DIR}/testscenes/collisiondetectiontests/large_tissue_blade.py"
+VT_SELF="${REPO_DIR}/testscenes/collisiondetectiontests/self_collision_vertex_triangle.py"
+VT_CROSS="${REPO_DIR}/testscenes/collisiondetectiontests/cross_model_vertex_triangle.py"
+HASH="${REPO_DIR}/testscenes/collisiondetectiontests/hash_prefixsum_large.py"
+XLARGE="${REPO_DIR}/testscenes/collisiondetectiontests/collision_xlarge_200k.py"
 
 # --- tri-tri FBP: small ---
 run_leg small_fastpath   "${SMALL}" SOFA_USE_FEATURE_BASED_PROXIMITY=1 SOFA_PROXIMITY_READ_CONTACT_COUNTER=0

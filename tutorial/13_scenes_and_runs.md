@@ -7,10 +7,10 @@ GTX 1650 Ti (full table in `reports/performance_all_modes_20260715.md`).
 
 ---
 
-## The five scenes (in `testscenes/`)
+## The five scenes (in `testscenes/collisiondetectiontests/`)
 
 Each scene builds two meshes and switches on **one** narrow-phase path. They all import
-shared geometry helpers from `testscenes/dense_collision_benchmark_common.py`.
+shared geometry helpers from `testscenes/collisiondetectiontests/dense_collision_benchmark_common.py`.
 
 ```mermaid
 flowchart TD
@@ -139,7 +139,7 @@ scripts/run_mode_comparison_ab_wsl.sh      # 7 legs: dense | Phase-15 | opt hash
 scripts/run_tiny_ab_wsl.sh                 # the tiny regime (where dense wins)
 
 # Single way via env (mutually exclusive; the optimised hash wins the tie-break):
-SOFA_USE_SIMPLE_HASH_GENERATION=1 runSofa ... testscenes/hash_prefixsum_large.py
+SOFA_USE_SIMPLE_HASH_GENERATION=1 runSofa ... testscenes/collisiondetectiontests/hash_prefixsum_large.py
 
 # Backend parity (no SOFA): prints fbp / hash / simplehash contacts must all match:
 SOFA_BACKEND_BENCH_RUN_SIMPLE_HASH=1 ./SofaGpuCollisionDenseGridBackendBench

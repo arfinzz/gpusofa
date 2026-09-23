@@ -27,7 +27,7 @@ scenes; only speed differs.
 | # | Mode (leg name) | Way | What is different | Selecting envs |
 |---|---|---|---|---|
 | 1 | `dense_plain` | 1 baseline dense grid | fixed cell array; generation launches one block per grid cell (mostly empty) | `SOFA_USE_TOOL_ACTIVE_CELL_GENERATION=0` |
-| 2 | `dense_phase15` | 2 optimised dense grid | same grid; generation only over tool-occupied cells (**the production default**) | *(all toggles 0)* |
+| 2 | `dense_active` | 2 optimised dense grid | same grid; generation only over tool-occupied cells (**the production default**) | *(all toggles 0)* |
 | 3 | `hash_opt` | 3 optimised spatial hash | occupied-cells-only storage via mark→compact→fill hash table; 11 kernels | `SOFA_USE_HASH_PREFIXSUM_GENERATION=1` |
 | 4 | `simple_hash` | 4 simple direct-bucket hash | triangles inserted straight into per-cell hash buckets in one pass; 7 kernels | `SOFA_USE_SIMPLE_HASH_GENERATION=1` |
 | 5 | `sorted_grid` | 5 sorted grid | (cell, triangle) incidences → **counting sort** → contiguous runs; **home-cell** exactly-once dedup that doubles as an exact AABB pre-cull | `SOFA_USE_SORTED_GRID_GENERATION=1` |
@@ -55,9 +55,9 @@ to emit the identical contact set. Every mode pair above is such an A/B.
 |---|---|---|---|
 | bench "80k" | 181×181 tissue grid (64,800 tris) + subdivided blade (14,720 tris), generated in-process | 79,520 | kernel-only timing, ncu profiling |
 | bench "200k" | 316×316 tissue grid (198,450) + same blade | 213,170 | scale behavior |
-| `testscenes/hash_prefixsum_large.py` | 81×81 tissue + blade, static, in SOFA | 14,368 | end-to-end SOFA timing (the surgical-scale scene) |
-| `testscenes/collision_xlarge_200k.py` | 316×316 tissue grid (198,450 tris) + 1,568-triangle blade in SOFA | **200,018** | end-to-end at scale |
-| `one_tissue_one_blade.py` / `large_tissue_blade.py` / v-t scenes | see guide/setup.md §4 | 12,812 / 79,520 / — | full-suite regression legs |
+| `testscenes/collisiondetectiontests/hash_prefixsum_large.py` | 81×81 tissue + blade, static, in SOFA | 14,368 | end-to-end SOFA timing (the surgical-scale scene) |
+| `testscenes/collisiondetectiontests/collision_xlarge_200k.py` | 316×316 tissue grid (198,450 tris) + 1,568-triangle blade in SOFA | **200,018** | end-to-end at scale |
+| `one_tissue_one_blade.py` / `large_tissue_blade.py` / v-t scenes | see README.md §10 | 12,812 / 79,520 / — | full-suite regression legs |
 
 The geometry generators are deterministic (no randomness), and a comparison run launches
 every leg on the *same scene file with the same parameters* — only the mode env differs.
@@ -100,6 +100,6 @@ That is what makes contact-count equality a meaningful correctness gate.
 
 - Canonical numbers + per-kernel profiles: `performance_all_modes_20260715.md`
 - Metric formulas: `README_metrics_explained.md`
-- How to run everything: `guide/setup.md` (§5 scripts, §6 env tables, §7 walkthroughs)
-- Design/why: `guide/architecture.md`; history: `guide/plan.md` §5
+- How to run everything: the root `README.md` (§3 quick start, §10 scenes, §11 scripts)
+- How it works: the root `README.md` §7; why each decision was made: `IDEAS.md` and the dated reports
 - Raw artifacts: `output/benchmark_logs/` (gitignored; mirrored from WSL)

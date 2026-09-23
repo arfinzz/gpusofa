@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Quick smoke test for the feature-based proximity (VF/EE) narrow phase.
-# Runs the one-tissue/one-blade scene with SOFA_USE_FEATURE_BASED_PROXIMITY=1
-# and SOFA_PROXIMITY_READ_CONTACT_COUNTER=1 so the run prints emitted contact
-# counts. Detection-only (no CPU response).
+# Runs the one-tissue/one-blade scene with SOFA_USE_FEATURE_BASED_PROXIMITY=1.
+# Counter readback is OFF by default (the fast path); set
+# SOFA_PROXIMITY_READ_CONTACT_COUNTER=1 to see the emitted contact counts.
+# Detection-only (no CPU response).
 
 set -euo pipefail
 
@@ -43,4 +44,4 @@ echo "Logs -> ${LOG_DIR}"
     -l SofaPython3 \
     -l SofaCUDA \
     -l "${SOFA_GPU_COLLISION_LIB}" \
-    "${REPO_DIR}/testscenes/one_tissue_one_blade.py"
+    "${REPO_DIR}/testscenes/collisiondetectiontests/one_tissue_one_blade.py"

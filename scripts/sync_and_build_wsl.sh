@@ -2,7 +2,8 @@
 # Sync the Windows working tree into the WSL repo copy, then build the plugin
 # and the standalone backend bench. Resolves the spaced Windows mount path via a
 # glob so no literal space is typed. Run from WSL:
-#   cp /mnt/c/Users/arfin/Desktop/GPU*SOFA/scripts/_wsl_sync_build.sh /home/arfin/_sb.sh && bash /home/arfin/_sb.sh
+#   cp /mnt/c/Users/arfin/Desktop/GPU*SOFA/scripts/sync_and_build_wsl.sh /home/arfin/_sb.sh && bash /home/arfin/_sb.sh
+# The copy never deletes: a file removed or moved on Windows keeps its old copy in WSL.
 set -uo pipefail
 
 SRC="$(ls -d /mnt/c/Users/arfin/Desktop/GPU*SOFA)"
@@ -18,7 +19,7 @@ rsync -a "${SRC}/testscenes/"           "${DST}/testscenes/"
 rsync -a "${SRC}/scripts/"              "${DST}/scripts/"
 
 echo "--- sync markers (expect non-zero) ---"
-grep -c computeSimpleHashProximityContacts "${DST}/SofaGpuCollision/src/SofaGpuCollision/cuda/GpuCollisionBackend.cu"
+grep -c computeSimpleHashProximityContacts "${DST}/SofaGpuCollision/src/SofaGpuCollision/cuda/detail/SimpleHash.cuh"
 grep -c useSimpleHashGeneration            "${DST}/SofaGpuCollision/src/SofaGpuCollision/GpuCollisionNarrowPhase.cpp"
 grep -c computeSimpleHashProximityContacts "${DST}/SofaGpuCollision/src/tools/DenseGridBackendBench.cpp"
 grep -c CudaContactPenaltyForceField       "${DST}/SofaGpuCollision/CMakeLists.txt"

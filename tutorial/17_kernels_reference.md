@@ -383,4 +383,4 @@ path is already ~8 µs, so the hash build stages aren't worth it. Numbers:
 - [10_the_math.md](10_the_math.md) — the VF/FV/EE closest-feature geometry.
 - [06_the_dense_grid.md](06_the_dense_grid.md) — the grid data structure with a worked numeric example.
 - [00_high_level_flow.md](00_high_level_flow.md) — the easy top-to-bottom story.
-- `guide/architecture.md` — the canonical reference doc.
+- the root `README.md` — the source-of-truth reference.

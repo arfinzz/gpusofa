@@ -135,7 +135,7 @@ simultaneously without corrupting the per-cell counts.
 **Timing note:** the tissue insert (~28 µs) does real work. The blade insert
 (~30 µs) is almost all *launch overhead* — 12 triangles is far too few to fill
 the GPU, so the kernel spends its time starting up, not computing. This is a
-known small inefficiency for tiny meshes (see `guide/plan.md` §5.13), but it's
+known small inefficiency for tiny meshes (see `reports/archive_pre_20260525/gpu_collision_atomic_profile_finding_20260524.md`), but it's
 not worth fixing because it's tiny in absolute terms.
 
 ### The blade insert also builds the active-cell list (Phase 15)
@@ -231,7 +231,7 @@ Because the active variant only ever visits cells that are guaranteed to be
 mixed, it produces **exactly the same candidate pairs** as the all-cells
 variant — it just skips the ~32,738 cells that could never contribute a pair.
 That's why the contact output is bit-identical between the two (verified by
-A/B; `guide/plan.md` §5.15).
+A/B; `reports/archive_pre_20260609/gpu_collision_phase15_16_optimization_20260525.md`).
 
 > **Advanced sidebar — a third, experimental broad cull.** The two variants
 > above both use the *dense* grid (a fixed 32,768-cell array). There is a third,
@@ -388,7 +388,7 @@ This is a **grid-stride loop**, and it does two jobs at once:
    each thread loop back and pick up `idx + stride`, `idx + 2·stride`, … until
    every pair is covered. (The earlier version had no loop — it just did
    `if (tid >= pairCount) return; ... candidatePairs[tid]` — and dropped ~80% of
-   pairs on the large scene. That was Phase 17's fix; see `guide/plan.md` §5.17.)
+   pairs on the large scene. That was Phase 17's fix; see `reports/archive_pre_20260609/gpu_collision_phase15_16_optimization_20260525.md` §5.)
 
 **What each loop iteration does:**
 

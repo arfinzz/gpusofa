@@ -40,4 +40,4 @@ echo "Logs -> ${LOG_DIR}"
     -l SofaPython3 \
     -l SofaCUDA \
     -l "${SOFA_GPU_COLLISION_LIB}" \
-    "${REPO_DIR}/testscenes/large_tissue_blade.py"
+    "${REPO_DIR}/testscenes/collisiondetectiontests/large_tissue_blade.py"

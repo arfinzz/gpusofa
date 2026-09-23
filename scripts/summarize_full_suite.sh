@@ -4,7 +4,8 @@ RUNDIR="${1}"
 shopt -s nullglob
 for leg in small_fastpath small_validation large_fastpath large_validation \
            vt_self_fastpath vt_self_validation vt_cross_fastpath vt_cross_validation \
-           hash_dense hash_on; do
+           hash_dense hash_on hash_simple hash_sorted hash_bigcell \
+           xlarge_dense xlarge_sorted xlarge_bigcell; do
     d="${RUNDIR}/${leg}"
     [[ -d "${d}" ]] || continue
     f="$(ls ${d}/*summary*.txt 2>/dev/null | head -1)"

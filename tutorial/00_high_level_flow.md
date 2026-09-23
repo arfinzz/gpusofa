@@ -71,7 +71,7 @@ That's the entire system. The rest is detail.
 ## Each step, in plain words
 
 ### 1. The scene
-A small Python file (e.g. `testscenes/one_tissue_one_blade.py`)
+A small Python file (e.g. `testscenes/collisiondetectiontests/one_tissue_one_blade.py`)
 lists the two meshes and switches on the GPU collision components. Think of it as
 the "level file." Tour of one such file:
 [02_the_scene.md](02_the_scene.md).
@@ -196,7 +196,7 @@ bottleneck is in **[15_profiling_and_tuning.md](15_profiling_and_tuning.md)**.
 - Want to know how to **profile and tune** a kernel yourself?
   [15_profiling_and_tuning.md](15_profiling_and_tuning.md).
 - Want the canonical engineering reference (not a tutorial)? See
-  `guide/architecture.md`; current measured numbers are in
+  the root `README.md`; current measured numbers are in
   `reports/performance_all_modes_20260715.md`.
 
 > **One sentence to remember:** *lay a grid over space, keep only triangle pairs

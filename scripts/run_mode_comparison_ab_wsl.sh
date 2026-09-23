@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Same-session 4-way* broad-cull comparison on the large-tissue + large-tool scene.
-# Runs three modes back-to-back (thermally fair), counter readback on so contacts
-# can be checked identical:
-#   1. dense_plain   : dense grid, Phase-15 tool-active-cell generation OFF
-#   2. dense_phase15 : dense grid, Phase-15 ON   (the "optimised dense" path)
-#   3. hash_opt      : optimised spatial-hash + prefix-sum broad cull
-# (*The "earlier hash" 4th mode is a prior build; compare via its documented
-#  kernel time in reports/hash_optimized_broadphase_20260617.md.)
+# Same-session comparison of all 12 execution modes (the 6 broad-cull ways and
+# their toggle combinations) on the 14,368-triangle scene hash_prefixsum_large.py.
+# Legs run back-to-back (thermally fair) with counter readback on, so every leg's
+# contact count can be checked identical; the summary ranks them by kernel time.
+# Leg names and what each one means: README.md, "The 12 execution modes".
 #
 # Usage (from WSL):  bash scripts/run_mode_comparison_ab_wsl.sh
 set -uo pipefail
@@ -16,7 +13,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 BUILD="${SOFA_GPU_COLLISION_BUILD_DIR:-${REPO_DIR}/SofaGpuCollision/build-profile}"
 LIB="${SOFA_GPU_COLLISION_LIB:-${BUILD}/libSofaGpuCollision.so}"
-SCENE="${REPO_DIR}/testscenes/hash_prefixsum_large.py"
+SCENE="${REPO_DIR}/testscenes/collisiondetectiontests/hash_prefixsum_large.py"
 STEPS="${SOFA_BENCHMARK_STEPS:-160}"
 BASE="${SOFA_BENCHMARK_LOG_DIR:-${REPO_DIR}/output/benchmark_logs/mode_comparison_$(date +%Y%m%d_%H%M%S)}"
 
@@ -27,7 +24,7 @@ export SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 mkdir -p "${BASE}"
 
 run_mode() {
-    label="$1"; hashflag="$2"; phase15="$3"; simplehash="${4:-0}"; sorted="${5:-0}"; cub="${6:-0}"; pairdedup="${7:-0}"; bigcell="${8:-0}"; sharedbuild="${9:-0}"; hashbuild="${10:-0}"
+    label="$1"; hashflag="$2"; activecells="$3"; simplehash="${4:-0}"; sorted="${5:-0}"; cub="${6:-0}"; pairdedup="${7:-0}"; bigcell="${8:-0}"; sharedbuild="${9:-0}"; hashbuild="${10:-0}"
     d="${BASE}/${label}"; mkdir -p "${d}"
     env SOFA_USE_HASH_PREFIXSUM_GENERATION="${hashflag}" \
         SOFA_USE_SIMPLE_HASH_GENERATION="${simplehash}" \
@@ -38,7 +35,7 @@ run_mode() {
         SOFA_BIGCELL_SHARED_BUILD="${sharedbuild}" \
         SOFA_BIGCELL_HASH_BUILD="${hashbuild}" \
         SOFA_BIGCELL_HASH_SLOTS=2048 \
-        SOFA_USE_TOOL_ACTIVE_CELL_GENERATION="${phase15}" \
+        SOFA_USE_TOOL_ACTIVE_CELL_GENERATION="${activecells}" \
         SOFA_BENCHMARK_LABEL_SUFFIX="_${label}" \
         SOFA_BENCHMARK_LOG_DIR="${d}" \
         "${SOFA_ROOT}/bin/runSofa" -g batch -n "${STEPS}" \
@@ -48,7 +45,7 @@ run_mode() {
 
 nvidia-smi --query-gpu=temperature.gpu,clocks.gr --format=csv,noheader || true
 run_mode dense_plain          0 0 0 0 0 0 0 0 0
-run_mode dense_phase15        0 1 0 0 0 0 0 0 0
+run_mode dense_active         0 1 0 0 0 0 0 0 0
 run_mode hash_opt             1 1 0 0 0 0 0 0 0
 run_mode simple_hash          0 1 1 0 0 0 0 0 0
 run_mode sorted_grid          0 1 0 1 0 0 0 0 0
@@ -62,7 +59,7 @@ run_mode bigcell_globalhash   0 1 0 0 0 0 1 0 1
 
 echo
 echo "=== SUMMARY (kernel time is the robust metric) ==="
-for leg in dense_plain dense_phase15 hash_opt simple_hash sorted_grid sorted_cub sorted_pairhash sorted_cub_pairhash bigcell_direct bigcell_sharedhash bigcell_sharedsort bigcell_globalhash; do
+for leg in dense_plain dense_active hash_opt simple_hash sorted_grid sorted_cub sorted_pairhash sorted_cub_pairhash bigcell_direct bigcell_sharedhash bigcell_sharedsort bigcell_globalhash; do
     f="$(ls "${BASE}/${leg}"/*summary*.txt 2>/dev/null | head -1)"
     [ -z "${f}" ] && { echo "${leg}: NO SUMMARY (see ${BASE}/${leg}/run.log)"; continue; }
     fps=$(grep -E '^avg_fps=' "${f}"|cut -d= -f2)

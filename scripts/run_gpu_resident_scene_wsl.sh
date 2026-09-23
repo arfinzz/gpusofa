@@ -9,7 +9,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 BUILD="${SOFA_GPU_COLLISION_BUILD_DIR:-${REPO_DIR}/SofaGpuCollision/build-profile}"
 LIB="${BUILD}/libSofaGpuCollision.so"
-SCENE="${REPO_DIR}/testscenes/gpu_resident_fem_contact.py"
+SCENE="${REPO_DIR}/testscenes/collisiondetectiontests/gpu_resident_fem_contact.py"
 STEPS="${1:-${SOFA_BENCHMARK_STEPS:-60}}"
 OUT="${SOFA_BENCHMARK_LOG_DIR:-${REPO_DIR}/output/benchmark_logs/gpu_resident_$(date +%Y%m%d_%H%M%S)}"
 

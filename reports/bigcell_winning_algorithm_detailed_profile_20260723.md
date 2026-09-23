@@ -285,7 +285,7 @@ The instrumented kernel's 165 registers halve theoretical occupancy and make its
 
 ## 11. Reproduction
 
-From PowerShell, sync/build as documented in `guide/setup.md`, then run:
+From PowerShell, sync/build as documented in the root `README.md`, then run:
 
 ```powershell
 wsl -d wsl-gpu-proj -- bash -lc 'SOFA_BIGCELL_PROFILE_OUT=/home/arfin/gpu-sofa/output/my_bigcell_profile bash /home/arfin/gpu-sofa/scripts/run_bigcell_detailed_profile_wsl.sh'

@@ -273,7 +273,7 @@ default:
    that already contains tissue, that cell's ID is appended to an "active list."
    No separate scan pass is needed — the list is a side effect of an insert
    that already runs. (Details and the correctness argument are in file 09 §9.4
-   and `guide/plan.md` §5.15.)
+   and `reports/archive_pre_20260609/gpu_collision_phase15_16_optimization_20260525.md`.)
 
    Result: candidate generation visits ~30 cells instead of 32,768. On the
    one-tissue scene this dropped the generation kernel from ~300 µs to ~8 µs —

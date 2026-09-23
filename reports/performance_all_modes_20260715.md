@@ -22,7 +22,7 @@ big-cell fused way with 4 build strategies = **12 modes**:
 | # | Mode | One-line description |
 |---|---|---|
 | 1 | `dense_plain` | baseline dense grid, one block per grid cell |
-| 2 | `dense_phase15` | dense grid, generation over tool-occupied cells only (**production default**) |
+| 2 | `dense_active` | dense grid, generation over tool-occupied cells only (**production default**) |
 | 3 | `hash_opt` | optimised spatial hash (mark→compact→fill), 11 kernels |
 | 4 | `simple_hash` | direct-bucket spatial hash, single insert pass, 7 kernels |
 | 5 | `sorted_grid` | sorted grid: counting sort + home-cell dedup (= exact AABB pre-cull) |
@@ -70,7 +70,7 @@ same-session (160 steps). Bench = kernel-only tool (30 steps).
 | sorted_cub_pairhash | 0.669 | 2.924 | 6.763 |
 | bigcell_sharedsort | 0.759 | 1.558 | 3.388 |
 | bigcell_globalhash | 1.092 | 2.800 | 6.985 |
-| dense_phase15 | 1.505 | 2.58–4.75* | 4.50 |
+| dense_active | 1.505 | 2.58–4.75* | 4.50 |
 | dense_plain | 1.658 | — | — |
 
 \* the 80k base bench process started on cold clocks (1350 MHz ramping); its early legs
@@ -99,7 +99,7 @@ The legacy dense-exact leg (`generateDenseGridUniqueCandidatePairsKernel`, ~1.89
 @10% SM) runs in every capture as a stable cross-capture reference and is excluded from
 pipeline sums. "×2" = launched once per mesh (tissue, tool).
 
-### dense_phase15 (way 2)
+### dense_active (way 2)
 
 | Kernel | dur | SM% | DRAM% | occ% | regs |
 |---|---:|---:|---:|---:|---:|

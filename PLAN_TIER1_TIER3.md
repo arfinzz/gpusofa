@@ -147,7 +147,7 @@ contact, using the existing per-stage profiling + ncu. Report kernel time per st
 
 ## Test scene
 
-`testscenes/dense_collision_benchmark_common.py` already has `generate_tissue_mesh()`
+`testscenes/collisiondetectiontests/dense_collision_benchmark_common.py` already has `generate_tissue_mesh()`
 returning tets + fixed indices + surface triangles — so a proper FEM scene needs no new
 geometry code. New scene: tet tissue + `EulerImplicitSolver` + `CGLinearSolver` +
 `CudaMeshMatrixMass` + FEM force field + `CudaFixedProjectiveConstraint` + blade +
