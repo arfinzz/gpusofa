@@ -17,7 +17,7 @@ OUT=$REPO/output/benchmark_logs/profiling_5way_$(date +%Y%m%d_%H%M%S)
 NSIGHT_HOST=/usr/lib/nsight-systems/host-linux-x64
 mkdir -p "$OUT"
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null)"
-export LD_LIBRARY_PATH="$BUILD:${SOFA_ROOT}/lib:${PLP}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:${SOFA_ROOT}/lib:${PLP}"
 
 # mode name -> leg gate env values: FBP VT HASH SIMPLE SORTED BIGCELL
 run_env() {

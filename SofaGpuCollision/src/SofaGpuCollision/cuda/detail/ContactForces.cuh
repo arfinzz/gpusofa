@@ -118,20 +118,106 @@ __device__ __forceinline__ float3 gatherVertexValue(
 }
 
 // ----------------------------------------------------------------------------
+// Which side is which.
+//
+// The collision kernel reports an UNSIGNED distance, and a normal from the
+// first surface's contact point to the second's. Once a point crosses the other
+// surface that normal flips, so a plain penalty pushes the point FURTHER
+// through. Each triangle's outward normal (from its winding) is used as a side
+// reference instead:
+//   * contact normal agrees with the reference -> the surfaces are on their
+//     correct sides; direction and distance are used unchanged;
+//   * it disagrees -> they overlap; the direction is flipped and the distance
+//     becomes a negative separation, so the force grows with depth;
+//   * no usable contact normal (touching / crossing) -> the reference itself.
+// The reference is the second face's normal for VF (reversed: it points from the
+// first surface toward the second), the first face's normal for FV, and their
+// difference for EE. Surfaces must be wound with normals pointing outward.
+//
+// Plain unit-normalisation here, not normalizeOrZero: its 1e-6 length cut-off
+// would zero the normal of any triangle a few millimetres across in SI units.
+// ----------------------------------------------------------------------------
+__device__ __forceinline__ float3 unitOrZero(const float3 v)
+{
+    const float lenSq = lengthSquared3(v);
+    return lenSq > 1.0e-30f ? mul3(v, rsqrtf(lenSq)) : make_float3(0.0f, 0.0f, 0.0f);
+}
+
+__device__ __forceinline__ float3 loadVertex(const float* __restrict__ positions, const std::uint32_t v)
+{
+    return make_float3(positions[3u * v], positions[3u * v + 1u], positions[3u * v + 2u]);
+}
+
+__device__ __forceinline__ float3 outwardNormal(
+    const float* __restrict__ positions,
+    const std::uint32_t* __restrict__ indices,
+    const std::uint32_t triangleId)
+{
+    const float3 p0 = loadVertex(positions, indices[3u * triangleId]);
+    const float3 p1 = loadVertex(positions, indices[3u * triangleId + 1u]);
+    const float3 p2 = loadVertex(positions, indices[3u * triangleId + 2u]);
+    return unitOrZero(cross3(sub3(p1, p0), sub3(p2, p0)));
+}
+
+// Direction from the first surface toward the second (the second is pushed
+// along it, the first against it) and the separation measured along it.
+// Null positions = the old unsigned law.
+__device__ __forceinline__ void contactSeparation(
+    const DeviceProximityContact& c,
+    const float* __restrict__ firstPositions,
+    const std::uint32_t* __restrict__ firstIndices,
+    const float* __restrict__ secondPositions,
+    const std::uint32_t* __restrict__ secondIndices,
+    const float contactDistance,
+    float3& direction,
+    float& separation)
+{
+    direction = c.normal;
+    separation = c.signedDistance;
+    if (firstPositions == nullptr || secondPositions == nullptr) return;
+
+    float3 reference;
+    if (c.featureKind == 0u)
+    {
+        reference = mul3(outwardNormal(secondPositions, secondIndices, c.secondPrimitiveIndex), -1.0f);
+    }
+    else if (c.featureKind == 1u)
+    {
+        reference = outwardNormal(firstPositions, firstIndices, c.firstPrimitiveIndex);
+    }
+    else
+    {
+        reference = unitOrZero(sub3(
+            outwardNormal(firstPositions, firstIndices, c.firstPrimitiveIndex),
+            outwardNormal(secondPositions, secondIndices, c.secondPrimitiveIndex)));
+    }
+    if (lengthSquared3(reference) == 0.0f) return;  // degenerate triangles: keep the old law
+
+    const bool normalKnown = lengthSquared3(c.normal) > 0.0f &&
+                             c.signedDistance > 1.0e-4f * contactDistance;
+    if (!normalKnown)
+    {
+        direction = reference;
+        separation = 0.0f;
+    }
+    else if (dot3(c.normal, reference) < 0.0f)
+    {
+        direction = mul3(c.normal, -1.0f);
+        separation = -c.signedDistance;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Penalty response. One thread per contact.
 //
-//   depth = contactDistance - distance          (> 0 when closer than the margin)
-//   vn    = (v_second - v_first) . normal       (< 0 while approaching)
+//   depth = contactDistance - separation        (> 0 when closer than the margin)
+//   vn    = (v_second - v_first) . direction    (< 0 while approaching)
 //   F     = max(0, stiffness*depth - damping*vn)
 //
-// The normal points from the first surface's contact point toward the second's,
-// so the first side is pushed along -n and the second along +n: equal and
-// opposite, which Gate 2 checks by reduction.
-//
-// Note the contacts carry an UNSIGNED distance (FbpKernels writes sqrt of the
-// squared closest-feature distance), so this is a proximity penalty that turns
-// on at contactDistance rather than at interpenetration. That matches how the
-// contacts were generated — they only exist within contactDistance at all.
+// The first side is pushed along -direction and the second along +direction:
+// equal and opposite, which Gate 2 checks by reduction. With side awareness
+// off (null positions) direction/separation are the contact's own normal and
+// unsigned distance, i.e. a proximity penalty that turns on at contactDistance.
 // ----------------------------------------------------------------------------
 __global__ void accumulateContactPenaltyForcesKernel(
     const DeviceProximityContact* __restrict__ contacts,
@@ -139,6 +225,8 @@ __global__ void accumulateContactPenaltyForcesKernel(
     const std::uint32_t capacity,
     const std::uint32_t* __restrict__ firstIndices,
     const std::uint32_t* __restrict__ secondIndices,
+    const float* __restrict__ firstPositions,    // null = unsigned law
+    const float* __restrict__ secondPositions,
     float* __restrict__ firstForces,
     float* __restrict__ secondForces,
     const float* __restrict__ firstVelocities,   // may be null
@@ -154,7 +242,11 @@ __global__ void accumulateContactPenaltyForcesKernel(
     {
         const DeviceProximityContact c = contacts[i];
 
-        const float depth = contactDistance - c.signedDistance;
+        float3 n;
+        float separation;
+        contactSeparation(c, firstPositions, firstIndices, secondPositions, secondIndices,
+                          contactDistance, n, separation);
+        const float depth = contactDistance - separation;
         if (depth <= 0.0f) continue;
 
         float wFirst[3];
@@ -167,34 +259,37 @@ __global__ void accumulateContactPenaltyForcesKernel(
         {
             const float3 v1 = gatherVertexValue(firstVelocities, firstIndices, c.firstPrimitiveIndex, wFirst);
             const float3 v2 = gatherVertexValue(secondVelocities, secondIndices, c.secondPrimitiveIndex, wSecond);
-            const float3 vrel = sub3(v2, v1);
-            magnitude -= damping * dot3(vrel, c.normal);
+            magnitude -= damping * dot3(sub3(v2, v1), n);
         }
         if (magnitude <= 0.0f) continue;  // separating faster than the spring pulls
 
-        const float3 force = make_float3(
-            c.normal.x * magnitude, c.normal.y * magnitude, c.normal.z * magnitude);
+        const float3 force = mul3(n, magnitude);
 
         // First side pushed away from the second, second pushed away from the first.
-        const float3 negForce = make_float3(-force.x, -force.y, -force.z);
-        scatterVertexForce(firstForces, firstIndices, c.firstPrimitiveIndex, wFirst, negForce);
+        scatterVertexForce(firstForces, firstIndices, c.firstPrimitiveIndex, wFirst, mul3(force, -1.0f));
         scatterVertexForce(secondForces, secondIndices, c.secondPrimitiveIndex, wSecond, force);
 
         if (activeCount != nullptr) atomicAdd(activeCount, 1u);
     }
 }
 
-// Stiffness-times-dx for implicit integration. For an active contact the
-// penalty force derivative is K = stiffness * (n outer n) acting on the relative
-// displacement, so df = -kFactor * stiffness * (n . dRel) * n on the first side
-// and +the same on the second. Damping is deliberately excluded (SOFA passes
-// its own factors for the damping term; treating it here would double count).
+// Stiffness-times-dx for implicit integration: df += kFactor * (df/dx) * dx.
+// The force on the second side is n * stiffness * (contactDistance - separation)
+// and separation grows with n . (x_second - x_first), so
+//   df/dx_second = -stiffness * (n outer n),   df/dx_first = +stiffness * (n outer n).
+// Hence df_second = -kFactor * stiffness * (n . dRel) * n and df_first = -df_second,
+// the same convention as SOFA's PenalityContactForceField (with the implicit
+// solver's negative kFactor this ADDS stiffness to the system). Uses the same
+// direction and active set as the force pass. Damping is left to SOFA's own
+// b-factor terms; treating it here would double count.
 __global__ void accumulateContactPenaltyDForcesKernel(
     const DeviceProximityContact* __restrict__ contacts,
     const std::uint32_t* __restrict__ contactCount,
     const std::uint32_t capacity,
     const std::uint32_t* __restrict__ firstIndices,
     const std::uint32_t* __restrict__ secondIndices,
+    const float* __restrict__ firstPositions,    // null = unsigned law
+    const float* __restrict__ secondPositions,
     float* __restrict__ firstDForces,
     float* __restrict__ secondDForces,
     const float* __restrict__ firstDx,
@@ -208,7 +303,12 @@ __global__ void accumulateContactPenaltyDForcesKernel(
     for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride)
     {
         const DeviceProximityContact c = contacts[i];
-        if (contactDistance - c.signedDistance <= 0.0f) continue;
+
+        float3 n;
+        float separation;
+        contactSeparation(c, firstPositions, firstIndices, secondPositions, secondIndices,
+                          contactDistance, n, separation);
+        if (contactDistance - separation <= 0.0f) continue;
 
         float wFirst[3];
         float wSecond[3];
@@ -217,14 +317,11 @@ __global__ void accumulateContactPenaltyDForcesKernel(
 
         const float3 dx1 = gatherVertexValue(firstDx, firstIndices, c.firstPrimitiveIndex, wFirst);
         const float3 dx2 = gatherVertexValue(secondDx, secondIndices, c.secondPrimitiveIndex, wSecond);
-        const float dn = dot3(sub3(dx2, dx1), c.normal);
-        const float scale = kFactor * stiffness * dn;
+        const float dn = dot3(sub3(dx2, dx1), n);
 
-        const float3 df = make_float3(
-            c.normal.x * scale, c.normal.y * scale, c.normal.z * scale);
-        const float3 negDf = make_float3(-df.x, -df.y, -df.z);
-        scatterVertexForce(firstDForces, firstIndices, c.firstPrimitiveIndex, wFirst, negDf);
-        scatterVertexForce(secondDForces, secondIndices, c.secondPrimitiveIndex, wSecond, df);
+        const float3 dfSecond = mul3(n, -kFactor * stiffness * dn);
+        scatterVertexForce(firstDForces, firstIndices, c.firstPrimitiveIndex, wFirst, mul3(dfSecond, -1.0f));
+        scatterVertexForce(secondDForces, secondIndices, c.secondPrimitiveIndex, wSecond, dfSecond);
     }
 }
 
@@ -307,11 +404,50 @@ bool resolveContactHandle(
     return false;
 }
 
+// False when the narrow phase did not compute this pair in the current
+// collision pass: the pair has no contacts now, and the handle's buffer still
+// holds the last ones it had. Applying those would keep pushing two bodies that
+// have already separated.
+bool computedThisPass(const RecordedContactHandle& handle)
+{
+    return handle.collisionPass == contactHandleRegistry().collisionPass;
+}
+
+// For the force entry points: finds this pair's contacts from the current pass.
+// Returns false only on a real fault (the registry had to evict handles because
+// more pairs are live than it has slots). A pair with no recorded contacts - its
+// bodies have not come within reach yet, or not in this pass - is the normal
+// no-contact state: `out` stays null, and the caller applies nothing.
+bool currentContactsFor(
+    const std::uint64_t firstSurfaceId,
+    const std::uint64_t secondSurfaceId,
+    const RecordedContactHandle*& out,
+    bool& outSwapped,
+    std::string& diagnostic)
+{
+    out = nullptr;
+    const RecordedContactHandle* handle = nullptr;
+    if (!resolveContactHandle(firstSurfaceId, secondSurfaceId, handle, outSwapped, diagnostic))
+    {
+        if (contactHandleRegistry().evictions > 0) return false;
+        diagnostic.clear();
+        return true;
+    }
+    if (computedThisPass(*handle)) out = handle;
+    diagnostic.clear();
+    return true;
+}
+
 } // namespace
 
 
 namespace SofaGpuCollision::backend
 {
+
+void beginContactFrame()
+{
+    ++contactHandleRegistry().collisionPass;
+}
 
 bool accumulateContactPenaltyForces(
     const ContactPenaltyConfig& config,
@@ -321,6 +457,8 @@ bool accumulateContactPenaltyForces(
     void* deviceSecondForces,
     const void* deviceFirstVelocities,
     const void* deviceSecondVelocities,
+    const void* deviceFirstPositions,
+    const void* deviceSecondPositions,
     ContactPenaltyStats* stats,
     std::string& diagnostic)
 {
@@ -330,16 +468,28 @@ bool accumulateContactPenaltyForces(
         diagnostic = "Null device force vector.";
         return false;
     }
+    if (config.useSurfaceNormals && (deviceFirstPositions == nullptr || deviceSecondPositions == nullptr))
+    {
+        diagnostic = "useSurfaceNormals needs both surfaces' device positions.";
+        return false;
+    }
+    if (!config.useSurfaceNormals)
+    {
+        deviceFirstPositions = nullptr;
+        deviceSecondPositions = nullptr;
+    }
 
     const RecordedContactHandle* handle = nullptr;
     bool swapped = false;
-    if (!resolveContactHandle(firstSurfaceId, secondSurfaceId, handle, swapped, diagnostic)) return false;
+    if (!currentContactsFor(firstSurfaceId, secondSurfaceId, handle, swapped, diagnostic)) return false;
+    if (handle == nullptr) return true;   // no contacts this pass: no force (stats stay 0)
 
     // Bind the caller's vectors to the HANDLE's surface order.
     if (swapped)
     {
         std::swap(deviceFirstForces, deviceSecondForces);
         std::swap(deviceFirstVelocities, deviceSecondVelocities);
+        std::swap(deviceFirstPositions, deviceSecondPositions);
     }
 
     auto& ws = contactForceWorkspace();
@@ -356,6 +506,8 @@ bool accumulateContactPenaltyForces(
     accumulateContactPenaltyForcesKernel<<<blocks, threads>>>(
         handle->contacts, handle->countDevice, handle->capacity,
         handle->firstIndices, handle->secondIndices,
+        static_cast<const float*>(deviceFirstPositions),
+        static_cast<const float*>(deviceSecondPositions),
         static_cast<float*>(deviceFirstForces),
         static_cast<float*>(deviceSecondForces),
         static_cast<const float*>(deviceFirstVelocities),
@@ -393,6 +545,8 @@ bool accumulateContactPenaltyDForces(
     void* deviceSecondDForces,
     const void* deviceFirstDx,
     const void* deviceSecondDx,
+    const void* deviceFirstPositions,
+    const void* deviceSecondPositions,
     std::string& diagnostic)
 {
     if (deviceFirstDForces == nullptr || deviceSecondDForces == nullptr ||
@@ -401,15 +555,27 @@ bool accumulateContactPenaltyDForces(
         diagnostic = "Null device dforce/dx vector.";
         return false;
     }
+    if (config.useSurfaceNormals && (deviceFirstPositions == nullptr || deviceSecondPositions == nullptr))
+    {
+        diagnostic = "useSurfaceNormals needs both surfaces' device positions.";
+        return false;
+    }
+    if (!config.useSurfaceNormals)
+    {
+        deviceFirstPositions = nullptr;
+        deviceSecondPositions = nullptr;
+    }
 
     const RecordedContactHandle* handle = nullptr;
     bool swapped = false;
-    if (!resolveContactHandle(firstSurfaceId, secondSurfaceId, handle, swapped, diagnostic)) return false;
+    if (!currentContactsFor(firstSurfaceId, secondSurfaceId, handle, swapped, diagnostic)) return false;
+    if (handle == nullptr) return true;   // no contacts this pass: no stiffness
 
     if (swapped)
     {
         std::swap(deviceFirstDForces, deviceSecondDForces);
         std::swap(deviceFirstDx, deviceSecondDx);
+        std::swap(deviceFirstPositions, deviceSecondPositions);
     }
 
     constexpr std::uint32_t threads = 256;
@@ -417,6 +583,8 @@ bool accumulateContactPenaltyDForces(
     accumulateContactPenaltyDForcesKernel<<<blocks, threads>>>(
         handle->contacts, handle->countDevice, handle->capacity,
         handle->firstIndices, handle->secondIndices,
+        static_cast<const float*>(deviceFirstPositions),
+        static_cast<const float*>(deviceSecondPositions),
         static_cast<float*>(deviceFirstDForces),
         static_cast<float*>(deviceSecondDForces),
         static_cast<const float*>(deviceFirstDx),
@@ -482,15 +650,40 @@ bool validateContactPenaltyForces(
     const std::size_t firstVertexCount = firstSurface.vertexCount;
     const std::size_t secondVertexCount = secondSurface.vertexCount;
 
+    // Side awareness reads positions. The reference below needs them on the host
+    // anyway, so upload those rather than trusting any device copy.
+    const bool sideAware = config.useSurfaceNormals;
+    if (sideAware && (firstSurface.positions == nullptr || secondSurface.positions == nullptr))
+    {
+        diagnostic = "validateContactPenaltyForces with useSurfaceNormals needs host positions.";
+        return false;
+    }
+
     float* deviceFirstForces = nullptr;
     float* deviceSecondForces = nullptr;
+    float* deviceFirstPositions = nullptr;
+    float* deviceSecondPositions = nullptr;
     std::uint32_t* deviceActive = nullptr;
+    const auto freeAll = [&]() {
+        cudaFree(deviceFirstForces); cudaFree(deviceSecondForces);
+        cudaFree(deviceFirstPositions); cudaFree(deviceSecondPositions);
+        cudaFree(deviceActive);
+    };
     cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&deviceFirstForces), firstVertexCount * 3u * sizeof(float));
     if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&deviceSecondForces), secondVertexCount * 3u * sizeof(float));
     if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&deviceActive), sizeof(std::uint32_t));
+    if (err == cudaSuccess && sideAware)
+    {
+        err = cudaMalloc(reinterpret_cast<void**>(&deviceFirstPositions), firstVertexCount * 3u * sizeof(float));
+        if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&deviceSecondPositions), secondVertexCount * 3u * sizeof(float));
+        if (err == cudaSuccess) err = cudaMemcpy(deviceFirstPositions, firstSurface.positions,
+                                                 firstVertexCount * 3u * sizeof(float), cudaMemcpyHostToDevice);
+        if (err == cudaSuccess) err = cudaMemcpy(deviceSecondPositions, secondSurface.positions,
+                                                 secondVertexCount * 3u * sizeof(float), cudaMemcpyHostToDevice);
+    }
     if (err != cudaSuccess)
     {
-        cudaFree(deviceFirstForces); cudaFree(deviceSecondForces); cudaFree(deviceActive);
+        freeAll();
         diagnostic = std::string("validation alloc failed: ") + cudaGetErrorString(err);
         return false;
     }
@@ -503,6 +696,7 @@ bool validateContactPenaltyForces(
     accumulateContactPenaltyForcesKernel<<<blocks, threads>>>(
         handle->contacts, handle->countDevice, handle->capacity,
         handle->firstIndices, handle->secondIndices,
+        deviceFirstPositions, deviceSecondPositions,
         deviceFirstForces, deviceSecondForces,
         nullptr, nullptr,                       // damping off: velocities are not part of this gate
         config.stiffness, 0.0f, config.contactDistance,
@@ -510,7 +704,7 @@ bool validateContactPenaltyForces(
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess)
     {
-        cudaFree(deviceFirstForces); cudaFree(deviceSecondForces); cudaFree(deviceActive);
+        freeAll();
         diagnostic = std::string("validation kernel: ") + cudaGetErrorString(err);
         return false;
     }
@@ -538,9 +732,7 @@ bool validateContactPenaltyForces(
     cudaMemcpy(hostFirstIndices.data(), handle->firstIndices, hostFirstIndices.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(hostSecondIndices.data(), handle->secondIndices, hostSecondIndices.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
 
-    cudaFree(deviceFirstForces);
-    cudaFree(deviceSecondForces);
-    cudaFree(deviceActive);
+    freeAll();
 
     // ---- independent host reference ----
     auto hostWeights = [](const std::uint8_t kind, const std::uint8_t localIndex,
@@ -563,21 +755,76 @@ bool validateContactPenaltyForces(
         }
     };
 
+    // Side rule, written separately from the device version and in double.
+    const auto hostFaceNormal = [](const BackendTriangleVertex* positions,
+                                   const std::vector<std::uint32_t>& indices,
+                                   const std::uint32_t triangleId, double n[3]) {
+        const BackendTriangleVertex& a = positions[indices[3u * triangleId]];
+        const BackendTriangleVertex& b = positions[indices[3u * triangleId + 1u]];
+        const BackendTriangleVertex& d = positions[indices[3u * triangleId + 2u]];
+        const double e1[3] = { double(b.x) - a.x, double(b.y) - a.y, double(b.z) - a.z };
+        const double e2[3] = { double(d.x) - a.x, double(d.y) - a.y, double(d.z) - a.z };
+        n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        for (int k = 0; k < 3; ++k) n[k] = len > 1e-15 ? n[k] / len : 0.0;
+    };
+
     std::vector<float> refFirst(firstVertexCount * 3u, 0.0f);
     std::vector<float> refSecond(secondVertexCount * 3u, 0.0f);
     for (const auto& c : hostContacts)
     {
-        const float depth = config.contactDistance - c.signedDistance;
-        if (depth <= 0.0f) continue;
-        const float magnitude = config.stiffness * depth;
-        if (magnitude <= 0.0f) continue;
+        double dir[3] = { c.normal.x, c.normal.y, c.normal.z };
+        double separation = c.signedDistance;
+        if (sideAware)
+        {
+            double ref[3];
+            if (c.featureKind == 0u)
+            {
+                hostFaceNormal(secondSurface.positions, hostSecondIndices, c.secondPrimitiveIndex, ref);
+                for (double& r : ref) r = -r;
+            }
+            else if (c.featureKind == 1u)
+            {
+                hostFaceNormal(firstSurface.positions, hostFirstIndices, c.firstPrimitiveIndex, ref);
+            }
+            else
+            {
+                double na[3], nb[3];
+                hostFaceNormal(firstSurface.positions, hostFirstIndices, c.firstPrimitiveIndex, na);
+                hostFaceNormal(secondSurface.positions, hostSecondIndices, c.secondPrimitiveIndex, nb);
+                for (int k = 0; k < 3; ++k) ref[k] = na[k] - nb[k];
+                const double len = std::sqrt(ref[0] * ref[0] + ref[1] * ref[1] + ref[2] * ref[2]);
+                for (double& r : ref) r = len > 1e-15 ? r / len : 0.0;
+            }
+            const double refLen = ref[0] * ref[0] + ref[1] * ref[1] + ref[2] * ref[2];
+            const double normalLen = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+            if (refLen > 0.0)
+            {
+                if (normalLen == 0.0 || c.signedDistance <= 1.0e-4f * config.contactDistance)
+                {
+                    for (int k = 0; k < 3; ++k) dir[k] = ref[k];
+                    separation = 0.0;
+                }
+                else if (dir[0] * ref[0] + dir[1] * ref[1] + dir[2] * ref[2] < 0.0)
+                {
+                    for (double& v : dir) v = -v;
+                    separation = -separation;
+                }
+            }
+        }
+
+        const double depth = config.contactDistance - separation;
+        if (depth <= 0.0) continue;
+        const double magnitude = config.stiffness * depth;
 
         float wa[3], wb[3];
         hostWeights(c.featureKind, c.firstFeatureLocalIndex, c.firstBary, true, wa);
         hostWeights(c.featureKind, c.secondFeatureLocalIndex, c.secondBary, false, wb);
-        const float fx = c.normal.x * magnitude;
-        const float fy = c.normal.y * magnitude;
-        const float fz = c.normal.z * magnitude;
+        const float fx = static_cast<float>(dir[0] * magnitude);
+        const float fy = static_cast<float>(dir[1] * magnitude);
+        const float fz = static_cast<float>(dir[2] * magnitude);
 
         for (int k = 0; k < 3; ++k)
         {
@@ -686,6 +933,258 @@ bool validateContactPenaltyForces(
         validation->contactPointCheckRan = pointCheckRan;
     }
 
+    diagnostic.clear();
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// Gates 2b + 2c — side awareness and stiffness sign on hand-built cases.
+//
+// A large face in the plane y = 0, wound so its normal is +y (its outside), and
+// a small triangle whose vertex 0 sits a distance h from it, the rest far away,
+// so collision detection finds exactly one contact on that vertex. Run through
+// the real dense-grid detection and the real kernels. Whatever the side, the
+// vertex must be pushed toward +y; inside, harder than outside.
+// ----------------------------------------------------------------------------
+bool validateContactSideAwareness(ContactSideValidation* validation, std::string& diagnostic)
+{
+    ContactSideValidation result;
+    constexpr float stiffness = 1000.0f;
+    constexpr float contactDistance = 0.05f;
+    constexpr float h = 0.02f;       // vertex distance from the face
+    constexpr float delta = 0.004f;  // outward nudge for the stiffness check
+    result.expectedOutside = static_cast<double>(stiffness) * (contactDistance - h);
+    result.expectedInside = static_cast<double>(stiffness) * (contactDistance + h);
+    result.expectedStiffnessDf = -static_cast<double>(stiffness) * delta;
+
+    const std::vector<BackendTriangleVertex> bigFace = {
+        { -1.0f, 0.0f, -1.0f }, { 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, -1.0f } };  // normal +y
+    const auto smallTriangle = [](const float tipY, const float restY) {
+        return std::vector<BackendTriangleVertex> {
+            { 0.0f, tipY, 0.0f }, { -0.2f, restY, 0.1f }, { 0.2f, restY, 0.1f } };
+    };
+    const std::vector<std::uint32_t> oneTriangle = { 0u, 1u, 2u };
+
+    DenseGridConfig grid;
+    grid.gridMinX = -1.5f; grid.gridMinY = -1.0f; grid.gridMinZ = -1.5f;
+    grid.gridMaxX = 1.5f;  grid.gridMaxY = 1.0f;  grid.gridMaxZ = 1.5f;
+    grid.gridResolutionX = 12; grid.gridResolutionY = 8; grid.gridResolutionZ = 12;
+    grid.contactDistance = contactDistance;
+    grid.maxCandidatePairs = 1024;
+    grid.copyContactsToHost = false;
+    FeatureBasedProximityConfig proximity;
+    proximity.contactDistance = contactDistance;
+    proximity.keepContactsOnDevice = true;
+    proximity.readContactCounter = true;
+    proximity.maxContacts = 64;
+
+    // Detect one contact between (first, second), then evaluate the force kernel,
+    // or - with dxFirstVertex0 set - the stiffness kernel, and return the result
+    // on vertex 0 of the requested side.
+    std::uint64_t nextSurfaceId = 0x51DE0000ull;
+    const auto runCase = [&](const std::vector<BackendTriangleVertex>& firstPositions,
+                             const std::vector<BackendTriangleVertex>& secondPositions,
+                             const bool sideAware,
+                             const bool readSecondSide,
+                             const float* dxFirstVertex0,
+                             float out[3]) -> bool {
+        TriangleIndexedSurface first;
+        first.positions = firstPositions.data();
+        first.vertexCount = 3;
+        first.triangleIndices = oneTriangle.data();
+        first.triangleCount = 1;
+        first.surfaceId = ++nextSurfaceId;
+        TriangleIndexedSurface second = first;
+        second.positions = secondPositions.data();
+        second.surfaceId = ++nextSurfaceId;
+
+        std::vector<ProximityContact> unused;
+        FeatureBasedProximityStats stats;
+        if (!computeFeatureBasedProximityContacts(first, second, grid, proximity, unused, &stats, diagnostic))
+        {
+            return false;
+        }
+        if (stats.emittedContactCount != 1u)
+        {
+            diagnostic = "side check expected exactly 1 contact, got " + std::to_string(stats.emittedContactCount);
+            return false;
+        }
+        bool swapped = false;
+        const RecordedContactHandle* handle = findContactHandle(first.surfaceId, second.surfaceId, swapped);
+        if (handle == nullptr || swapped)
+        {
+            diagnostic = "side check: no contact handle recorded for the case";
+            return false;
+        }
+
+        float* buffers[6] = {};  // positions x2, outputs x2, dx x2
+        const std::size_t bytes = 9u * sizeof(float);
+        cudaError_t err = cudaSuccess;
+        for (float*& b : buffers)
+        {
+            if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&b), bytes);
+            if (err == cudaSuccess) err = cudaMemset(b, 0, bytes);
+        }
+        if (err == cudaSuccess) err = cudaMemcpy(buffers[0], firstPositions.data(), bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess) err = cudaMemcpy(buffers[1], secondPositions.data(), bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess && dxFirstVertex0 != nullptr)
+        {
+            err = cudaMemcpy(buffers[4], dxFirstVertex0, 3u * sizeof(float), cudaMemcpyHostToDevice);
+        }
+        const float* p1 = sideAware ? buffers[0] : nullptr;
+        const float* p2 = sideAware ? buffers[1] : nullptr;
+        if (err == cudaSuccess)
+        {
+            if (dxFirstVertex0 == nullptr)
+            {
+                accumulateContactPenaltyForcesKernel<<<1, 32>>>(
+                    handle->contacts, handle->countDevice, handle->capacity,
+                    handle->firstIndices, handle->secondIndices, p1, p2,
+                    buffers[2], buffers[3], nullptr, nullptr,
+                    stiffness, 0.0f, contactDistance, nullptr);
+            }
+            else
+            {
+                accumulateContactPenaltyDForcesKernel<<<1, 32>>>(
+                    handle->contacts, handle->countDevice, handle->capacity,
+                    handle->firstIndices, handle->secondIndices, p1, p2,
+                    buffers[2], buffers[3], buffers[4], buffers[5],
+                    stiffness, contactDistance, 1.0f);
+            }
+            err = cudaDeviceSynchronize();
+        }
+        if (err == cudaSuccess)
+        {
+            err = cudaMemcpy(out, readSecondSide ? buffers[3] : buffers[2], 3u * sizeof(float), cudaMemcpyDeviceToHost);
+        }
+        for (float* b : buffers) cudaFree(b);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("side check CUDA error: ") + cudaGetErrorString(err);
+            return false;
+        }
+        return true;
+    };
+
+    const auto relativeError = [](const double measured, const double expected) {
+        return std::fabs(measured - expected) / std::fabs(expected);
+    };
+    const auto pushedAlongY = [](const float f[3], const double expectedY) {
+        return std::fabs(f[0]) < 1e-3 * std::fabs(expectedY) && std::fabs(f[2]) < 1e-3 * std::fabs(expectedY);
+    };
+    float f[3];
+
+    // 1. Vertex just OUTSIDE the face (first = small triangle above, second = face).
+    if (!runCase(smallTriangle(h, 0.5f), bigFace, true, false, nullptr, f)) return false;
+    ++result.casesRun;
+    result.vertexOutsideForceY = f[1];
+    result.maxRelativeError = std::max(result.maxRelativeError, relativeError(f[1], result.expectedOutside));
+    if (f[1] > 0.0f && relativeError(f[1], result.expectedOutside) < 1e-3 && pushedAlongY(f, result.expectedOutside))
+        ++result.casesPassed;
+
+    // 2. Vertex just INSIDE the face: still pushed toward +y, and harder.
+    if (!runCase(smallTriangle(-h, -0.5f), bigFace, true, false, nullptr, f)) return false;
+    ++result.casesRun;
+    result.vertexInsideForceY = f[1];
+    result.maxRelativeError = std::max(result.maxRelativeError, relativeError(f[1], result.expectedInside));
+    if (f[1] > 0.0f && relativeError(f[1], result.expectedInside) < 1e-3 && pushedAlongY(f, result.expectedInside))
+        ++result.casesPassed;
+
+    // 3. A tool tip that has sunk into the face (face first, tip second: FV).
+    if (!runCase(bigFace, smallTriangle(-h, 0.5f), true, true, nullptr, f)) return false;
+    ++result.casesRun;
+    result.toolTipInsideForceY = f[1];
+    result.maxRelativeError = std::max(result.maxRelativeError, relativeError(f[1], result.expectedInside));
+    if (f[1] > 0.0f && relativeError(f[1], result.expectedInside) < 1e-3 && pushedAlongY(f, result.expectedInside))
+        ++result.casesPassed;
+
+    // 4. Case 2 under the old unsigned law must push the vertex INWARD - the
+    //    failure the side rule fixes. If it didn't, cases 1-3 would prove nothing.
+    if (!runCase(smallTriangle(-h, -0.5f), bigFace, false, false, nullptr, f)) return false;
+    ++result.casesRun;
+    result.unsignedInsideForceY = f[1];
+    if (f[1] < 0.0f) ++result.casesPassed;
+
+    // 5. Stiffness sign: nudge the inside vertex OUTWARD by delta; its push must
+    //    drop by stiffness * delta (kFactor = 1, i.e. df = (df/dx) dx).
+    const float nudge[3] = { 0.0f, delta, 0.0f };
+    if (!runCase(smallTriangle(-h, -0.5f), bigFace, true, false, nudge, f)) return false;
+    ++result.casesRun;
+    result.stiffnessDfY = f[1];
+    result.maxRelativeError = std::max(result.maxRelativeError, relativeError(f[1], result.expectedStiffnessDf));
+    if (relativeError(f[1], result.expectedStiffnessDf) < 1e-3 && pushedAlongY(f, result.expectedStiffnessDf))
+        ++result.casesPassed;
+
+    // 6. Gate 2d, through the public entry point a force field uses: the outside
+    //    case gives its force in the pass that computed it, and nothing once a
+    //    new collision pass has begun without recomputing the pair (as when the
+    //    broad phase drops a pair whose bodies have moved apart).
+    {
+        const std::vector<BackendTriangleVertex> firstPositions = smallTriangle(h, 0.5f);
+        TriangleIndexedSurface first;
+        first.positions = firstPositions.data();
+        first.vertexCount = 3;
+        first.triangleIndices = oneTriangle.data();
+        first.triangleCount = 1;
+        first.surfaceId = ++nextSurfaceId;
+        TriangleIndexedSurface second = first;
+        second.positions = bigFace.data();
+        second.surfaceId = ++nextSurfaceId;
+        std::vector<ProximityContact> unused;
+        FeatureBasedProximityStats stats;
+        if (!computeFeatureBasedProximityContacts(first, second, grid, proximity, unused, &stats, diagnostic))
+        {
+            return false;
+        }
+
+        float* buffers[4] = {};  // positions first/second, forces first/second
+        const std::size_t bytes = 9u * sizeof(float);
+        cudaError_t err = cudaSuccess;
+        for (float*& b : buffers)
+        {
+            if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&b), bytes);
+            if (err == cudaSuccess) err = cudaMemset(b, 0, bytes);
+        }
+        if (err == cudaSuccess) err = cudaMemcpy(buffers[0], firstPositions.data(), bytes, cudaMemcpyHostToDevice);
+        if (err == cudaSuccess) err = cudaMemcpy(buffers[1], bigFace.data(), bytes, cudaMemcpyHostToDevice);
+
+        ContactPenaltyConfig config;
+        config.stiffness = stiffness;
+        config.contactDistance = contactDistance;
+        config.useSurfaceNormals = true;
+        const auto forceOnVertex0 = [&](double& outY) -> bool {
+            if (err == cudaSuccess) err = cudaMemset(buffers[2], 0, bytes);
+            if (err == cudaSuccess) err = cudaMemset(buffers[3], 0, bytes);
+            if (err != cudaSuccess) return false;
+            if (!accumulateContactPenaltyForces(config, first.surfaceId, second.surfaceId, buffers[2], buffers[3],
+                                                nullptr, nullptr, buffers[0], buffers[1], nullptr, diagnostic))
+            {
+                return false;
+            }
+            float out[3] = {};
+            err = cudaDeviceSynchronize();
+            if (err == cudaSuccess) err = cudaMemcpy(out, buffers[2], sizeof(out), cudaMemcpyDeviceToHost);
+            outY = out[1];
+            return err == cudaSuccess;
+        };
+        bool ran = forceOnVertex0(result.currentPassForceY);
+        if (ran)
+        {
+            beginContactFrame();   // a new pass that does not recompute this pair
+            ran = forceOnVertex0(result.stalePassForceY);
+        }
+        for (float* b : buffers) cudaFree(b);
+        if (!ran)
+        {
+            if (err != cudaSuccess) diagnostic = std::string("stale-pair check CUDA error: ") + cudaGetErrorString(err);
+            return false;
+        }
+        ++result.casesRun;
+        if (relativeError(result.currentPassForceY, result.expectedOutside) < 1e-3 && result.stalePassForceY == 0.0)
+            ++result.casesPassed;
+    }
+
+    if (validation != nullptr) *validation = result;
     diagnostic.clear();
     return true;
 }

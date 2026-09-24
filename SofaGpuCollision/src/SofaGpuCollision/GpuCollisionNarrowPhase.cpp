@@ -757,6 +757,9 @@ void GpuCollisionNarrowPhase::beginNarrowPhase()
 {
     m_pendingPairs.clear();
     ++m_frameCounter;
+    // New collision pass: a pair not recomputed below (the broad phase dropped it
+    // because the bodies moved apart) must not keep its last contacts' forces.
+    backend::beginContactFrame();
 #ifdef SOFAGPUCOLLISION_WITH_CUDA
     markTriangleTopologyCacheUnused();
 #endif

@@ -6,7 +6,7 @@ BUILD=${SOFA_GPU_COLLISION_BUILD_DIR:-$REPO/SofaGpuCollision/build-profile}
 BENCH=$BUILD/SofaGpuCollisionDenseGridBackendBench
 OUT=${SOFA_FUSED_WINNER_OUT:-$REPO/output/fused_winner_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$OUT"
-export LD_LIBRARY_PATH="$BUILD:/opt/sofa/install/v25.12/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:/opt/sofa/install/v25.12/lib:${LD_LIBRARY_PATH:-}"
 
 # Factors 1/2/4, tile chunking, CSR/hash, and both shared builders.
 SOFA_BACKEND_BENCH_STEPS=2 SOFA_BACKEND_BENCH_WARMUP=1 \

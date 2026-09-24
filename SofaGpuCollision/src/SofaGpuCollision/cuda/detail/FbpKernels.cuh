@@ -48,6 +48,7 @@ struct RecordedContactHandle
     const std::uint32_t* secondIndices { nullptr };
     std::uint64_t firstSurfaceId { 0 };
     std::uint64_t secondSurfaceId { 0 };
+    std::uint64_t collisionPass { 0 };   ///< registry pass in which these contacts were computed
     bool valid { false };
 };
 
@@ -58,6 +59,11 @@ struct ContactHandleRegistry
     RecordedContactHandle slots[kContactHandleSlots];
     std::size_t nextSlot { 0 };
     std::uint64_t evictions { 0 };   ///< non-zero => more live pairs than slots
+    // Advanced once per collision pass (beginContactFrame). A handle stamped
+    // with an older pass belongs to a pair the narrow phase did not compute this
+    // time - the broad phase dropped it because the bodies' boxes no longer
+    // overlap - so it has no contacts now, though it still points at old ones.
+    std::uint64_t collisionPass { 0 };
 };
 
 ContactHandleRegistry& contactHandleRegistry()
@@ -127,6 +133,7 @@ void recordContactHandle(
     target->secondIndices = secondIndices;
     target->firstSurfaceId = firstSurfaceId;
     target->secondSurfaceId = secondSurfaceId;
+    target->collisionPass = registry.collisionPass;
     target->valid = (target->contacts != nullptr && countDevice != nullptr &&
                      firstIndices != nullptr && secondIndices != nullptr);
 }

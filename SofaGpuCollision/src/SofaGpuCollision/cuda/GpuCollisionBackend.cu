@@ -33,7 +33,10 @@
 // includes, NOT separate compilation units. Include order is dependency order:
 // common device math -> dense grid (owns the shared cell math + pair dedup) ->
 // legacy paths -> FBP kernels -> hash -> simple hash -> sorted grid ->
-// big-cell fused -> contact forces (the CONSUMER, needs every producer above).
+// big-cell fused -> contact forces (the CONSUMER, needs every producer above) ->
+// contact constraints (the constraint-based consumer; reuses contact forces' geometry) ->
+// tissue solver (the deformable body's own step; reuses the constraints' helpers and
+// hands them its factor).
 // Each module holds one concern's workspace + kernels + host driver(s).
 // ============================================================================
 
@@ -46,3 +49,5 @@
 #include "detail/SortedGrid.cuh"
 #include "detail/BigCellGrid.cuh"
 #include "detail/ContactForces.cuh"
+#include "detail/ContactConstraints.cuh"
+#include "detail/TissueSolver.cuh"

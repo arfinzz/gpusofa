@@ -115,6 +115,9 @@ GpuCollisionBroadPhase::GpuCollisionBroadPhase()
     , d_logBackendStatus(initData(&d_logBackendStatus, true, "logBackendStatus", "Log the selected broad phase backend during init."))
     , d_logBoxesOnce(initData(&d_logBoxesOnce, false, "logBoxesOnce", "Log the first-frame root AABBs collected for GPU broad phase."))
     , d_useObjectAabbCulling(initData(&d_useObjectAabbCulling, false, "useObjectAabbCulling", "Use object-level GPU AABB culling before narrow phase. Disable this for one tissue/one tool surgical scenes."))
+    , d_testGpuModelBoxes(initData(&d_testGpuModelBoxes, true, "testGpuModelBoxes",
+        "Test the root boxes of pairs of GPU (Cuda) models before the narrow phase. Turn off with GpuCollisionPipeline, "
+        "which does not update GPU models' boxes each frame; the GPU narrow phase then decides alone."))
 {
 }
 
@@ -205,7 +208,10 @@ void GpuCollisionBroadPhase::endBroadPhase()
             std::swap(cm1, cm2);
         }
 
-        if (!intersector->canIntersect(cm1->begin(), cm2->begin(), this->intersectionMethod))
+        // GPU (Cuda) models' root boxes are stale under GpuCollisionPipeline: skip their test.
+        const bool gpuPair = lastA->getTemplateName().rfind("Cuda", 0) == 0 && lastB->getTemplateName().rfind("Cuda", 0) == 0;
+        if ((d_testGpuModelBoxes.getValue() || !gpuPair) &&
+            !intersector->canIntersect(cm1->begin(), cm2->begin(), this->intersectionMethod))
         {
             return;
         }

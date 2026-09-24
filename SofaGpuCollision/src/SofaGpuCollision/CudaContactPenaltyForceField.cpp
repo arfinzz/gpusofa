@@ -25,6 +25,8 @@ CudaContactPenaltyForceField::CudaContactPenaltyForceField()
         "Separation at which the penalty force starts. MUST match the contactDistance the contacts were generated with, otherwise the force turns on at the wrong distance."))
     , d_useDamping(initData(&d_useDamping, false, "useDamping",
         "Enable the damping term. Requires gathering velocities at each contact, so it costs extra device reads."))
+    , d_useSurfaceNormals(initData(&d_useSurfaceNormals, true, "useSurfaceNormals",
+        "Use each triangle's outward normal to tell which side a point is on, so a point that has crossed the other surface is pushed back out, harder the deeper it is. Both meshes must be wound with normals pointing out of the object. False = the older unsigned proximity law, which pushes a crossed point further through."))
     , d_reportStats(initData(&d_reportStats, false, "reportStats",
         "Read back contact/active counts each frame for diagnostics. Costs one synchronisation per frame; leave off in production."))
     , d_firstSurfaceIdOverride(initData(&d_firstSurfaceIdOverride, static_cast<unsigned int>(0), "firstSurfaceId",
@@ -92,7 +94,7 @@ void CudaContactPenaltyForceField::init()
 void CudaContactPenaltyForceField::addForce(
     const sofa::core::MechanicalParams* /*mparams*/,
     DataVecDeriv& f1, DataVecDeriv& f2,
-    const DataVecCoord& /*x1*/, const DataVecCoord& /*x2*/,
+    const DataVecCoord& x1, const DataVecCoord& x2,
     const DataVecDeriv& v1, const DataVecDeriv& v2)
 {
     const auto firstId = m_firstSurfaceId;
@@ -106,6 +108,11 @@ void CudaContactPenaltyForceField::addForce(
     config.stiffness = static_cast<float>(d_stiffness.getValue());
     config.damping = d_useDamping.getValue() ? static_cast<float>(d_damping.getValue()) : 0.0f;
     config.contactDistance = static_cast<float>(d_contactDistance.getValue());
+    config.useSurfaceNormals = d_useSurfaceNormals.getValue();
+
+    // deviceRead(): the positions the contacts were detected from, read in place.
+    const void* devicePositions1 = config.useSurfaceNormals ? x1.getValue().deviceRead() : nullptr;
+    const void* devicePositions2 = config.useSurfaceNormals ? x2.getValue().deviceRead() : nullptr;
 
     // deviceWrite()/deviceRead() ONLY. helper::WriteAccessor would call
     // hostWrite(), copying the whole force vector to the host and invalidating
@@ -130,6 +137,7 @@ void CudaContactPenaltyForceField::addForce(
         config, firstId, secondId,
         deviceForce1, deviceForce2,
         deviceVel1, deviceVel2,
+        devicePositions1, devicePositions2,
         d_reportStats.getValue() ? &stats : nullptr,
         diagnostic);
 
@@ -180,9 +188,20 @@ void CudaContactPenaltyForceField::addDForce(
     config.stiffness = static_cast<float>(d_stiffness.getValue());
     config.damping = 0.0f;  // the damping term's derivative is handled by SOFA's b-factor
     config.contactDistance = static_cast<float>(d_contactDistance.getValue());
+    config.useSurfaceNormals = d_useSurfaceNormals.getValue();
 
     const auto kFactor = static_cast<float>(
         sofa::core::mechanicalparams::kFactorIncludingRayleighDamping(mparams, this->rayleighStiffness.getValue()));
+
+    // The same positions addForce used, so both passes agree on each contact's
+    // direction and on which contacts are active.
+    const void* devicePositions1 = nullptr;
+    const void* devicePositions2 = nullptr;
+    if (config.useSurfaceNormals)
+    {
+        devicePositions1 = this->mstate1->read(sofa::core::vec_id::read_access::position)->getValue().deviceRead();
+        devicePositions2 = this->mstate2->read(sofa::core::vec_id::read_access::position)->getValue().deviceRead();
+    }
 
     VecDeriv& dforce1 = *df1.beginEdit();
     VecDeriv& dforce2 = *df2.beginEdit();
@@ -192,6 +211,7 @@ void CudaContactPenaltyForceField::addDForce(
         config, firstId, secondId, kFactor,
         dforce1.deviceWrite(), dforce2.deviceWrite(),
         dx1.getValue().deviceRead(), dx2.getValue().deviceRead(),
+        devicePositions1, devicePositions2,
         diagnostic);
 
     df1.endEdit();

@@ -14,7 +14,7 @@ BASE="${REPO}/output/benchmark_logs/branch_cmp_20260609"
 
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null || true)"
 export SOFA_PLUGIN_PATH="${SOFA_ROOT}/lib:${SOFA_ROOT}/plugins:${PLP%:}"
-export LD_LIBRARY_PATH="${SOFA_ROOT}/lib:${PLP}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${SOFA_ROOT}/lib:${PLP}"
 export SOFA_PROXIMITY_READ_CONTACT_COUNTER=1
 export SOFA_USE_TOOL_ACTIVE_CELL_GENERATION=1
 export SOFA_HASH_TISSUE_NX=21

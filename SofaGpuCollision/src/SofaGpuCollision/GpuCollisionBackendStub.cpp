@@ -221,6 +221,10 @@ void clearRecordedContactHandles()
 {
 }
 
+void beginContactFrame()
+{
+}
+
 bool validateContactPenaltyForces(
     const ContactPenaltyConfig&,
     const TriangleIndexedSurface&,
@@ -233,12 +237,21 @@ bool validateContactPenaltyForces(
     return false;
 }
 
+bool validateContactSideAwareness(ContactSideValidation* validation, std::string& diagnostic)
+{
+    if (validation != nullptr) *validation = ContactSideValidation {};
+    diagnostic = "Contact side validation is unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
 bool accumulateContactPenaltyForces(
     const ContactPenaltyConfig&,
     std::uint64_t,
     std::uint64_t,
     void*,
     void*,
+    const void*,
+    const void*,
     const void*,
     const void*,
     ContactPenaltyStats* stats,
@@ -258,9 +271,177 @@ bool accumulateContactPenaltyDForces(
     void*,
     const void*,
     const void*,
+    const void*,
+    const void*,
     std::string& diagnostic)
 {
     diagnostic = "GPU contact penalty dforces are unavailable because the plugin was built without CUDA support.";
+    return false;
+}
+
+namespace
+{
+const char* const kNoCudaConstraints = "GPU contact constraints are unavailable because the plugin was built without CUDA support.";
+}
+
+struct ConstraintWorkspace
+{
+};
+
+ConstraintWorkspace* createConstraintWorkspace(std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return nullptr;
+}
+
+void destroyConstraintWorkspace(ConstraintWorkspace* workspace)
+{
+    delete workspace;
+}
+
+bool setRigidSystem(ConstraintWorkspace*, const double[36], std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool buildContactConstraints(ConstraintWorkspace*, const ConstraintBuildInput&, ConstraintBuildStats* stats,
+                             ConstraintTimings*, std::string& diagnostic)
+{
+    if (stats != nullptr) *stats = ConstraintBuildStats {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool factorizeDeformableSystem(ConstraintWorkspace*, const HostCsrMatrix&, ConstraintTimings*, std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool assembleContactCompliance(ConstraintWorkspace*, double, double, ConstraintTimings*, std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool solveContactConstraints(ConstraintWorkspace*, const ConstraintSolveConfig&, ConstraintSolveStats* stats,
+                             ConstraintTimings*, std::string& diagnostic)
+{
+    if (stats != nullptr) *stats = ConstraintSolveStats {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool computeContactCorrection(ConstraintWorkspace*, std::vector<float>& deformableCorrection, double rigidCorrection[6],
+                              ConstraintImpulse* impulse, ConstraintTimings*, std::string& diagnostic)
+{
+    deformableCorrection.clear();
+    for (int e = 0; e < 6; ++e) rigidCorrection[e] = 0.0;
+    if (impulse != nullptr) *impulse = ConstraintImpulse {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool downloadContactProblem(ConstraintWorkspace*, bool, ConstraintProblemSnapshot& snapshot, std::string& diagnostic)
+{
+    snapshot = ConstraintProblemSnapshot {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool solveFrictionProblemOnGpu(int, int, const std::vector<double>&, const std::vector<double>&, double,
+                               const ConstraintSolveConfig&, std::vector<double>& lambda, ConstraintSolveStats* stats,
+                               std::string& diagnostic)
+{
+    lambda.clear();
+    if (stats != nullptr) *stats = ConstraintSolveStats {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool computeDenseComplianceOnGpu(const HostCsrMatrix&, const std::vector<int>&, std::vector<double>& compliance,
+                                 ConstraintTimings*, std::string& diagnostic)
+{
+    compliance.clear();
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool useExternalDeformableFactor(ConstraintWorkspace*, const float*, int, std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool computeContactCorrectionOnDevice(ConstraintWorkspace*, double rigidCorrection[6], ConstraintImpulse* impulse,
+                                      ConstraintTimings*, std::string& diagnostic)
+{
+    for (int e = 0; e < 6; ++e) rigidCorrection[e] = 0.0;
+    if (impulse != nullptr) *impulse = ConstraintImpulse {};
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool applyContactCorrectionOnDevice(ConstraintWorkspace*, const DeviceCorrectionTarget&, std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool downloadDeformableCorrection(ConstraintWorkspace*, std::vector<float>& correction, std::string& diagnostic)
+{
+    correction.clear();
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+namespace
+{
+const char* const kNoCudaTissue = "The GPU tissue solver is unavailable because the plugin was built without CUDA support.";
+}
+
+struct TissueWorkspace
+{
+};
+
+TissueWorkspace* createTissueWorkspace(const TissueSetup&, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return nullptr;
+}
+
+void destroyTissueWorkspace(TissueWorkspace* workspace)
+{
+    delete workspace;
+}
+
+bool tissueFreeMotion(TissueWorkspace*, const void*, const void*, void*, void*, const TissueStepConfig&,
+                      TissueTimings* timings, std::string& diagnostic)
+{
+    if (timings != nullptr) *timings = TissueTimings {};
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+const float* tissueFactor(const TissueWorkspace*, int& size)
+{
+    size = 0;
+    return nullptr;
+}
+
+bool tissueMonitor(TissueWorkspace*, const void*, int, double& minVolumeRatio, double position[3], std::string& diagnostic)
+{
+    minVolumeRatio = 0.0;
+    for (int c = 0; c < 3; ++c) position[c] = 0.0;
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool downloadTissueStep(TissueWorkspace*, bool, TissueStepSnapshot& snapshot, std::string& diagnostic)
+{
+    snapshot = TissueStepSnapshot {};
+    diagnostic = kNoCudaTissue;
     return false;
 }
 

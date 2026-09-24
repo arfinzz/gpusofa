@@ -36,8 +36,13 @@ namespace SofaGpuCollision
 // Response law (proximity penalty, matching how the contacts were generated —
 // they only exist within contactDistance in the first place):
 //
-//     depth = contactDistance - distance
+//     depth = contactDistance - separation
 //     F     = max(0, stiffness * depth - damping * relativeNormalVelocity)
+//
+// With useSurfaceNormals (the default) each triangle's outward normal tells
+// which side a point is on, so a point that has crossed the other surface gets
+// a negative separation and is pushed back OUT, harder the deeper it is. Both
+// meshes must be wound with their normals pointing out of the object.
 //
 // Use with DefaultAnimationLoop, whose step order is collision -> integrate, so
 // the buffer produced during collision is read while the solver evaluates forces.
@@ -85,6 +90,7 @@ private:
     DataReal d_damping;
     DataReal d_contactDistance;
     DataBool d_useDamping;
+    DataBool d_useSurfaceNormals;    ///< side-aware law; needs outward-wound meshes
     DataBool d_reportStats;          ///< costs one sync per frame; off by default
     DataUInt d_firstSurfaceIdOverride;   ///< 0 = derive from the mechanical state pointer
     DataUInt d_secondSurfaceIdOverride;

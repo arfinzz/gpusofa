@@ -587,13 +587,22 @@ struct BigCellStats
 // ============================================================================
 struct ContactPenaltyConfig
 {
-    // Penalty law: F = stiffness * max(0, contactDistance - distance)
+    // Penalty law: F = stiffness * max(0, contactDistance - separation)
     //                - damping * (relative normal velocity), clamped to >= 0.
     // contactDistance must match the value the contacts were generated with,
     // otherwise the force turns on at the wrong separation.
     float stiffness { 1000.0f };
     float damping { 0.0f };
     float contactDistance { 0.03f };
+    // Side awareness. The collision kernel reports an UNSIGNED distance and a
+    // normal from the first contact point to the second, which flips once a
+    // point crosses the other surface — a plain penalty then pushes it further
+    // through. With this on, each triangle's outward normal (from its winding)
+    // tells which side a point is on: overlapping contacts get a negative
+    // separation and a flipped direction, so the force grows with depth and
+    // always pushes back out. Needs both surfaces' device positions, and
+    // triangles wound so their normals point out of the object.
+    bool useSurfaceNormals { true };
 };
 
 struct ContactPenaltyStats
@@ -602,13 +611,25 @@ struct ContactPenaltyStats
     std::uint32_t activeContactCount { 0 };  // those actually producing force
 };
 
-// Accumulate penalty forces from the last proximity result for (firstSurfaceId,
-// secondSurfaceId). Returns false (with a diagnostic) if no handle was recorded
-// for that pair this frame — e.g. the pair produced no contacts, or a different
-// pair ran last.
+// Start a new collision pass (the narrow phase calls it once per frame, before
+// any pair). A pair whose contacts are not recomputed after this call has no
+// contacts this frame: the force functions below then apply nothing, instead of
+// the last contacts recorded for it. That happens when the broad phase stops
+// sending the pair because the two bodies' boxes no longer overlap.
+SOFA_GPU_COLLISION_API void beginContactFrame();
+
+// Accumulate penalty forces from the current collision pass's contacts for
+// (firstSurfaceId, secondSurfaceId). A pair with no contacts in this pass - not
+// recorded yet because its bodies have not come within reach, or not recomputed
+// this pass - applies nothing and returns true: that is the normal no-contact
+// state. Returns false (with a diagnostic) only on a fault: null vectors,
+// missing positions, a kernel launch error, or more live pairs than the contact
+// registry holds (16).
 //
 // deviceFirstForces / deviceSecondForces: Vec3f* device pointers, accumulated
 // into (never overwritten). Velocity pointers may be null when damping == 0.
+// Position pointers (the surfaces' current Vec3f positions, device) are
+// required when config.useSurfaceNormals is set, and ignored otherwise.
 SOFA_GPU_COLLISION_API bool accumulateContactPenaltyForces(
     const ContactPenaltyConfig& config,
     std::uint64_t firstSurfaceId,
@@ -617,12 +638,17 @@ SOFA_GPU_COLLISION_API bool accumulateContactPenaltyForces(
     void* deviceSecondForces,
     const void* deviceFirstVelocities,
     const void* deviceSecondVelocities,
+    const void* deviceFirstPositions,
+    const void* deviceSecondPositions,
     ContactPenaltyStats* stats,
     std::string& diagnostic);
 
-// Stiffness-times-dx for implicit integration (SOFA's addDForce). Applies
-// K = kFactor * stiffness * (n outer n) for each active contact, projected
-// through the same per-vertex weights.
+// Stiffness-times-dx for implicit integration (SOFA's addDForce). Adds
+// kFactor * (df/dx) * dx, where df/dx = -stiffness * (n outer n) on the
+// relative displacement of each active contact (the same sign convention as
+// SOFA's PenalityContactForceField), projected through the same per-vertex
+// weights. Must see the same positions as the force pass, so that both use
+// the same direction and the same set of active contacts.
 SOFA_GPU_COLLISION_API bool accumulateContactPenaltyDForces(
     const ContactPenaltyConfig& config,
     std::uint64_t firstSurfaceId,
@@ -632,6 +658,8 @@ SOFA_GPU_COLLISION_API bool accumulateContactPenaltyDForces(
     void* deviceSecondDForces,
     const void* deviceFirstDx,
     const void* deviceSecondDx,
+    const void* deviceFirstPositions,
+    const void* deviceSecondPositions,
     std::string& diagnostic);
 
 // Self-validation for the contact-force path (Gates 1 and 2). Runs the GPU
@@ -676,6 +704,39 @@ SOFA_GPU_COLLISION_API bool validateContactPenaltyForces(
     ContactForceValidation* validation,
     std::string& diagnostic);
 
+// Gates 2b and 2c — side awareness and stiffness sign, on tiny two-triangle
+// cases run through the REAL collision detection and the REAL force kernels:
+//   * a vertex just OUTSIDE a face, a vertex just INSIDE it, and a tool tip
+//     that has sunk INTO a face: each must be pushed toward the outside, with
+//     magnitude stiffness * (contactDistance - separation), separation < 0 inside;
+//   * the same inside case under the old unsigned law is also run and must
+//     push the vertex INWARD — proof that the case exercises the fixed failure;
+//   * moving the inside vertex outward by delta must reduce its push by
+//     stiffness * delta (the implicit stiffness term has the right sign).
+// Gate 2d, through the public accumulateContactPenaltyForces: the outside case
+// must give its force in the collision pass that computed it, and exactly zero
+// once a new pass has begun without recomputing the pair (no stale contacts).
+struct ContactSideValidation
+{
+    std::uint32_t casesRun { 0 };
+    std::uint32_t casesPassed { 0 };
+    double vertexOutsideForceY { 0.0 };     // expected +k*(cd - h)
+    double vertexInsideForceY { 0.0 };      // expected +k*(cd + h)
+    double toolTipInsideForceY { 0.0 };     // expected +k*(cd + h)
+    double unsignedInsideForceY { 0.0 };    // old law, same inside case: expected < 0
+    double stiffnessDfY { 0.0 };            // expected -k*delta (kFactor = 1)
+    double currentPassForceY { 0.0 };       // gate 2d, same pass: expected +k*(cd - h)
+    double stalePassForceY { 0.0 };         // gate 2d, next pass, pair not recomputed: expected 0
+    double expectedOutside { 0.0 };
+    double expectedInside { 0.0 };
+    double expectedStiffnessDf { 0.0 };
+    double maxRelativeError { 0.0 };        // over the magnitude checks
+};
+
+SOFA_GPU_COLLISION_API bool validateContactSideAwareness(
+    ContactSideValidation* validation,
+    std::string& diagnostic);
+
 SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(
     const TriangleIndexedSurface& firstSurface,
     const TriangleIndexedSurface& secondSurface,
@@ -687,5 +748,334 @@ SOFA_GPU_COLLISION_API bool computeBigCellFusedProximityContacts(
     BigCellStats* bigStats,
     std::string& diagnostic,
     BackendExecutionStats* executionStats = nullptr);
+
+// ============================================================================
+// GPU contact constraints: Lagrange multipliers with Coulomb friction.
+//
+// The GPU counterpart of SOFA's constraint step (FreeMotionAnimationLoop +
+// BlockGaussSeidelConstraintSolver + UnilateralLagrangianConstraint +
+// LinearSolverConstraintCorrection) for one deformable body (body 1, a Vec3
+// state whose GPU collision surface uses the same vertex numbering) touching
+// one rigid body (body 2, a Rigid3 state with a rigidly mapped GPU surface).
+// Per step, in this order:
+//   setRigidSystem            body 2's 6x6 implicit system matrix
+//   buildContactConstraints   rows + free violations from this pass's contacts
+//   factorizeDeformableSystem body 1's implicit system matrix, dense Cholesky
+//                             on the GPU (only needed when there are rows)
+//   assembleContactCompliance W = f1 J1 A1^-1 J1^T + f2 J2 A2^-1 J2^T
+//   solveContactConstraints   SOFA's block Gauss-Seidel with friction
+//   computeContactCorrection  dv = A^-1 J^T lambda for both bodies
+// Every formula follows SOFA's CPU code (see cuda/detail/ContactConstraints.cuh)
+// so the two can be compared on identical inputs. lambda is an impulse (force x
+// dt), as in SOFA.
+// ============================================================================
+
+struct ConstraintWorkspace;   // opaque, owns every GPU buffer and library handle
+
+SOFA_GPU_COLLISION_API ConstraintWorkspace* createConstraintWorkspace(std::string& diagnostic);
+SOFA_GPU_COLLISION_API void destroyConstraintWorkspace(ConstraintWorkspace* workspace);
+
+// A square sparse matrix in scalar CSR form, host memory, both triangles stored.
+struct HostCsrMatrix
+{
+    int size { 0 };
+    int nonZeros { 0 };
+    const int* rowPtr { nullptr };      // size + 1
+    const int* columns { nullptr };     // nonZeros
+    const double* values { nullptr };   // nonZeros
+};
+
+// GPU time per stage (CUDA events), filled only when a pointer is passed.
+struct ConstraintTimings
+{
+    double factorizeMs { 0.0 };
+    double buildMs { 0.0 };
+    double complianceMs { 0.0 };
+    double solveMs { 0.0 };
+    double correctionMs { 0.0 };
+};
+
+enum class ConstraintContactFilter
+{
+    VertexFace = 0,   // one vertex-face contact per vertex (closest face), both sides; no edge-edge
+    All = 1           // every contact the narrow phase reported
+};
+
+struct ConstraintBuildInput
+{
+    std::uint64_t deformableSurfaceId { 0 };
+    std::uint64_t rigidSurfaceId { 0 };
+    const void* deformableSurfacePositions { nullptr };  // DEVICE Vec3f, positions contacts were found at
+    const void* rigidSurfacePositions { nullptr };       // DEVICE Vec3f
+    std::uint32_t deformableVertexCount { 0 };
+    std::uint32_t rigidVertexCount { 0 };
+    const float* deformableFreePositions { nullptr };    // HOST Vec3f per body-1 vertex (uploaded), or
+    const void* deformableFreePositionsDevice { nullptr }; // DEVICE Vec3f (body 1 on the GPU: no upload)
+    // Body 2's centre when the contacts were found, and its free motion over the
+    // step as dt * free velocity (linear, then angular; world frame). SOFA moves
+    // a mapped point by exactly that: x_free = x + dt v_free on every state, with
+    // RigidMapping's v + omega x r, so p_free = p + linear + angular x (p - centre).
+    double rigidCenter[3] { 0.0, 0.0, 0.0 };
+    double rigidFreeStep[6] { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    // DOFs held by projective constraints (SOFA removes them from the constraint
+    // rows: MechanicalProjectJacobianMatrixVisitor). Body 1: HOST, one byte per
+    // vertex, bit c set = DOF c free; nullptr = all free. Body 2: bit e = DOF e.
+    const std::uint8_t* deformableDofMask { nullptr };
+    std::uint8_t rigidDofMask { 0x3F };
+    float contactDistance { 0.0f };                      // SOFA's contactDistance (the gap kept)
+    float friction { 0.0f };                             // mu; 0 = one row per contact
+    ConstraintContactFilter filter { ConstraintContactFilter::VertexFace };
+};
+
+struct ConstraintBuildStats
+{
+    std::uint32_t detectedContacts { 0 };   // reported by the narrow phase
+    std::uint32_t contacts { 0 };           // kept as constraints
+    std::uint32_t rows { 0 };
+    std::uint32_t touchedVertices { 0 };    // body-1 vertices the rows act on
+};
+
+struct ConstraintSolveConfig
+{
+    int maxIterations { 1000 };
+    double tolerance { 0.001 };
+    bool scaleTolerance { true };       // SOFA: tolerance x number of rows
+    bool allVerified { false };
+    double sor { 1.0 };
+    // true: SOFA's own arithmetic in double throughout (to check the kernel
+    // against SOFA to machine precision); false: float with precomputed
+    // per-contact divisors, the fast mode for simulation.
+    bool doubleAccumulation { false };
+};
+
+struct ConstraintSolveStats
+{
+    int iterations { 0 };
+    double error { 0.0 };
+    bool converged { false };
+    double gpuMilliseconds { 0.0 };   // the Gauss-Seidel itself (CUDA events), no uploads
+};
+
+// The built problem, for comparisons with SOFA's CPU pipeline.
+struct ConstraintProblemSnapshot
+{
+    std::uint32_t contacts { 0 };
+    std::uint32_t rows { 0 };
+    std::uint32_t rowsPerContact { 3 };
+    std::uint32_t touchedVertices { 0 };
+    double friction { 0.0 };
+    std::vector<std::int32_t> rowVertices;     // rows*3 body-1 vertex ids (-1 = unused)
+    std::vector<double> rowDeformable;         // rows*9 coefficient (Vec3) per row vertex
+    std::vector<double> rowRigid;              // rows*6 body-2 row [u ; r x u]
+    std::vector<double> dfree;                 // rows
+    std::vector<double> contactGeometry;       // contacts*21: P, Q, Pfree, Qfree, n, t, s
+    std::vector<std::int32_t> contactVertices; // contacts*3 body-1 vertex ids (-1 = unused)
+    std::vector<double> contactWeights;        // contacts*3
+    std::vector<double> compliance;            // rows*rows row-major (when requested)
+    std::vector<double> lambda;                // rows (after a solve)
+};
+
+SOFA_GPU_COLLISION_API bool setRigidSystem(ConstraintWorkspace* workspace, const double matrix[36], std::string& diagnostic);
+
+SOFA_GPU_COLLISION_API bool buildContactConstraints(
+    ConstraintWorkspace* workspace,
+    const ConstraintBuildInput& input,
+    ConstraintBuildStats* stats,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+SOFA_GPU_COLLISION_API bool factorizeDeformableSystem(
+    ConstraintWorkspace* workspace,
+    const HostCsrMatrix& matrix,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+SOFA_GPU_COLLISION_API bool assembleContactCompliance(
+    ConstraintWorkspace* workspace,
+    double deformableFactor,
+    double rigidFactor,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+SOFA_GPU_COLLISION_API bool solveContactConstraints(
+    ConstraintWorkspace* workspace,
+    const ConstraintSolveConfig& config,
+    ConstraintSolveStats* stats,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+// The impulses of this step's solution (lambda is an impulse: divide by dt for forces).
+struct ConstraintImpulse
+{
+    double rigid[6] { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };   // J2^T lambda on body 2 (force part, then torque about its centre)
+    double normalSum { 0.0 };                           // sum of the normal multipliers
+};
+
+// deformableCorrection: one value per body-1 DOF (3 per vertex); rigidCorrection:
+// the 6 body-2 DOFs. Both are A^-1 J^T lambda (velocity changes). impulse may be null.
+SOFA_GPU_COLLISION_API bool computeContactCorrection(
+    ConstraintWorkspace* workspace,
+    std::vector<float>& deformableCorrection,
+    double rigidCorrection[6],
+    ConstraintImpulse* impulse,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+SOFA_GPU_COLLISION_API bool downloadContactProblem(
+    ConstraintWorkspace* workspace,
+    bool withCompliance,
+    ConstraintProblemSnapshot& snapshot,
+    std::string& diagnostic);
+
+// Body 1 on the GPU (see the tissue solver below): use its Cholesky factor of A1
+// instead of factorizeDeformableSystem. The factor stays owned by the caller and
+// must stay valid until the correction.
+SOFA_GPU_COLLISION_API bool useExternalDeformableFactor(
+    ConstraintWorkspace* workspace, const float* factor, int size, std::string& diagnostic);
+
+// Body 1 on the GPU, in two parts. First the correction dv = A1^-1 J1^T lambda,
+// kept on the device (body 2's 6 values come back to the host as in
+// computeContactCorrection)...
+SOFA_GPU_COLLISION_API bool computeContactCorrectionOnDevice(
+    ConstraintWorkspace* workspace,
+    double rigidCorrection[6],
+    ConstraintImpulse* impulse,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+// ...then into body 1's state (device Vec3f): x = xFree + positionFactor dv,
+// v = vFree + velocityFactor dv, dx = positionFactor dv.
+struct DeviceCorrectionTarget
+{
+    void* x { nullptr };
+    void* v { nullptr };
+    void* dx { nullptr };
+    const void* xFree { nullptr };
+    const void* vFree { nullptr };
+    double positionFactor { 0.0 };
+    double velocityFactor { 1.0 };
+    int vertexCount { 0 };
+    bool withContacts { false };              // false: no correction this step (x = xFree, v = vFree, dx = 0)
+    const float* hostCorrection { nullptr };  // if set: this dv (host, uploaded) instead of the device one
+};
+SOFA_GPU_COLLISION_API bool applyContactCorrectionOnDevice(
+    ConstraintWorkspace* workspace, const DeviceCorrectionTarget& target, std::string& diagnostic);
+
+// The device correction of the last computeContactCorrectionOnDevice, for comparisons.
+SOFA_GPU_COLLISION_API bool downloadDeformableCorrection(
+    ConstraintWorkspace* workspace, std::vector<float>& correction, std::string& diagnostic);
+
+// Standalone pieces, for the checks in the test program:
+// the Gauss-Seidel solver on a given problem (W row-major rows x rows) ...
+SOFA_GPU_COLLISION_API bool solveFrictionProblemOnGpu(
+    int rows,
+    int rowsPerContact,
+    const std::vector<double>& W,
+    const std::vector<double>& dfree,
+    double mu,
+    const ConstraintSolveConfig& config,
+    std::vector<double>& lambda,
+    ConstraintSolveStats* stats,
+    std::string& diagnostic);
+
+// ... and the block of A^-1 on the given vertices' DOFs (3*count square,
+// column-major), through the same Cholesky + triangular solve + product.
+SOFA_GPU_COLLISION_API bool computeDenseComplianceOnGpu(
+    const HostCsrMatrix& matrix,
+    const std::vector<int>& vertices,
+    std::vector<double>& compliance,
+    ConstraintTimings* timings,
+    std::string& diagnostic);
+
+// ============================================================================
+// GPU tissue: one implicit Euler step of a tetrahedral viscoelastic tissue on the
+// GPU, following SOFA's CPU components stage for stage (see cuda/detail/
+// TissueSolver.cuh): SofaViscoElastic's SLSOgdenFirstOrder (+ MaxwellFirstOrder)
+// tetrahedra, MeshMatrixMass (not lumped), FixedProjectiveConstraint through the
+// linear system, EulerImplicitSolver with a direct solve. The state stays on the
+// GPU; the step leaves A's Cholesky factor for the contact constraints.
+// ============================================================================
+
+struct TissueWorkspace;
+
+struct TissueMaterial
+{
+    bool hasOgden { true };        // SLSOgdenFirstOrder: mu1, alpha1, G1 (its viscous branch), tau, k0
+    double ogdenMu1 { 0.0 };
+    double ogdenAlpha1 { 2.0 };
+    double ogdenG1 { 0.0 };
+    double ogdenTau { 1.0 };
+    double ogdenK0 { 0.0 };
+    // true: C^p built as SofaViscoElastic v25.12 builds it (sorted eigenvalues paired with C's
+    // scaled lower triangle, not its eigenvectors; see sofaOgdenBasis); false: exact eigenvectors.
+    bool ogdenSofaEigenvectors { true };
+    bool hasMaxwell { false };     // MaxwellFirstOrder: G1, tau, lambda
+    double maxwellG1 { 0.0 };
+    double maxwellTau { 1.0 };
+    double maxwellLambda { 0.0 };
+};
+
+struct TissueSetup
+{
+    int vertexCount { 0 };
+    std::vector<int> tetrahedra;                   // 4 per tetrahedron
+    std::vector<int> edges;                        // 2 per edge: the topology's edge array
+    std::vector<int> tetrahedronEdges;             // 6 per tetrahedron: global edge of local edge j
+    std::vector<unsigned char> tetrahedronEdgeSides; // 6 per tetrahedron: k | (l << 2), the local vertices at
+                                                   //   the global edge's first and second end
+    std::vector<double> restPositions;             // 3 per vertex
+    std::vector<double> vertexMass;                // MeshMatrixMass: diagonal masses,
+    std::vector<double> edgeMass;                  //   edge masses,
+    std::vector<double> gravityMass;               //   and the lumped mass gravity acts on
+    std::vector<unsigned char> fixedDofs;          // per vertex, bit c set = DOF c held by a projective constraint
+    TissueMaterial material;
+    double gravity[3] { 0.0, 0.0, 0.0 };
+};
+
+struct TissueStepConfig
+{
+    double dt { 0.01 };
+    double rayleighMass { 0.0 };
+    double rayleighStiffness { 0.0 };
+    int refinementSteps { 1 };     // iterative refinement of the single-precision solve, in double
+};
+
+struct TissueTimings
+{
+    double materialMs { 0.0 };
+    double assembleMs { 0.0 };
+    double factorizeMs { 0.0 };
+    double solveMs { 0.0 };
+};
+
+SOFA_GPU_COLLISION_API TissueWorkspace* createTissueWorkspace(const TissueSetup& setup, std::string& diagnostic);
+SOFA_GPU_COLLISION_API void destroyTissueWorkspace(TissueWorkspace* workspace);
+
+// One free-motion step: x, v (device Vec3f at the step's start) -> xFree, vFree (device Vec3f).
+SOFA_GPU_COLLISION_API bool tissueFreeMotion(
+    TissueWorkspace* workspace, const void* x, const void* v, void* xFree, void* vFree,
+    const TissueStepConfig& config, TissueTimings* timings, std::string& diagnostic);
+
+// The Cholesky factor of A the last step left (dense, lower, column-major), or null.
+SOFA_GPU_COLLISION_API const float* tissueFactor(const TissueWorkspace* workspace, int& size);
+
+// The smallest volume ratio det(F) over the tetrahedra, and one vertex's position, for x (device).
+SOFA_GPU_COLLISION_API bool tissueMonitor(
+    TissueWorkspace* workspace, const void* x, int vertex, double& minVolumeRatio, double position[3],
+    std::string& diagnostic);
+
+// The last step's pieces, for comparisons (host, double).
+struct TissueStepSnapshot
+{
+    std::vector<double> force;                   // f at the step's start (material + gravity)
+    std::vector<double> stiffnessTimesVelocity;  // K v
+    std::vector<double> rhs;                     // b, projected
+    std::vector<double> dv;                      // the solution
+    std::vector<int> rowPtr;                     // A in CSR (with the Dirichlet rows/columns)
+    std::vector<int> columns;
+    std::vector<double> values;
+};
+SOFA_GPU_COLLISION_API bool downloadTissueStep(
+    TissueWorkspace* workspace, bool withMatrix, TissueStepSnapshot& snapshot, std::string& diagnostic);
 
 } // namespace SofaGpuCollision::backend

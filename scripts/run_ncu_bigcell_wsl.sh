@@ -12,7 +12,7 @@ SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 OUT=$REPO/output/benchmark_logs/profiling_bigcell_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null)"
-export LD_LIBRARY_PATH="$BUILD:${SOFA_ROOT}/lib:${PLP}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:${SOFA_ROOT}/lib:${PLP}"
 METRICS="gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread"
 
 profile_leg() {

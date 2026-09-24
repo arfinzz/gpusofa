@@ -11,7 +11,7 @@ WIN=$(ls -d /mnt/c/Users/arfin/Desktop/GPU*SOFA)
 STAMP=$(date +%Y%m%d_%H%M%S)
 OUT=$REPO/output/benchmark_logs/fresh_report_$STAMP
 mkdir -p "$OUT"
-export LD_LIBRARY_PATH="$BUILD:$SOFA_ROOT/lib"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:$SOFA_ROOT/lib"
 
 echo "=== sync + build ==="
 rsync -a "$WIN/SofaGpuCollision/src/" "$REPO/SofaGpuCollision/src/"

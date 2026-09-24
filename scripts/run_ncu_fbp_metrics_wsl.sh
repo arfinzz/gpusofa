@@ -8,7 +8,7 @@ BUILD=$REPO/SofaGpuCollision/build-profile
 BENCH=$BUILD/SofaGpuCollisionDenseGridBackendBench
 OUT=$REPO/output/benchmark_logs/ncu_fbp_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$OUT"
-export LD_LIBRARY_PATH="$BUILD:/opt/sofa/install/v25.12/lib"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:/opt/sofa/install/v25.12/lib"
 
 echo "=== ncu on featureBasedProximityKernel (8 launches) ==="
 ncu --target-processes all --kernel-name-base function \

@@ -11,7 +11,7 @@ BUILD=${SOFA_GPU_COLLISION_BUILD_DIR:-$REPO/SofaGpuCollision/build-profile}
 BENCH=$BUILD/SofaGpuCollisionDenseGridBackendBench
 OUT=${SOFA_BIGCELL_PROFILE_OUT:-$REPO/output/bigcell_detailed_profile_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$OUT"
-export LD_LIBRARY_PATH="$BUILD:/opt/sofa/install/v25.12/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$BUILD:/opt/sofa/install/v25.12/lib:${LD_LIBRARY_PATH:-}"
 
 run_leg() {
     local label=$1 nx=$2 steps=$3 warmup=$4 detailed=$5 internals=$6 graph=$7

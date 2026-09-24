@@ -18,6 +18,24 @@
 >
 > Gates 1 and 2 (the force math and Newton's third law) are not affected and still pass.
 
+> **Second correction (2026-09-24).** Three more faults in the contact code described here
+> were found while building the tissue-poke test, and fixed (details in the root `README.md`,
+> sections 7.7 and 15):
+>
+> 1. **The implicit stiffness term had the wrong sign.** The dForce kernel added
+>    `+k (n·dx) n`, which tells the implicit solver that the push gets *stronger* as the
+>    bodies separate (a negative stiffness) instead of weaker. It is now `−k n nᵀ` on the
+>    relative motion, the same convention as SOFA's `PenalityContactForceField`. Gate 1
+>    could not catch this: it checks forces, not their derivative. The new Gate 2c does.
+> 2. **The unsigned-distance problem (cause 2 above) is fixed.** With `useSurfaceNormals`
+>    (on by default), each triangle's outward normal tells the contact which side a point is
+>    on, so a point that has crossed a surface is pushed back out. Gate 2b checks it.
+> 3. **Stale contacts.** When the broad phase stopped sending a pair (the bodies' boxes no
+>    longer overlapped), the force field kept applying that pair's last contacts. Contacts
+>    now count only in the collision pass that computed them. Gate 2d checks it.
+>
+> Cause 1 above (the blade is 8 loose points, not a rigid body) still stands.
+
 The collision pipeline had a producer and no consumer. Contacts were computed on the
 device at 0.29 ms and then either sat unread in a device buffer or were copied into SOFA's
 host `DetectionOutput`. Every test scene was collision-only — no solver, no mass, no force
@@ -37,7 +55,7 @@ Companion docs: plan in `PLAN_TIER1_TIER3.md`, mode/metric explainers in
 | Component | File | Role |
 |---|---|---|
 | `contactVertexWeights` | `cuda/detail/ContactForces.cuh` | Decodes a contact's feature (VF / FV / EE) + local index + barycentrics into **weights on the triangle's 3 vertices**. Deliberately factored out — the future constraint path needs exactly this to build Jacobian rows |
-| penalty force / dForce kernels | same | `F = max(0, k·(contactDistance − d) − c·vₙ)` scattered onto the 6 owning vertices with `atomicAdd`; `K = k·(n⊗n)` for implicit integration |
+| penalty force / dForce kernels | same | `F = max(0, k·(contactDistance − d) − c·vₙ)` scattered onto the 6 owning vertices with `atomicAdd`; `K = −k·(n⊗n)` for implicit integration (the first version had the sign wrong: see the second correction) |
 | `accumulateContactPenaltyForces` / `…DForces` | public API | Contact struct stays private to the CUDA TU (§7 boundary rule): callers pass device force pointers and get forces, never contacts |
 | `RecordedContactHandle` | `cuda/detail/FbpKernels.cuh` | Every one of the five proximity drivers records where its contacts live, plus the device triangle indices needed to resolve owning vertices |
 | `CudaContactPenaltyForceField` | new SOFA component | `PairInteractionForceField<CudaVec3fTypes>`; reaches state **only** through `deviceWrite()` / `deviceRead()` |

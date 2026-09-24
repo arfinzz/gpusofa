@@ -30,7 +30,7 @@ import_nsys_report() {
 }
 
 SOFA_PLUGIN_LIB_PATHS="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf "%p:" 2>/dev/null || true)"
-export LD_LIBRARY_PATH="${BUILD_DIR}:${SOFA_ROOT}/lib:${NSIGHT_SYSTEMS_HOST_DIR}:${SOFA_PLUGIN_LIB_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${BUILD_DIR}:${SOFA_ROOT}/lib:${NSIGHT_SYSTEMS_HOST_DIR}:${SOFA_PLUGIN_LIB_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export SOFA_ROOT
 
 cmake -S "${REPO_DIR}/SofaGpuCollision" \

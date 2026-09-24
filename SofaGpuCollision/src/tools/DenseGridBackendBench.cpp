@@ -1102,15 +1102,18 @@ int main()
 
         // Sweep stiffness: the penalty law is linear in k, so the reference must
         // track the GPU at every scale (catches clamping / precision surprises
-        // that a single stiffness would hide).
+        // that a single stiffness would hide). Both laws: side-aware (default)
+        // and the older unsigned one.
         const float stiffnesses[] = { 100.0f, 1000.0f, 25000.0f };
         bool allPassed = true;
+        for (const bool sideAware : { true, false })
         for (const float stiffness : stiffnesses)
         {
             SofaGpuCollision::backend::ContactPenaltyConfig penaltyConfig;
             penaltyConfig.stiffness = stiffness;
             penaltyConfig.damping = 0.0f;
             penaltyConfig.contactDistance = config.contactDistance;
+            penaltyConfig.useSurfaceNormals = sideAware;
 
             SofaGpuCollision::backend::ContactForceValidation validation;
             const bool ok = SofaGpuCollision::backend::validateContactPenaltyForces(
@@ -1141,7 +1144,8 @@ int main()
                                 validation.maxWeightSumError < 1e-5;
             allPassed = allPassed && gate1 && gate2 && gate1b;
 
-            std::cout << "contactforce_k=" << stiffness
+            std::cout << "contactforce_law=" << (sideAware ? "side-aware" : "unsigned")
+                      << " k=" << stiffness
                       << " contacts=" << validation.contactCount
                       << " active=" << validation.activeContactCount
                       << " rel_err=" << relError << (gate1 ? " [GATE1 PASS]" : " [GATE1 FAIL]")
@@ -1154,12 +1158,37 @@ int main()
                       << '\n';
         }
 
+        // Gates 2b, 2c + 2d: hand-built inside/outside cases through real detection.
+        SofaGpuCollision::backend::ContactSideValidation side;
+        if (!SofaGpuCollision::backend::validateContactSideAwareness(&side, diagnostic))
+        {
+            std::cerr << "Contact side check failed to run: " << diagnostic << "\n";
+            return 12;
+        }
+        const bool gate2bcd = side.casesRun == 6u && side.casesPassed == side.casesRun;
+        allPassed = allPassed && gate2bcd;
+        std::cout << "contactside outside_fy=" << side.vertexOutsideForceY << " (expect +" << side.expectedOutside << ")"
+                  << " inside_fy=" << side.vertexInsideForceY << " (expect +" << side.expectedInside << ")"
+                  << " tooltip_fy=" << side.toolTipInsideForceY << " (expect +" << side.expectedInside << ")"
+                  << " unsigned_inside_fy=" << side.unsignedInsideForceY << " (old law: expect < 0)"
+                  << " stiffness_dfy=" << side.stiffnessDfY << " (expect " << side.expectedStiffnessDf << ")"
+                  << " current_pass_fy=" << side.currentPassForceY << " (expect +" << side.expectedOutside << ")"
+                  << " stale_pass_fy=" << side.stalePassForceY << " (expect 0)"
+                  << " cases=" << side.casesPassed << '/' << side.casesRun
+                  << (gate2bcd ? " [GATE2b/2c/2d PASS]" : " [GATE2b/2c/2d FAIL]") << '\n';
+
         std::cout << "CONTACT_FORCE_GATES=" << (allPassed ? "PASS" : "FAIL") << '\n'
                   << "  gate 1  = GPU forces match a host reference computed from the same contacts\n"
                   << "  gate 1b = decoded barycentric weights reproduce the COLLISION kernel's own\n"
                   << "            contact points (independent of the force math, so it catches a\n"
                   << "            wrong VF/FV/EE convention that gate 1 alone would share and miss)\n"
-                  << "  gate 2  = sum of all forces over both bodies is zero (Newton's third law)\n";
+                  << "  gate 2  = sum of all forces over both bodies is zero (Newton's third law)\n"
+                  << "  gate 2b = a point outside, inside, or a tool tip sunk into a face is always\n"
+                  << "            pushed OUT, harder when inside (the old unsigned law must fail it)\n"
+                  << "  gate 2c = moving the inside point outward lowers its push by stiffness*delta\n"
+                  << "            (the implicit stiffness term has the physically right sign)\n"
+                  << "  gate 2d = a pair's contacts act only in the collision pass that computed them;\n"
+                  << "            once a new pass skips the pair (bodies apart), its force is exactly 0\n";
         if (!allPassed) return 11;
     }
 

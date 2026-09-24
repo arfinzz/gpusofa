@@ -15,7 +15,7 @@ OUT="${SOFA_BENCHMARK_LOG_DIR:-${REPO_DIR}/output/benchmark_logs/gpu_resident_$(
 
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null || true)"
 export SOFA_PLUGIN_PATH="${SOFA_ROOT}/lib:${SOFA_ROOT}/plugins:${PLP%:}"
-export LD_LIBRARY_PATH="${BUILD}:${SOFA_ROOT}/lib:${PLP}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${BUILD}:${SOFA_ROOT}/lib:${PLP}"
 mkdir -p "${OUT}"
 
 echo "scene=${SCENE}"

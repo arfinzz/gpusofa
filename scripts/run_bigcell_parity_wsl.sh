@@ -12,7 +12,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 B="${SOFA_GPU_COLLISION_BUILD_DIR:-${REPO_DIR}/SofaGpuCollision/build-profile}"
 PLP="$(find "${SOFA_ROOT}/plugins" -type d -name lib -printf '%p:' 2>/dev/null)"
-export LD_LIBRARY_PATH="${B}:${SOFA_ROOT}/lib:${PLP}"
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:${B}:${SOFA_ROOT}/lib:${PLP}"
 
 run_combo() {
     local label="$1" factor="$2" tile="$3" hashbuild="$4" runothers="$5" sharedbuild="${6:-0}"

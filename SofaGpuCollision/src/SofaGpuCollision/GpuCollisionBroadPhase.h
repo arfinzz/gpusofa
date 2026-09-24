@@ -32,6 +32,9 @@ private:
     DataBool d_logBackendStatus;
     DataBool d_logBoxesOnce;
     DataBool d_useObjectAabbCulling;
+    // false: pairs of two GPU models skip the root-box overlap test (their boxes are
+    // not updated each frame under GpuCollisionPipeline); the narrow phase decides.
+    DataBool d_testGpuModelBoxes;
 
     std::vector<sofa::core::CollisionModel*> m_pendingModels;
     bool m_backendAvailable { false };
