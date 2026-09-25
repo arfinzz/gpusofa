@@ -398,6 +398,7 @@ def createScene(root):
         GPU_COLLISION_LIB if os.path.isfile(GPU_COLLISION_LIB) else "SofaGpuCollision",
     ] + pc.MATERIAL_PLUGINS)
     root.addObject("VisualStyle", displayFlags="showVisualModels")
+    pc.add_camera(root)
 
     mesh = pc.TissueMesh()
     probe_mesh = pc.ProbeMesh()

@@ -68,6 +68,7 @@ def build_scene(root, name, label, notes):
         "Sofa.GL.Component.Rendering3D",
     ] + pc.MATERIAL_PLUGINS)
     root.addObject("VisualStyle", displayFlags="showVisualModels")
+    pc.add_camera(root)
 
     root.addObject("FreeMotionAnimationLoop")
     constraint_solver = root.addObject("BlockGaussSeidelConstraintSolver", name="constraintSolver",

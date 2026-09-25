@@ -68,7 +68,7 @@ been measured here.
 | Band factorisation | ✅ | The tissue matrix is renumbered to a narrow band and stored as blocks: 17 MB instead of 117 MB for the poke, and bigger meshes fit ([7.9](#79-the-gpu-tissue)). |
 | Several tools, grasping | ✅ Works | One constraint solve for the tissue against any number of rigid bodies. Two jaws and a pedestal lift or drop a block exactly as Coulomb's law says, on SOFA's CPU and on the GPU alike ([14.5](#145-validation-tests)). |
 | Cutting | ✅ Works | Element removal: `TetrahedronCutter` removes the tetrahedra a blade passes through, and the GPU tissue follows ([7.11](#711-cutting)); a cut beam matches SOFA's run to 1.3 nm. |
-| Bugs found in SOFA | ⚠️ 3 | SofaViscoElastic's Ogden computes no eigenvectors (its stress is wrong once deformed; 42% less peak force in the poke); SOFA's core Ogden is wrong where two stretches coincide; SofaCUDA's GPU `RigidMapping` gives a wrong torque. Fixes for the last two are in `patches/` ([16](#16-known-problems-and-limits)). |
+| Bugs found in SOFA | ⚠️ 4 | SofaViscoElastic's Ogden computes no eigenvectors (its stress is wrong once deformed; 42% less peak force in the poke); SOFA's core Ogden is wrong where two stretches coincide; SofaCUDA's GPU `RigidMapping` gives a wrong torque; runSofa leaves the camera it makes for a scene without one at the origin. Fixes for the core Ogden and the torque are in `patches/`; the poke scenes carry their own camera ([16](#16-known-problems-and-limits)). |
 | GPU collision detection | ✅ Works | 6 ways to find candidate triangle pairs, 12 execution modes in total. All of them give exactly the same contacts. |
 | Fastest mode | ✅ | Way 6 ("big-cell fused") with its default table build: **0.290 ms** of GPU time per frame on the 14,368-triangle scene, about 5× faster than the component's default mode. |
 | No per-frame copies in collision | ✅ | Mesh positions are read in place on the GPU and contacts stay on the GPU. The collision code copies 0 bytes each way per frame. |
@@ -76,6 +76,7 @@ been measured here.
 | GPU contact forces (penalty) | ✅ Works | Penalty contact that knows inside from outside, so a point that crosses a surface is pushed back out. It passes all 6 of its self-checks, Gates 1 to 2d ([section 15](#15-correctness-checks)), and in the tissue-poke test it matches SOFA's CPU constraint contact to within about 6%. |
 | GPU constraint contact with friction | ✅ Works | `GpuContactConstraintSolver`: no overlap, Coulomb friction, exact compliance, the whole constraint step on the GPU ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). On identical contacts it matches SOFA's CPU pipeline at every stage, with the same number of solver sweeps in every step. On the poke's biggest problems (about 1,700 rows) SOFA's CPU pipeline takes about 10 s per step; the GPU, with the tissue on the GPU, 16 ms on average and under 30 ms at most. |
 | Tissue-poke test (realistic) | ✅ Works | A probe pokes a liver-like block 8 mm deep, holds 1 s and pulls out. The CPU scene and the GPU scene run the whole poke, and their forces agree within 0.3%. See [10.3](#103-surgical-simulation-tests-tissue-poke) and [14.4](#144-tissue-poke). |
+| Watching in SOFA's window | ✅ Works | Both poke scenes run in `runSofa`'s window under WSLg, drawn on the GTX 1650 Ti through D3D12; the GPU poke at about 24 steps per second ([10.3](#103-surgical-simulation-tests-tissue-poke)). The scenes place the camera themselves: the one runSofa 25.12 makes stays inside the tissue ([16](#16-known-problems-and-limits)). |
 | Old physics scene | ✅ Works | In `gpu_resident_fem_contact.py` the blade is now a rigid body: it lands on the tissue and rests there, and its energy doesn't grow (Gate 3). |
 | Whole frame on the GPU, old physics scene | ✅ Works | Nothing is copied between the CPU and the GPU in any frame after the first (SofaCUDA's copy trace and the residency checker, Gate 5). The two per-frame copies were SOFA's bounding boxes; `GpuCollisionPipeline` and `computeBoundingBox=false` remove them. |
 
@@ -1497,7 +1498,8 @@ To check the GPU tissue and the GPU contact against SOFA's CPU components along 
 SOFA_POKE_COMPARE=1 SOFA_POKE_COMPARE_EVERY=10 bash scripts/run_tissue_poke_wsl.sh gpu
 ```
 
-To **watch** a poke in SOFA's window, run the following, then press Animate:
+To **watch** a poke in SOFA's window, run the following, then press Animate (or add `-a`
+to start at once):
 
 ```bash
 bash scripts/run_tissue_poke_wsl.sh view-cpu
@@ -1505,7 +1507,13 @@ bash scripts/run_tissue_poke_wsl.sh view-cpu
 
 `view-gpu` shows the GPU scene. Extra arguments go to `runSofa`, and the mode sets
 `GALLIUM_DRIVER=d3d12` so that WSLg draws on the GPU. The scene still writes its CSV while
-you watch.
+you watch. In the window the GPU poke runs at about 24 steps per second (41 ms per step,
+against 28 ms without the window; drawing through WSLg takes the rest), the CPU poke at
+about 2 seconds per step. Both scenes place SOFA's camera themselves
+(`poke_common.add_camera`), 11 cm from the probe's spot and 27° above the tissue top: the
+camera runSofa 25.12 makes on its own stays at the origin, inside the tissue
+([16](#16-known-problems-and-limits)). Reset View does not bring the scene's camera back
+after you move it; Save View once, and Reset View returns to the saved view.
 
 **Environment variables** (all optional; `SOFA_BENCHMARK_LOG_DIR` and
 `SOFA_BENCHMARK_LABEL_SUFFIX` work as in the other scenes):
@@ -2166,6 +2174,26 @@ How to read it:
   so for large 3D meshes a sparse factorisation would scale better ([17](#17-whats-next)).
   The dense factorisation would take over a second at that size.
 
+**The poke's force as the mesh is refined** (the GPU scene, the default material, the press
+and 0.6 s of the hold; SOFA's CPU scene would take tens of seconds per step on the finer
+meshes):
+
+| Elements under the probe | Nodes | Tetrahedra | Band (half-width) | Peak force (7.1 mm deep) | Force at 4.7 mm (t = 3.0 s) | After 0.6 s of hold | GPU per step |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 mm | 726 | 3,000 | 203 | 0.556 N | 0.281 N | 0.497 N | 19 ms |
+| 2 mm (default) | 1,800 | 8,232 | 365 | 0.412 N | 0.206 N | 0.361 N | 30 ms |
+| 1.5 mm | 3,610 | 17,496 | 575 | 0.345 N | 0.168 N | 0.298 N | 47 ms |
+| 1 mm | 8,125 | 41,472 | 980 | 0.302 N | 0.147 N | 0.259 N | 112 ms |
+| 0.75 mm | 12,615 | 65,856 | 1,310 | 0.299 N | 0.145 N | 0.256 N | 280 ms |
+
+- **The force converges to about 0.30 N**: from 1 mm to 0.75 mm the peak changes by 0.9%.
+  The default 2 mm mesh gives 38% more (linear tetrahedra lock in this nearly incompressible
+  tissue). For absolute forces, use `SOFA_POKE_FINE_STEP=0.001`: 112 ms per step on the
+  GPU. The default stays 2 mm for comparisons with SOFA's CPU scene, which needs about 2 s
+  per step there and would need tens of seconds on the converged mesh.
+- **Only the band storage makes the finest mesh fit**: 37,845 DOFs, whose dense matrix
+  would need 5.7 GB on a 4 GB GPU; the band's blocks take about 430 MB.
+
 ---
 
 ## 15. Correctness checks
@@ -2296,6 +2324,13 @@ wrong torque ([9.11](#911-gpurigidmapping)).
   because it builds C^(α/2−1) as V D Vᵀ from the general `EigenSolver`'s eigenvectors,
   which are not orthogonal there ([7.9](#79-the-gpu-tissue)). The GPU has the material as
   written. The fix for SOFA is in `patches/SOFA-Ogden-orthonormal-eigenvectors.patch`.
+- **runSofa 25.12 leaves the camera it makes at the origin.** For a scene without a camera,
+  `BaseViewer::load()` creates an `InteractiveCamera` and calls only its `bwdInit()`.
+  `BaseCamera::setDefaultView()` moves a camera only if its `init()` ran and found no position,
+  so the new camera stays at (0, 0, 0), looking down −z, and Reset View does not move it
+  either. In the poke that is inside the tissue: the window showed a red slab and no probe,
+  on the CPU scene as on the GPU one. Both poke scenes now have a camera of their own; any
+  other scene watched in `runSofa` needs one too.
 - **A soft block pinched with high friction needs a short time step.** In the grasp test
   ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)) with dt = 0.01 s,
   the Gauss-Seidel stopped converging near full squeeze for μ ≥ 0.3 (1,000 sweeps and
@@ -2330,7 +2365,9 @@ wrong torque ([9.11](#911-gpurigidmapping)).
   then takes 200 to 300 ms instead of 31 to 40 ms (`SofaGpuCollisionConstraintChecks
   --cadence`: 271 ms right after a 4.6 s CPU phase, 31 ms with 300 ms pauses). Take GPU
   times from runs without the comparison.
-- **The poke's default mesh is too stiff.** With 2 mm elements under a 2.5 mm-radius tip,
+- **The poke's default mesh is too stiff.** With the default material, its peak force is
+  0.412 N against 0.30 N on a converged mesh (1 mm or finer, [14.6](#146-time-per-step-as-the-scene-grows)).
+  With the earlier material and 2 mm elements under a 2.5 mm-radius tip,
   the force comes out about 50% higher than with 1 mm elements
   ([14.4](#144-tissue-poke)): linear tetrahedra lock when the tissue is nearly
   incompressible. Compare scenes on the same mesh; for absolute forces, use a finer mesh
@@ -2389,15 +2426,17 @@ Next, in order:
    and elements) would need the GPU tissue to grow its vertices, edges and band on the fly.
 2. **Report the SOFA bugs upstream** with their patches: SofaViscoElastic's Ogden
    (eigenvectors, one argument), SOFA's core Ogden (`SelfAdjointEigenSolver` with
-   `ComputeEigenvectors`), SofaCUDA's `RigidMapping` torque.
+   `ComputeEigenvectors`), SofaCUDA's `RigidMapping` torque, and runSofa's camera
+   (`BaseViewer::load()` should `init()` the camera it creates).
 3. **A sparse factorisation for large 3D meshes.** The band grows with the mesh's
    cross-section; nested dissection (for example NVIDIA's cuDSS) would scale better. How far
    the band goes is in [14.6](#146-time-per-step-as-the-scene-grows).
 4. **Contact between two deformable bodies and between rigid tools**, and edge-edge
    contacts, so that a tool's sharp edge on a coarse mesh is held ([16](#16-known-problems-and-limits)).
-5. **Accurate absolute poke forces.** Linear tetrahedra lock in the nearly incompressible
-   tissue; the poke's mesh convergence is in [14.6](#146-time-per-step-as-the-scene-grows).
-   Quadratic tetrahedra or a mixed formulation would converge faster.
+5. **Faster convergence to absolute forces.** Linear tetrahedra lock in the nearly
+   incompressible tissue: the poke's force converges only at 1 mm elements (8,125 nodes,
+   112 ms per step on the GPU; [14.6](#146-time-per-step-as-the-scene-grows)). Quadratic
+   tetrahedra or a mixed formulation would converge on coarser meshes.
 6. **Speed**:
    - fewer bytes of W per Gauss-Seidel sweep (the solve reads all of W every sweep; half
      precision, or only the rows that changed);

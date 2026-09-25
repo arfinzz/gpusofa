@@ -369,6 +369,14 @@ def add_probe_body(node, external_rest_shape):
                    angularStiffness=COUPLING_ANGULAR_STIFFNESS, external_rest_shape=external_rest_shape)
 
 
+def add_camera(root):
+    """The view in SOFA's window: 11 cm away, 27 degrees above the tissue top, on the spot
+    the probe presses. Without a camera in the scene, runSofa 25.12 leaves the one it
+    creates at the origin, inside the tissue: BaseViewer::load() calls only bwdInit() on
+    it, and BaseCamera::setDefaultView() moves a camera only after its init()."""
+    root.addObject("InteractiveCamera", name="camera", position=[0.0, 0.045, 0.10], lookAt=[0.0, -0.005, 0.0])
+
+
 # ---------------------------------------------------------------------------
 # Controllers
 # ---------------------------------------------------------------------------

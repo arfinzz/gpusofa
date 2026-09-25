@@ -2,7 +2,7 @@
 
 The GPU implementation was checked against SOFA's own, widely used CPU components on seven
 physics tests with known answers, extended to several rigid tools (grasping) and to
-cutting, and timed against SOFA's CPU as the scene grows. Three bugs in SOFA turned up on
+cutting, and timed against SOFA's CPU as the scene grows. Four bugs in SOFA turned up on
 the way. The details, settings and full tables are in the root `README.md` (sections 10.4,
 14.4 to 14.6, 16); this report keeps the plots and the story of what was found.
 
@@ -55,6 +55,7 @@ Coulomb's law. Confined compression: every material reaches the exact stretch.*
 | SofaViscoElastic `SLSOgdenFirstOrder` | `SelfAdjointEigenSolver(C, true)`: `true` asks for no eigenvectors | stress wrong once deformed; 42% less peak force in the poke | `Eigen::ComputeEigenvectors` |
 | SOFA core `Ogden` (since 17/11/2025) | general `EigenSolver`, then V D Vᵀ | wrong by up to 100% where two stretches coincide (rest, uniaxial, axisymmetric states) | `patches/SOFA-Ogden-orthonormal-eigenvectors.patch` |
 | SofaCUDA `RigidMapping` | `applyJT` writes thread 1's forces into the torque | a rigid tool with surface forces turns the wrong way | `patches/SofaCUDA-RigidMapping-applyJT-torque.patch` |
+| runSofa (`BaseViewer`) | the camera it makes for a scene without one gets `bwdInit()` but no `init()`, so the default view is never applied | the window looks out from the origin: from inside the poke's tissue, no probe in sight | a camera in the scene (both poke scenes have one) |
 
 The second was found because the GPU's Ogden (symmetric eigen-decomposition) and SOFA's
 disagreed by up to 4.6e-4 in confined compression, in a few steps only, while NeoHookean in
