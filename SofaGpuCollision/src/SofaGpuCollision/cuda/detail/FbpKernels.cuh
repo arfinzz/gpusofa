@@ -46,6 +46,8 @@ struct RecordedContactHandle
     std::uint32_t capacity { 0 };
     const std::uint32_t* firstIndices { nullptr };   // 3 per triangle, device
     const std::uint32_t* secondIndices { nullptr };
+    std::uint32_t firstTriangleCount { 0 };
+    std::uint32_t secondTriangleCount { 0 };
     std::uint64_t firstSurfaceId { 0 };
     std::uint64_t secondSurfaceId { 0 };
     std::uint64_t collisionPass { 0 };   ///< registry pass in which these contacts were computed
@@ -102,7 +104,9 @@ void recordContactHandle(
     const std::uint32_t* firstIndices,
     const std::uint32_t* secondIndices,
     const std::uint64_t firstSurfaceId,
-    const std::uint64_t secondSurfaceId)
+    const std::uint64_t secondSurfaceId,
+    const std::uint32_t firstTriangleCount,
+    const std::uint32_t secondTriangleCount)
 {
     ContactHandleRegistry& registry = contactHandleRegistry();
 
@@ -131,6 +135,8 @@ void recordContactHandle(
     target->capacity = capacity;
     target->firstIndices = firstIndices;
     target->secondIndices = secondIndices;
+    target->firstTriangleCount = firstTriangleCount;
+    target->secondTriangleCount = secondTriangleCount;
     target->firstSurfaceId = firstSurfaceId;
     target->secondSurfaceId = secondSurfaceId;
     target->collisionPass = registry.collisionPass;
@@ -429,6 +435,103 @@ __device__ __forceinline__ void fbpEmitContact(
     if (c.featureKind == 0u)      atomicAdd(vfCount, 1u);
     else if (c.featureKind == 1u) atomicAdd(fvCount, 1u);
     else                          atomicAdd(eeCount, 1u);
+}
+
+// A vertex-face (kind 0: vertex i of the first triangle, point p2 on the second)
+// or face-vertex (kind 1: point p1 on the first, vertex j of the second) contact,
+// filled as fbpComputeClosestFeatureContact fills its closest pair.
+__device__ __forceinline__ void fbpMakeVertexContact(
+    DeviceProximityContact& c, const int kind, const int i, const int j, const float3 p1, const float3 p2,
+    const float3 bary1, const float3 bary2, const float distSq, const bool computeBarycentrics,
+    const std::uint32_t firstIndex, const std::uint32_t secondIndex)
+{
+    c.firstPrimitiveIndex = firstIndex;
+    c.secondPrimitiveIndex = secondIndex;
+    c.featureKind = static_cast<std::uint8_t>(kind);
+    c.firstFeatureLocalIndex = static_cast<std::uint8_t>(i);
+    c.secondFeatureLocalIndex = static_cast<std::uint8_t>(j);
+    c.reserved = 0;
+    const float3 b1 = computeBarycentrics ? bary1 : make_float3(1.0f, 0.0f, 0.0f);
+    const float3 b2 = computeBarycentrics ? bary2 : make_float3(1.0f, 0.0f, 0.0f);
+    c.firstBary[0] = b1.x;  c.firstBary[1] = b1.y;  c.firstBary[2] = b1.z;
+    c.secondBary[0] = b2.x; c.secondBary[1] = b2.y; c.secondBary[2] = b2.z;
+    c.pointOnFirst = p1;
+    c.pointOnSecond = p2;
+    const float3 sep = sub3(p2, p1);
+    const float dist = sqrtf(distSq);
+    c.signedDistance = dist;
+    if (dist > 1.0e-12f)
+    {
+        const float invLen = 1.0f / dist;
+        c.normal = make_float3(sep.x * invLen, sep.y * invLen, sep.z * invLen);
+    }
+    else
+    {
+        c.normal = make_float3(0.0f, 1.0f, 0.0f);
+    }
+}
+
+// The contacts of one triangle pair. onePerPair: only the closest feature pair.
+// Otherwise every vertex-face and face-vertex pair closer than the threshold, and
+// the closest edge-edge pair when it is the closest feature: when two flat faces
+// touch, the six vertex-face distances tie and the closest-feature rule gives most
+// vertices no contact at all (a block resting on large floor triangles sank
+// through; SOFA's point-triangle proximity tests every vertex).
+__device__ __forceinline__ void fbpEmitPairContacts(
+    const float3 aV[3],
+    const float3 bV[3],
+    const float distThreshSq,
+    const bool computeBarycentrics,
+    const bool onePerPair,
+    const std::uint32_t firstIndex,
+    const std::uint32_t secondIndex,
+    DeviceProximityContact* __restrict__ contacts,
+    std::uint32_t* __restrict__ contactCount,
+    std::uint32_t* __restrict__ overflowCount,
+    std::uint32_t* __restrict__ vfCount,
+    std::uint32_t* __restrict__ fvCount,
+    std::uint32_t* __restrict__ eeCount,
+    const std::uint32_t maxContacts,
+    const bool aabbAlreadyRejected)
+{
+    DeviceProximityContact c;
+    if (!fbpComputeClosestFeatureContact(aV, bV, distThreshSq, computeBarycentrics, c, aabbAlreadyRejected))
+    {
+        return;
+    }
+    c.firstPrimitiveIndex = firstIndex;
+    c.secondPrimitiveIndex = secondIndex;
+    if (onePerPair || c.featureKind == 2u)
+    {
+        fbpEmitContact(c, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+    }
+    if (onePerPair) return;
+    #pragma unroll
+    for (int i = 0; i < 3; ++i)
+    {
+        const float3 bary = closestPointOnTriangleBary(aV[i], bV[0], bV[1], bV[2]);
+        const float3 cp = reconstructFromBary(bV[0], bV[1], bV[2], bary);
+        const float3 diff = sub3(aV[i], cp);
+        const float d2v = dot3(diff, diff);
+        if (d2v > distThreshSq) continue;
+        DeviceProximityContact v;
+        fbpMakeVertexContact(v, 0, i, 0, aV[i], cp, make_float3(1.0f, 0.0f, 0.0f), bary, d2v, computeBarycentrics,
+                             firstIndex, secondIndex);
+        fbpEmitContact(v, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+    }
+    #pragma unroll
+    for (int j = 0; j < 3; ++j)
+    {
+        const float3 bary = closestPointOnTriangleBary(bV[j], aV[0], aV[1], aV[2]);
+        const float3 cp = reconstructFromBary(aV[0], aV[1], aV[2], bary);
+        const float3 diff = sub3(cp, bV[j]);
+        const float d2v = dot3(diff, diff);
+        if (d2v > distThreshSq) continue;
+        DeviceProximityContact v;
+        fbpMakeVertexContact(v, 1, 0, j, cp, bV[j], bary, make_float3(1.0f, 0.0f, 0.0f), d2v, computeBarycentrics,
+                             firstIndex, secondIndex);
+        fbpEmitContact(v, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+    }
 }
 
 // One thread per candidate pair. Each thread runs 6 VF + 9 EE and keeps the
@@ -749,6 +852,7 @@ bool computeFeatureBasedProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(firstSurface.surfaceId, secondSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (proximityStats != nullptr)
     {
@@ -976,7 +1080,7 @@ bool computeFeatureBasedProximityContacts(
     recordContactHandle(
         workspace.proximityContacts, workspace.proximityContactCount, proximityConfig.maxContacts,
         workspace.indexedTissueIndices, workspace.indexedToolIndices,
-        firstSurface.surfaceId, secondSurface.surfaceId);
+        firstSurface.surfaceId, secondSurface.surfaceId, firstSurface.triangleCount, secondSurface.triangleCount);
 
     diagnostic.clear();
     return true;
@@ -1006,6 +1110,7 @@ bool computeFeatureBasedVertexTriangleContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(pointCloud.surfaceId, triangleSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (executionStats != nullptr)
     {

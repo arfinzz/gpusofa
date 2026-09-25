@@ -16,6 +16,15 @@ Animation loop: DefaultAnimationLoop, whose step order is collision -> integrate
 The contact buffer produced during the collision step is therefore read while the
 solver evaluates forces. (FreeMotionAnimationLoop is for the constraint path.)
 
+The blade is a rigid body (2026-09-25): a Rigid3d pose with the box's mass and
+inertia, and its GPU collision surface attached through GpuRigidMapping (computed
+on the GPU from the pose; this plugin's own, because SofaCUDA's GPU RigidMapping
+maps surface forces to a wrong torque). Before, it was 8 loose points with no force
+holding them together, and it came apart on landing. GpuCollisionPipeline, the broad phase's testGpuModelBoxes=false and the
+loop's computeBoundingBox=false keep SOFA's per-frame bounding boxes from copying
+the GPU surfaces to the CPU. BladeLogger writes the blade's height, speed, tilt and
+kinetic energy each frame (Gate 3).
+
 Env toggles:
   SOFA_CONTACT_STIFFNESS      penalty stiffness           (default 2000)
   SOFA_CONTACT_DAMPING        penalty damping             (default 0, off)
@@ -26,6 +35,7 @@ Env toggles:
   SOFA_USE_BIGCELL_FUSED_GENERATION / ... same broad-cull selectors as the other scenes
 """
 
+import math
 import os
 import sys
 
@@ -36,10 +46,10 @@ sys.path.append(current_dir)
 
 from dense_collision_benchmark_common import (
     create_blade_geometry,
+    create_subdivided_blade_geometry,
     default_benchmark_log_dir,
     env_flag,
     generate_tissue_mesh,
-    translate_vertices,
 )
 
 
@@ -54,6 +64,13 @@ TISSUE_POISSON = float(os.environ.get("SOFA_TISSUE_POISSON", "0.4"))
 TISSUE_TOTAL_MASS = float(os.environ.get("SOFA_TISSUE_TOTAL_MASS", "1.0"))
 
 CONTACT_STIFFNESS = float(os.environ.get("SOFA_CONTACT_STIFFNESS", "2000"))
+# Diagnostics: hold every tissue node fixed; scale the blade's rotational inertia.
+DIAG_FIX_ALL_TISSUE = env_flag("SOFA_DIAG_FIX_ALL_TISSUE", False)
+DIAG_CPU_RIGID_MAPPING = env_flag("SOFA_DIAG_CPU_RIGID_MAPPING", False)   # SOFA's CPU RigidMapping, then onto the GPU
+BLADE_INERTIA_SCALE = float(os.environ.get("SOFA_BLADE_INERTIA_SCALE", "1"))
+CG_ITERATIONS = int(os.environ.get("SOFA_CG_ITERATIONS", "25"))
+CG_TOLERANCE = float(os.environ.get("SOFA_CG_TOLERANCE", "1e-6"))
+CG_THRESHOLD = float(os.environ.get("SOFA_CG_THRESHOLD", "1e-9"))
 CONTACT_DAMPING = float(os.environ.get("SOFA_CONTACT_DAMPING", "0"))
 CONTACT_DISTANCE = float(os.environ.get("SOFA_CONTACT_DISTANCE", "0.03"))
 BLADE_MASS = float(os.environ.get("SOFA_BLADE_MASS", "0.05"))
@@ -82,6 +99,39 @@ USE_SORTED_GRID = env_flag("SOFA_USE_SORTED_GRID_GENERATION", False)
 USE_BIGCELL_FUSED = env_flag("SOFA_USE_BIGCELL_FUSED_GENERATION", True)
 WARMUP_STEPS = int(os.environ.get("SOFA_LARGE_WARMUP_STEPS", "10"))
 
+BLADE_LENGTH, BLADE_HEIGHT, BLADE_THICKNESS = 1.1, 0.28, 0.08
+
+
+class BladeLogger(Sofa.Core.Controller):
+    """Gate 3: the blade's height, speed, tilt and kinetic energy each frame (its
+    Rigid3d state is on the CPU, so this reads nothing back from the GPU)."""
+
+    def __init__(self, *args, **kwargs):
+        Sofa.Core.Controller.__init__(self, *args, **kwargs)
+        self.root = kwargs["root"]
+        self.blade = kwargs["blade"]
+        self.mass = kwargs["mass"]
+        self.inertia = kwargs["inertia"]      # principal moments, kg m^2
+        path = kwargs["path"]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.csv = open(path, "w")
+        self.csv.write("time,center_y,bottom_y,speed,tilt_deg,kinetic_energy,potential_energy\n")
+
+    def onAnimateEndEvent(self, event):
+        x = self.blade.position.value[0]
+        v = self.blade.velocity.value[0]
+        qx, qy, qz, qw = (float(q) for q in x[3:7])
+        # tilt: angle between the blade's own y axis and the world y axis
+        y_axis_y = 1.0 - 2.0 * (qx * qx + qz * qz)
+        tilt = math.degrees(math.acos(max(-1.0, min(1.0, y_axis_y))))
+        speed = math.sqrt(sum(float(c) ** 2 for c in v[0:3]))
+        omega = [float(c) for c in v[3:6]]
+        kinetic = 0.5 * self.mass * speed ** 2 + 0.5 * sum(i * w * w for i, w in zip(self.inertia, omega))
+        potential = self.mass * 9.81 * float(x[1])
+        row = [self.root.time.value, float(x[1]), float(x[1]) - 0.5 * BLADE_HEIGHT, speed, tilt, kinetic, potential]
+        self.csv.write(",".join(f"{c:.9g}" for c in row) + "\n")
+        self.csv.flush()
+
 
 def createScene(root):
     root.name = "RootNode"
@@ -102,20 +152,28 @@ def createScene(root):
         'Sofa.Component.Mass',
         'Sofa.Component.SolidMechanics.FEM.Elastic',
         'Sofa.Component.Constraint.Projective',
+        'Sofa.Component.Mapping.NonLinear',
     ])
 
     tissue_positions, tissue_tets, fixed_indices, tissue_surface = generate_tissue_mesh(
         nx=TISSUE_NX, ny=TISSUE_NY, nz=TISSUE_NZ, sx=4.0, sy=0.5, sz=4.0, border=1)
+    if DIAG_FIX_ALL_TISSUE:
+        fixed_indices = list(range(len(tissue_positions)))
 
-    blade_verts, blade_tris = create_blade_geometry(length=1.1, height=0.28, thickness=0.08)
-    blade_verts = translate_vertices(blade_verts, [0.0, BLADE_DROP_HEIGHT, 0.0])
+    # The blade's surface in its own frame (centred); its pose starts at the drop height.
+    blade_verts, blade_tris = create_blade_geometry(length=BLADE_LENGTH, height=BLADE_HEIGHT,
+                                                    thickness=BLADE_THICKNESS)
 
     # collision -> integrate ordering; the contact buffer is consumed during the solve.
-    root.addObject('DefaultAnimationLoop')
+    # No per-frame bounding box (it is for drawing, and would copy the GPU states back).
+    root.addObject('DefaultAnimationLoop', computeBoundingBox=False)
     if not NO_COLLISION:
-      root.addObject('CollisionPipeline')
+      # Builds the GPU surfaces' bounding trees once instead of every frame (each
+      # rebuild copies the surface to the CPU); the broad phase then skips the box test
+      # for pairs of GPU surfaces, whose boxes are no longer updated.
+      root.addObject('GpuCollisionPipeline')
       root.addObject('GpuCollisionBroadPhase', enableGPU=True, allowCPUFallback=True,
-                   logBackendStatus=True, useObjectAabbCulling=False)
+                   logBackendStatus=True, useObjectAabbCulling=False, testGpuModelBoxes=False)
       root.addObject(
         'GpuCollisionNarrowPhase',
         enableGPU=True,
@@ -160,7 +218,7 @@ def createScene(root):
                   rayleighStiffness=0.05, rayleighMass=0.05)
     # Matrix-free CG: no assembled system matrix, so the solve stays on the device.
     sim.addObject('CGLinearSolver', name='linearsolver',
-                  iterations=25, tolerance=1e-6, threshold=1e-9)
+                  iterations=CG_ITERATIONS, tolerance=CG_TOLERANCE, threshold=CG_THRESHOLD)
 
     # ---- deformable tissue: everything Cuda*, so state never leaves the GPU ----
     tissue = sim.addChild('Tissue')
@@ -190,15 +248,38 @@ def createScene(root):
     if not NO_COLLISION:
         tissue_surface_node.addObject('TriangleCollisionModel', name='tissueCM', selfCollision=False)
 
-    # ---- tool: blade falling under gravity ----
+    # ---- tool: a rigid blade falling under gravity ----
+    # A box's mass and inertia: RigidMass takes the inertia per unit of mass.
+    a, b, c = BLADE_LENGTH, BLADE_HEIGHT, BLADE_THICKNESS
+    inertia_per_mass = [BLADE_INERTIA_SCALE * v for v in
+                        ((b * b + c * c) / 12.0, (a * a + c * c) / 12.0, (a * a + b * b) / 12.0)]
     blade = sim.addChild('Blade')
-    blade.addObject('MechanicalObject', name='dofs', template='CudaVec3f',
-                    position=blade_verts)
-    blade.addObject('MeshTopology', name='topo', triangles=blade_tris)
-    blade.addObject('UniformMass', template='CudaVec3f', name='mass',
-                    totalMass=BLADE_MASS)
-    if not NO_COLLISION:
-        blade.addObject('TriangleCollisionModel', name='bladeCM', selfCollision=False)
+    blade.addObject('MechanicalObject', name='dofs', template='Rigid3d',
+                    position=[[0.0, BLADE_DROP_HEIGHT, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    blade_mass = blade.addObject('UniformMass', name='mass', template='Rigid3d',
+                                 vertexMass=" ".join(repr(float(v)) for v in (
+                                     BLADE_MASS, a * b * c, inertia_per_mass[0], 0, 0, 0,
+                                     inertia_per_mass[1], 0, 0, 0, inertia_per_mass[2])))
+    if DIAG_CPU_RIGID_MAPPING:
+        cpu_surface = blade.addChild('CpuSurface')
+        cpu_surface.addObject('MechanicalObject', name='dofs', template='Vec3d', position=blade_verts)
+        cpu_surface.addObject('RigidMapping', template='Rigid3d,Vec3d')
+        blade_surface = cpu_surface.addChild('Surface')
+        blade_surface.addObject('MechanicalObject', name='dofs', template='CudaVec3f', position=blade_verts)
+        blade_surface.addObject('MeshTopology', name='topo', triangles=blade_tris)
+        if not NO_COLLISION:
+            blade_surface.addObject('TriangleCollisionModel', name='bladeCM', selfCollision=False)
+        blade_surface.addObject('IdentityMapping', template='Vec3d,CudaVec3f')
+    else:
+        blade_surface = blade.addChild('Surface')
+        blade_surface.addObject('MechanicalObject', name='dofs', template='CudaVec3f', position=blade_verts)
+        blade_surface.addObject('MeshTopology', name='topo', triangles=blade_tris)
+        if not NO_COLLISION:
+            blade_surface.addObject('TriangleCollisionModel', name='bladeCM', selfCollision=False)
+        # Computed on the GPU from the pose; the penalty forces map back to the rigid body
+        # as a force and a torque. (SofaCUDA's RigidMapping<Rigid3d,CudaVec3f> maps them to
+        # a wrong torque in SOFA v25.12, and the blade spun up and shot through the tissue.)
+        blade_surface.addObject('GpuRigidMapping')
 
     # ---- the contact consumer: device contacts -> device forces ----
     # Inside the solver node so the solver sees it; it resolves each surface id
@@ -209,7 +290,7 @@ def createScene(root):
         'CudaContactPenaltyForceField',
         name='contactForces',
         object1='@Tissue/dofs',
-        object2='@Blade/dofs',
+        object2=blade_surface.dofs.getLinkPath(),
         stiffness=CONTACT_STIFFNESS,
         damping=CONTACT_DAMPING,
         useDamping=CONTACT_DAMPING > 0.0,
@@ -233,6 +314,12 @@ def createScene(root):
         failFast=RESIDENCY_FAIL_FAST,
         printLog=True,   # so the clean/violation tally is visible in the log
     )
+
+    print(f"Blade: rigid, mass={BLADE_MASS} kg, vertexMass='{blade_mass.vertexMass.getValueString()}'", flush=True)
+    root.addObject(BladeLogger(
+        name='bladeLogger', root=root, blade=blade.dofs, mass=BLADE_MASS,
+        inertia=[BLADE_MASS * i for i in inertia_per_mass],
+        path=os.path.join(BENCHMARK_LOG_DIR, 'gpu_resident_blade' + BENCHMARK_LABEL_SUFFIX + '.csv')))
 
     if not NO_BENCH:
       root.addObject(

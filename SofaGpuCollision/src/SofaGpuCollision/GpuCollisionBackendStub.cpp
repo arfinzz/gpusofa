@@ -305,6 +305,19 @@ bool setRigidSystem(ConstraintWorkspace*, const double[36], std::string& diagnos
     return false;
 }
 
+bool setAdditionalRigidSystems(ConstraintWorkspace*, const std::vector<double>&, const std::vector<double>&, std::string& diagnostic)
+{
+    diagnostic = kNoCudaConstraints;
+    return false;
+}
+
+bool additionalRigidResults(const ConstraintWorkspace*, std::vector<double>& corrections, std::vector<double>& impulses)
+{
+    corrections.clear();
+    impulses.clear();
+    return false;
+}
+
 bool buildContactConstraints(ConstraintWorkspace*, const ConstraintBuildInput&, ConstraintBuildStats* stats,
                              ConstraintTimings*, std::string& diagnostic)
 {
@@ -368,7 +381,7 @@ bool computeDenseComplianceOnGpu(const HostCsrMatrix&, const std::vector<int>&, 
     return false;
 }
 
-bool useExternalDeformableFactor(ConstraintWorkspace*, const float*, int, std::string& diagnostic)
+bool useTissueFactor(ConstraintWorkspace*, TissueWorkspace*, std::string& diagnostic)
 {
     diagnostic = kNoCudaConstraints;
     return false;
@@ -424,10 +437,48 @@ bool tissueFreeMotion(TissueWorkspace*, const void*, const void*, void*, void*, 
     return false;
 }
 
-const float* tissueFactor(const TissueWorkspace*, int& size)
+bool setTissueExternalForces(TissueWorkspace*, const std::vector<double>&, std::string& diagnostic)
 {
-    size = 0;
-    return nullptr;
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool updateTissueElements(TissueWorkspace*, const TissueElementUpdate&, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+int tissueLuFallbackSteps(const TissueWorkspace*)
+{
+    return 0;
+}
+
+int tissueDofCount(const TissueWorkspace*)
+{
+    return 0;
+}
+
+bool tissueFactorReady(const TissueWorkspace*)
+{
+    return false;
+}
+
+int tissueBandwidth(const TissueWorkspace*)
+{
+    return 0;
+}
+
+bool tissueSolveInPlace(TissueWorkspace*, float*, int, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool tissueComplianceBlock(TissueWorkspace*, const int*, int, float*, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return false;
 }
 
 bool tissueMonitor(TissueWorkspace*, const void*, int, double& minVolumeRatio, double position[3], std::string& diagnostic)
@@ -441,6 +492,25 @@ bool tissueMonitor(TissueWorkspace*, const void*, int, double& minVolumeRatio, d
 bool downloadTissueStep(TissueWorkspace*, bool, TissueStepSnapshot& snapshot, std::string& diagnostic)
 {
     snapshot = TissueStepSnapshot {};
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool rigidMappingApply(int, const double[9], const double[3], const void*, void*, void*, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool rigidMappingApplyJ(int, const double[3], const double[3], const void*, void*, bool, std::string& diagnostic)
+{
+    diagnostic = kNoCudaTissue;
+    return false;
+}
+
+bool rigidMappingApplyJT(int, const void*, const void*, double forceAndTorque[6], std::string& diagnostic)
+{
+    for (int k = 0; k < 6; ++k) forceAndTorque[k] = 0.0;
     diagnostic = kNoCudaTissue;
     return false;
 }

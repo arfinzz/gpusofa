@@ -7,14 +7,14 @@ its GPU component is available:
   piece                 on the GPU                          today
   --------------------  ----------------------------------  ---------------------------------
   tissue (material,     GpuTissueSolver: the viscoelastic   GPU (SOFA_POKE_GPU_TISSUE=cpu:
-    mass, fixed base,     Ogden, the consistent mass, the     SofaViscoElastic + MeshMatrixMass
-    implicit solve)       fixed DOFs, implicit Euler with     + EulerImplicit/SparseLDL on the
-                          a direct solve                      CPU, as in the CPU scene)
+    mass, fixed base,     Ogden, the consistent mass, the     SOFA's material components +
+    implicit solve)       fixed DOFs, implicit Euler with     MeshMatrixMass + EulerImplicit/
+                          a direct solve                      SparseLDL, as in the CPU scene)
   tissue surface        CudaVec3f via IdentityMapping       GPU
   collision detection   GpuCollisionPipeline + Broad/       GPU (way 6); no per-frame CPU
                           NarrowPhase                         bounding boxes
   contact response      GpuContactConstraintSolver          GPU (constraints with friction)
-  probe surface         CudaVec3f via RigidMapping          GPU
+  probe surface         CudaVec3f via GpuRigidMapping       GPU
   probe body            a 6-DOF rigid body on a spring      CPU (7 numbers; its GPU surface is
                                                               mapped from it every step)
 
@@ -44,10 +44,12 @@ SOFA_POKE_COMPARE_TISSUE=1 (GPU tissue) runs SOFA's own CPU tissue components on
 the same state every step and writes the differences of the tissue step to
 <log dir>/tissue_poke_gpu_tissue_compare.csv. SOFA_POKE_COMPARE and
 SOFA_POKE_RESPONSE=cpu turn it on too (their CPU pipeline needs its linear solver).
-SOFA_POKE_OGDEN=exact gives the GPU tissue the Ogden material as written. By
-default it reproduces SofaViscoElastic's SLSOgdenFirstOrder as it runs in SOFA
-v25.12, whose Eigen call computes no eigenvectors (GpuTissueSolver explains), so
-that this scene and the CPU scene have the same material.
+The material (SOFA_POKE_MATERIAL, poke_common.py) is the same in both scenes: by
+default SOFA's core Ogden + SofaViscoElastic's Maxwell element. With
+SOFA_POKE_MATERIAL=split (SofaViscoElastic's SLSOgdenFirstOrder) the GPU
+reproduces that component as it runs in SOFA v25.12, whose Eigen call computes no
+eigenvectors (GpuTissueSolver explains); SOFA_POKE_OGDEN=exact gives it the true
+eigenvectors instead.
 
 If any piece of the GPU contact chain is missing (SofaCUDA, this plugin, or one
 of its components), the scene falls back to the CPU scene's setup: constraint
@@ -83,9 +85,14 @@ MEASURE_TIMES = os.environ.get("SOFA_POKE_MEASURE_TIMES", "0") == "1"
 # Where the tissue runs (constraint mode): gpu (GpuTissueSolver) or cpu.
 TISSUE_MODE = os.environ.get("SOFA_POKE_GPU_TISSUE", "gpu")
 COMPARE_TISSUE = os.environ.get("SOFA_POKE_COMPARE_TISSUE", "0") == "1" or COMPARE
-# GPU tissue's Ogden: "sofa" reproduces SofaViscoElastic as it runs (so the CPU and GPU
-# scenes match), "exact" is the Ogden material as written (see GpuTissueSolver).
+# SOFA_POKE_MATERIAL=split (SofaViscoElastic's Ogden): "sofa" reproduces it as it runs
+# (so the CPU and GPU scenes match), "exact" is the Ogden material as written.
 OGDEN_EIGENVECTORS = os.environ.get("SOFA_POKE_OGDEN", "sofa")
+# Default material (SOFA core Ogden): its stiffness "robust" (default) or as SOFA computes it
+# ("sofa"; they differ only when two principal stretches are equal up to rounding).
+OGDEN_TANGENT = os.environ.get("SOFA_POKE_OGDEN_TANGENT", "robust")
+# The GPU tissue matrix's factorisation: auto (default), band or dense (GpuTissueSolver.factorization).
+FACTORIZATION = os.environ.get("SOFA_POKE_FACTORIZATION", "auto")
 # Visual models. The GPU tissue is drawn by CudaVisualModel, which reads it back
 # only when the view is drawn; SOFA_POKE_VISUAL=0 removes the visual models.
 VISUAL = os.environ.get("SOFA_POKE_VISUAL", "1") != "0"
@@ -141,6 +148,10 @@ class ConstraintStatsLogger(Sofa.Core.Controller):
         tissue = [0.0] * 5
         if self.tissue_solver is not None:
             t = self.tissue_solver
+            if not getattr(self, "_reported", False):
+                self._reported = True
+                band = int(t.bandwidth.value)
+                print(f"TissuePokeGPU factorisation: {'band, half-bandwidth ' + str(band) if band > 0 else 'dense'}", flush=True)
             tissue = [float(t.stepGpuMilliseconds.value)] + ([float(v) for v in t.stageMilliseconds.value] or [0.0] * 4)
         row = [self.root.time.value, s.currentContacts.value, s.currentConstraints.value, s.currentIterations.value,
                s.currentError.value, s.stepGpuMilliseconds.value, s.normalImpulse.value,
@@ -186,7 +197,12 @@ def _add_gpu_surface(node, positions, triangles, mapping, template_in, map_force
     surface.addObject("MechanicalObject", name="dofs", template="CudaVec3f", position=positions)
     surface.addObject("MeshTopology", triangles=triangles)
     surface.addObject("TriangleCollisionModel", selfCollision=False)
-    surface.addObject(mapping, template=f"{template_in},CudaVec3f", mapForces=map_forces)
+    if mapping == "RigidMapping" and _available("GpuRigidMapping"):
+        # This plugin's GPU rigid mapping: SofaCUDA's RigidMapping<Rigid3d,CudaVec3f> maps
+        # surface forces to a wrong torque (SOFA v25.12).
+        surface.addObject("GpuRigidMapping", mapForces=map_forces)
+    else:
+        surface.addObject(mapping, template=f"{template_in},CudaVec3f", mapForces=map_forces)
     return surface
 
 
@@ -235,14 +251,14 @@ def _add_tissue_body(parent, mesh, map_forces=True):
 
 def _add_gpu_tissue_body(parent, mesh):
     """The tissue on the GPU: a CudaVec3f state integrated by GpuTissueSolver, which
-    replaces SofaViscoElastic + MeshMatrixMass + EulerImplicitSolver + SparseLDLSolver."""
+    replaces the material's force fields + MeshMatrixMass + EulerImplicitSolver + SparseLDLSolver."""
     tissue = parent.addChild("Tissue")
     tissue.addObject("MechanicalObject", name="dofs", template="CudaVec3f", position=mesh.positions)
     tissue.addObject("TetrahedronSetTopologyContainer", name="topo", tetrahedra=mesh.tetrahedra)
     tissue.addObject("FixedProjectiveConstraint", template="CudaVec3f", indices=mesh.bottom_indices)
-    ogden, maxwell = pc.tissue_material_parameters()
-    tissue.addObject("GpuTissueSolver", name="odeSolver", ogdenParameters=ogden, maxwellParameters=maxwell,
-                     ogdenEigenvectors=OGDEN_EIGENVECTORS,
+    tissue.addObject("GpuTissueSolver", name="odeSolver",
+                     **pc.gpu_tissue_material(ogden_eigenvectors=OGDEN_EIGENVECTORS, ogden_tangent=OGDEN_TANGENT),
+                     factorization=FACTORIZATION,
                      massDensity=pc.DENSITY, restPositions=mesh.positions, monitorVertex=mesh.top_center_index,
                      measureTimes=MEASURE_TIMES, compareWithCpu=COMPARE_TISSUE, compareEvery=COMPARE_EVERY,
                      compareFile=os.path.join(pc.default_log_dir(current_dir), LABEL + "_tissue_compare.csv"))
@@ -394,8 +410,8 @@ def createScene(root):
     else:
         tissue, probe, target = _build_penalty_scene(root, mesh, probe_mesh)
         contact_note = "side-aware penalty contact on the GPU, no friction"
-    tissue_note = ("tissue on the GPU (GpuTissueSolver)" if gpu_tissue
-                   else "tissue on the CPU (SofaViscoElastic, MeshMatrixMass, EulerImplicit + SparseLDL)")
+    tissue_note = (f"tissue on the GPU (GpuTissueSolver, {pc.material_note()})" if gpu_tissue
+                   else f"tissue on the CPU ({pc.material_note()}, MeshMatrixMass, EulerImplicit + SparseLDL)")
 
     # ---- drive + measure ------------------------------------------------------
     root.addObject(pc.ProbeDriver(name="driver", root=root, target=target.dofs))

@@ -7,7 +7,7 @@ friction) for [SOFA](https://www.sofa-framework.org/), built as a SOFA plugin ca
 This README is the single source of truth for the project: what it does, how it works,
 how to build and run it, what has been measured, and what is still broken.
 
-Last updated: 2026-09-24.
+Last updated: 2026-09-25.
 
 ---
 
@@ -62,18 +62,22 @@ been measured here.
 
 | Area | State | Details |
 |---|---|---|
-| Whole poke on the GPU | ✅ Works | In the GPU poke scene the tissue (viscoelastic Ogden material, consistent mass, fixed base, implicit step with a direct solve), collision detection and constraint contact with friction all run on the GPU (`GpuTissueSolver`, [7.9](#79-the-gpu-tissue)). Every tissue stage matches SOFA's CPU components to machine precision, and a whole poke gives SOFA's forces. **48 ms per step against 320 ms** for SOFA's CPU scene, and no GPU state is copied to or from the CPU during a step. Only the probe (a 6-DOF rigid body) stays on the CPU. |
-| SOFA's viscoelastic Ogden | ⚠️ Bug found | SofaViscoElastic's `SLSOgdenFirstOrder` (v25.12) never gets its eigenvectors from Eigen, so its stress is wrong whenever the tissue is deformed. The GPU tissue reproduces it by default, so it can be compared with SOFA; `ogdenEigenvectors="exact"` gives the material as written: a **42% higher** peak force in the poke ([16](#16-known-problems-and-limits)). |
+| Whole poke on the GPU | ✅ Works | In the GPU poke scene the tissue (viscoelastic Ogden material, consistent mass, fixed base, implicit step with a direct solve), collision detection and constraint contact with friction all run on the GPU (`GpuTissueSolver`, [7.9](#79-the-gpu-tissue)). A whole poke gives SOFA's CPU scene's forces to 0.3%, in **28 ms per step against 1,907 ms** (68 times faster), and no GPU state is copied to or from the CPU during a step. Only the probe (a 6-DOF rigid body) stays on the CPU. |
+| Validation against SOFA | ✅ | Seven physics tests with known answers, each on SOFA's CPU components and on the GPU ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)): materials, confined compression, beam bending, friction on an incline, plate compression, grasping, cutting. The GPU matches SOFA stage by stage (forces to 1e-13) and whole runs to nanometres, and both give the exact answers where one exists ([14.5](#145-validation-tests)). |
+| GPU tissue materials | ✅ | SOFA's five core hyperelastic materials (NeoHookean, stable NeoHookean, St Venant-Kirchhoff, Mooney-Rivlin, Ogden), SofaViscoElastic's Ogden and a Maxwell (viscous) branch; fixed and partly fixed DOFs, loads. |
+| Band factorisation | ✅ | The tissue matrix is renumbered to a narrow band and stored as blocks: 17 MB instead of 117 MB for the poke, and bigger meshes fit ([7.9](#79-the-gpu-tissue)). |
+| Several tools, grasping | ✅ Works | One constraint solve for the tissue against any number of rigid bodies. Two jaws and a pedestal lift or drop a block exactly as Coulomb's law says, on SOFA's CPU and on the GPU alike ([14.5](#145-validation-tests)). |
+| Cutting | ✅ Works | Element removal: `TetrahedronCutter` removes the tetrahedra a blade passes through, and the GPU tissue follows ([7.11](#711-cutting)); a cut beam matches SOFA's run to 1.3 nm. |
+| Bugs found in SOFA | ⚠️ 3 | SofaViscoElastic's Ogden computes no eigenvectors (its stress is wrong once deformed; 42% less peak force in the poke); SOFA's core Ogden is wrong where two stretches coincide; SofaCUDA's GPU `RigidMapping` gives a wrong torque. Fixes for the last two are in `patches/` ([16](#16-known-problems-and-limits)). |
 | GPU collision detection | ✅ Works | 6 ways to find candidate triangle pairs, 12 execution modes in total. All of them give exactly the same contacts. |
 | Fastest mode | ✅ | Way 6 ("big-cell fused") with its default table build: **0.290 ms** of GPU time per frame on the 14,368-triangle scene, about 5× faster than the component's default mode. |
 | No per-frame copies in collision | ✅ | Mesh positions are read in place on the GPU and contacts stay on the GPU. The collision code copies 0 bytes each way per frame. |
 | Whole-scene speed (collision only) | ✅ | 1,450 frames per second on the 14,368-triangle scene, 81 on the 200,018-triangle scene (way 6). |
 | GPU contact forces (penalty) | ✅ Works | Penalty contact that knows inside from outside, so a point that crosses a surface is pushed back out. It passes all 6 of its self-checks, Gates 1 to 2d ([section 15](#15-correctness-checks)), and in the tissue-poke test it matches SOFA's CPU constraint contact to within about 6%. |
-| GPU constraint contact with friction | ✅ Works | `GpuContactConstraintSolver`: no overlap, Coulomb friction, exact compliance, the whole constraint step on the GPU ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). On identical contacts it matches SOFA's CPU pipeline at every stage, with the same number of solver sweeps in every step, and a whole poke agrees with one driven by SOFA's CPU pipeline to 0.06%. On the poke's biggest problems (about 1,700 rows) SOFA's CPU pipeline takes about 10 s per step; the GPU takes about 80 ms. |
-| Tissue-poke test (realistic) | ✅ Works | A probe pokes a liver-like block 8 mm deep, holds 1 s and pulls out. The CPU scene and the GPU scene run the whole poke, and their forces agree within 0.6%. The default mesh overstates the absolute force by about half. See [10.3](#103-surgical-simulation-tests-tissue-poke) and [14.4](#144-tissue-poke). |
-| Old physics scene | ❌ Broken | In `gpu_resident_fem_contact.py` the blade comes apart after about 0.3 s, because it is 8 loose points instead of a rigid body. (Its other problem, contact that couldn't tell inside from outside, is fixed.) |
-| Whole frame on the GPU, old physics scene | ❌ Not yet | In that scene SOFA's own solving loop copies `position` from the GPU to the CPU every frame. The exact call is not found yet. (The poke scene with the GPU tissue doesn't use that loop, and copies no tissue data per step: [7.9](#79-the-gpu-tissue).) |
-| Cutting | ⏳ Not started | Needs mesh topology changes on the GPU. |
+| GPU constraint contact with friction | ✅ Works | `GpuContactConstraintSolver`: no overlap, Coulomb friction, exact compliance, the whole constraint step on the GPU ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). On identical contacts it matches SOFA's CPU pipeline at every stage, with the same number of solver sweeps in every step. On the poke's biggest problems (about 1,700 rows) SOFA's CPU pipeline takes about 10 s per step; the GPU, with the tissue on the GPU, 16 ms on average and under 30 ms at most. |
+| Tissue-poke test (realistic) | ✅ Works | A probe pokes a liver-like block 8 mm deep, holds 1 s and pulls out. The CPU scene and the GPU scene run the whole poke, and their forces agree within 0.3%. See [10.3](#103-surgical-simulation-tests-tissue-poke) and [14.4](#144-tissue-poke). |
+| Old physics scene | ✅ Works | In `gpu_resident_fem_contact.py` the blade is now a rigid body: it lands on the tissue and rests there, and its energy doesn't grow (Gate 3). |
+| Whole frame on the GPU, old physics scene | ✅ Works | Nothing is copied between the CPU and the GPU in any frame after the first (SofaCUDA's copy trace and the residency checker, Gate 5). The two per-frame copies were SOFA's bounding boxes; `GpuCollisionPipeline` and `computeBoundingBox=false` remove them. |
 
 ## 3. Quick start
 
@@ -108,6 +112,14 @@ Run the tissue poke, SOFA's CPU scene and the all-GPU scene one after the other 
 bash scripts/run_tissue_poke_wsl.sh both
 ```
 
+Run the validation tests: seven physics tests on SOFA's CPU components and on the GPU,
+compared with each other and with known answers (about 15 minutes;
+[10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)):
+
+```bash
+bash scripts/run_validation_suite_wsl.sh
+```
+
 Results are written under `/home/arfin/gpu-sofa/output/benchmark_logs/`.
 [Section 13](#13-reading-the-results) explains how to read them.
 
@@ -119,19 +131,20 @@ Results are written under `/home/arfin/gpu-sofa/output/benchmark_logs/`.
 GPU SOFA/
 ├── README.md                     this file, the source of truth
 ├── IDEAS.md                      idea log: every speed-up idea and its measured verdict
-├── PLAN_TIER1_TIER3.md           the plan GPU contact forces and the GPU tissue were built from
+├── patches/                      fixes for two bugs found in SOFA (SofaCUDA's RigidMapping torque, the core Ogden's eigenvectors)
 ├── .gitignore                    what git skips
 ├── .gitattributes                keeps .sh and .py files on LF line endings (needed in WSL)
 ├── SofaGpuCollision/             the plugin: all C++ and CUDA code
 │   ├── CMakeLists.txt            build recipe for the plugin and the test program
 │   └── src/
-│       ├── SofaGpuCollision/     the SOFA components (24 files)
-│       │   └── cuda/             the GPU code (12 files)
+│       ├── SofaGpuCollision/     the SOFA components (28 files)
+│       │   └── cuda/             the GPU code (13 files)
 │       └── tools/                the two test programs
 ├── testscenes/
 │   ├── collisiondetectiontests/  the 7 collision test scenes and their shared helper
-│   └── surgicalsimulationtests/  the tissue-poke scenes (CPU and GPU) and their shared setup
-├── scripts/                      30 scripts: build, run, compare, profile, summarise
+│   ├── surgicalsimulationtests/  the tissue-poke scenes (CPU and GPU) and their shared setup
+│   └── validationtests/          physics tests with known answers, each on SOFA's CPU components and on the GPU
+├── scripts/                      36 scripts: build, run, compare, profile, summarise
 ├── reports/                      measured results: current reports + dated archive folders
 ├── tutorial/                     a beginner course, chapters 00-18
 ├── explanation/                  the fastest algorithm, explained from start to finish
@@ -161,8 +174,10 @@ branch `cuda`). The build does not use it; it uses the SOFA install inside WSL.
 | `GpuCollisionBackend.h` | The list of everything the GPU code offers to the C++ side: settings, statistics and functions. No CUDA types cross this line. |
 | `GpuCollisionBackendStub.cpp` | Empty versions of the GPU functions, used when building without CUDA. The plugin still compiles and falls back to the CPU. |
 | `CudaContactPenaltyForceField.h/.cpp` | SOFA component. Turns GPU contacts into push-apart forces, on the GPU. |
-| `GpuContactConstraintSolver.h/.cpp` | SOFA component. Constraint contact with friction on the GPU: takes the place of SOFA's constraint solver, and can run SOFA's own CPU pipeline alongside for comparison ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). |
-| `GpuTissueSolver.h/.cpp` | SOFA component. The whole tissue step on the GPU: viscoelastic Ogden material, consistent mass, fixed DOFs, implicit Euler with a direct solve. An ODE solver on a `CudaVec3f` tissue; can run SOFA's own CPU components alongside for comparison ([7.9](#79-the-gpu-tissue)). |
+| `GpuContactConstraintSolver.h/.cpp` | SOFA component. Constraint contact with friction on the GPU, between one deformable body and one or more rigid bodies: takes the place of SOFA's constraint solver, and can run SOFA's own CPU pipeline alongside for comparison ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). |
+| `GpuTissueSolver.h/.cpp` | SOFA component. The whole tissue step on the GPU: SOFA's hyperelastic materials (Ogden, NeoHookean, Mooney-Rivlin, St Venant-Kirchhoff, stable NeoHookean) and viscoelastic branches, consistent mass, fixed and partly fixed DOFs, loads, implicit Euler with a direct solve. An ODE solver on a `CudaVec3f` tissue; can run SOFA's own CPU components alongside for comparison ([7.9](#79-the-gpu-tissue)). |
+| `GpuRigidMapping.h/.cpp` | SOFA component. A rigid body's surface on the GPU, with the correct torque that SofaCUDA's `RigidMapping` gets wrong ([9.11](#911-gpurigidmapping)). |
+| `TetrahedronCutter.h/.cpp` | SOFA component. Cutting by element removal: a blade moving in a plane removes the tetrahedra it has passed through, on CPU and GPU tissues alike ([7.11](#711-cutting)). |
 | `GpuCollisionPipeline.h/.cpp` | SOFA component. SOFA's `CollisionPipeline` without the per-frame CPU bounding boxes of GPU surfaces, which copy them to the CPU every frame. |
 | `GpuResidencyChecker.h/.cpp` | SOFA component. Checks each frame whether positions, velocities or forces were copied to the CPU, and names which. |
 | `GpuPipelineBenchmarkController.h/.cpp` | SOFA component. Writes the per-frame timing CSV and the summary file. |
@@ -177,18 +192,19 @@ linking steps.
 
 | File | Size | What it contains |
 |---|---:|---|
-| `GpuCollisionBackend.cu` | 2 KB | Includes the eleven files below, in order. |
-| `detail/BackendCommon.cuh` | 19 KB | Shared basics: GPU data types, vector math, memory, copy and timing helpers, and CUDA-graph replay. |
-| `detail/DenseGrid.cuh` | 126 KB | Ways 1 and 2 (a fixed 3D grid), plus grid math that every way reuses. |
-| `detail/BroadPhaseLegacy.cuh` | 25 KB | Older code: a tree-based object broad phase, a brute-force contact kernel, and the "is CUDA working?" check. |
-| `detail/FbpKernels.cuh` | 56 KB | The exact distance math between triangles, the vertex-triangle kernels, and the list that tells the force field where the contacts are. |
-| `detail/HashGrid.cuh` | 64 KB | Way 3: optimised spatial hash. |
-| `detail/SimpleHash.cuh` | 23 KB | Way 4: simple one-pass spatial hash. |
-| `detail/SortedGrid.cuh` | 49 KB | Way 5: sorted grid. |
-| `detail/BigCellGrid.cuh` | 94 KB | Way 6, the fastest: big cells, and one kernel that finds pairs and does the distance math together. |
-| `detail/ContactForces.cuh` | 53 KB | GPU contact forces, plus a self-check against a CPU calculation. |
-| `detail/ContactConstraints.cuh` | 89 KB | GPU constraint contact: contact selection, constraint rows, the dense Cholesky compliance (cuSOLVER and cuBLAS), the Gauss-Seidel solver with friction, and the correction. |
-| `detail/TissueSolver.cuh` | 54 KB | The GPU tissue: the viscoelastic Ogden material and its stiffness, the mass, the implicit system, its Cholesky (cuSOLVER) with refinement in double precision. |
+| `GpuCollisionBackend.cu` | 2 KB | Includes the twelve files below, in order. |
+| `detail/BackendCommon.cuh` | 21 KB | Shared basics: GPU data types, vector math, memory, copy and timing helpers, CUDA-graph replay, and the one-workspace-per-collision-pair store ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). |
+| `detail/DenseGrid.cuh` | 123 KB | Ways 1 and 2 (a fixed 3D grid), plus grid math that every way reuses. |
+| `detail/BroadPhaseLegacy.cuh` | 24 KB | Older code: a tree-based object broad phase, a brute-force contact kernel, and the "is CUDA working?" check. |
+| `detail/FbpKernels.cuh` | 60 KB | The exact distance math between triangles, the vertex-triangle kernels, and the list that tells the contact response where each pair's contacts are. |
+| `detail/HashGrid.cuh` | 62 KB | Way 3: optimised spatial hash. |
+| `detail/SimpleHash.cuh` | 22 KB | Way 4: simple one-pass spatial hash. |
+| `detail/SortedGrid.cuh` | 48 KB | Way 5: sorted grid. |
+| `detail/BigCellGrid.cuh` | 95 KB | Way 6, the fastest: big cells, and one kernel that finds pairs and does the distance math together. |
+| `detail/ContactForces.cuh` | 52 KB | GPU contact forces, plus a self-check against a CPU calculation. |
+| `detail/ContactConstraints.cuh` | 111 KB | GPU constraint contact: contact selection, constraint rows for every rigid body, the compliance (cuSOLVER and cuBLAS), the Gauss-Seidel solver with friction, and the correction. |
+| `detail/TissueSolver.cuh` | 84 KB | The GPU tissue: the materials and their stiffness, the mass, loads, the implicit system, its band Cholesky (after a bandwidth-reducing renumbering) or dense Cholesky, LU when it is not positive definite, and refinement in double precision. |
+| `detail/RigidMapping.cuh` | 7 KB | `GpuRigidMapping`'s kernels: positions and velocities from a rigid pose, and the surface forces summed into a force and a torque. |
 
 `SofaGpuCollision/src/tools/` holds the two test programs ([section 12](#12-the-standalone-test-program)):
 `DenseGridBackendBench.cpp` (collision and contact forces, without SOFA) and
@@ -292,9 +308,12 @@ folder is `/opt/sofa/build`.
 
 ```bash
 cmake -S /home/arfin/gpu-sofa/SofaGpuCollision -B /home/arfin/gpu-sofa/SofaGpuCollision/build-profile \
-      -DCMAKE_PREFIX_PATH=/opt/sofa/install/v25.12 -DSOFAGPUCOLLISION_ENABLE_CUDA=ON
+      -DCMAKE_PREFIX_PATH=/opt/sofa/install/v25.12 -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=75 -DSOFAGPUCOLLISION_ENABLE_CUDA=ON
 cmake --build /home/arfin/gpu-sofa/SofaGpuCollision/build-profile -j"$(nproc)"
 ```
+
+(`SOFA_GPU_BUILD_TYPE` and `SOFA_GPU_CUDA_ARCH` override the two settings.)
 
 The configure and build output go to `~/_cfg.log` and `~/_build.log`. The build makes three
 files in `build-profile/`:
@@ -319,15 +338,19 @@ check that its name is inside the plugin:
 nm -DC /home/arfin/gpu-sofa/SofaGpuCollision/build-profile/libSofaGpuCollision.so | grep -c YourComponentName
 ```
 
-**The current build settings, and why they matter.** No build type is set, so:
+**The build settings.** Since 2026-09-25 the build is optimised (`Release`: `-O3` for the
+CPU code) and the GPU code is compiled for the GTX 1650 Ti itself (compute capability 7.5,
+`sm_75`). `CMakeLists.txt` uses the same defaults for a fresh build folder. Before that, CPU
+code had no optimisation and GPU code was compiled for 5.2 (`sm_52`, nvcc 12.0's default),
+which the driver translated for the 7.5 GPU when the plugin loaded.
 
-- CPU code is compiled **without optimisation** (no `-O` flag).
-- GPU code is compiled for compute capability 5.2 (`sm_52`, CMake's default with nvcc 12.0).
-  The GPU is 7.5, so the driver translates the code when the plugin loads.
-
-Every number in this README was measured with these settings. A faster build would add
-`-DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75` to the configure step. After
-switching, re-measure everything before comparing with older numbers.
+Measured back to back (same session), the switch changed **no result** (the constraint
+checks give the same numbers to the last digit; the poke's forces agree within run-to-run
+noise) and **no GPU-bound time**: way 6's kernel 0.308 → 0.295 ms, the all-GPU poke 48.7 →
+49.0 ms per step, all within noise. The driver was already running translated 7.5 code, and
+SOFA itself was already optimised. Only the plugin's own CPU code got faster: the checks'
+double-precision reference solve went from 4,562 to 148 ms. Numbers in this README from
+before 2026-09-25 were measured with the old settings.
 
 ### 6.4 Loading the plugin in SOFA
 
@@ -459,6 +482,12 @@ contacts.
   four ways to build it ([section 8](#8-the-12-execution-modes)). The default is fastest:
   each GPU block first builds a small hash table in shared memory, then merges it into the
   global list.
+- The list holds one entry per (triangle, small cell) it overlaps, so a large triangle over
+  small cells needs many. The buffer starts at 16 entries per triangle; the count step's
+  total (4 bytes) is read back every frame, and when it did not fit, the buffer grows with
+  50% headroom and the frame runs again. Before this, the extra entries were silently
+  dropped, and a block on a floor of 5 cm triangles over 5 mm cells lost more than half of
+  its contacts and sank through the floor.
 
 **Ways 3 to 6 replay their kernels as a CUDA graph.** The sequence of kernels is recorded
 once and replayed every frame, which removes most of the CPU cost of launching kernels.
@@ -575,7 +604,8 @@ overlap a little and has no friction.
 contact as a hard rule (the two surfaces may not come closer than the contact distance)
 with Coulomb friction, and works out the contact forces as Lagrange multipliers, the way
 SOFA's own constraint contact does. It takes the place of SOFA's constraint solver in a
-`FreeMotionAnimationLoop`, for **one deformable body touching one rigid body**.
+`FreeMotionAnimationLoop`, for **one deformable body touching one or more rigid bodies**
+(a probe; two grasper jaws and a table).
 
 **One step, in SOFA's order:**
 
@@ -598,9 +628,11 @@ SOFA's own constraint contact does. It takes the place of SOFA's constraint solv
    direct linear solver after the free motion: exactly what SOFA's
    `LinearSolverConstraintCorrection` uses. With a CPU tissue its matrix is copied up and
    factorised on the GPU as a dense Cholesky (cuSOLVER, single precision); with
-   `GpuTissueSolver` the free motion's own Cholesky factor is used as it is, with no copy
-   and no second factorisation. Only the block of A1⁻¹ on the touched vertices is formed:
-   one triangular solve and one matrix product (cuBLAS). The rigid body's 6×6 is inverted on
+   `GpuTissueSolver` the free motion's own factor (band or dense Cholesky, or LU,
+   [7.9](#79-the-gpu-tissue)) is used as it is, with no copy and no second factorisation.
+   Only the block of A1⁻¹ on the touched vertices is formed: one triangular solve with the
+   factor (dense with cuBLAS, or band) on the touched DOFs' unit columns, then one matrix
+   product (cuBLAS); after an LU step, full solves. Each rigid body's 6×6 is inverted on
    the CPU.
 5. **Solve** (GPU). SOFA's block Gauss-Seidel with its friction cone: the same update per
    contact, the same error measure, the same tolerance scaling and stopping rule. It runs in
@@ -611,6 +643,24 @@ SOFA's own constraint contact does. It takes the place of SOFA's constraint solv
 
 **Why the exact compliance, rebuilt every step:** the tissue stiffens under load (Ogden), so
 a compliance worked out once at rest would be wrong in exactly the moments that matter.
+
+**Several rigid bodies** (`additionalRigidStates`, `additionalRigidSurfaces`,
+`additionalRigidLinearSolvers`, `additionalRigidOdeSolvers`: one entry per extra body, in the
+same order). Every body's contacts with the tissue go into one problem and are solved
+together, as SOFA's constraint solver does with several bodies in contact: the rows of
+all bodies, one W (the tissue's part couples every contact; each rigid body adds its own
+6×6 compliance only between its own contacts), one Gauss-Seidel, and a correction for
+each body. A tissue vertex pinched between two jaws keeps a contact with each. Contacts
+between two rigid bodies are not computed: put the rigid bodies' collision models in one
+collision `group`, which SOFA's broad phase (and so the GPU's) honours. The force and
+torque on each extra body are in `additionalRigidContactForces`.
+
+**One set of contacts per pair of surfaces.** The narrow phase finds each pair's contacts in
+turn, and the contact response reads them all after the collision pass. So each pair of
+surfaces keeps its own GPU workspace (contacts, counters, triangle list, CUDA graph). Until
+2026-09-25 all pairs shared one, and in a scene with three tools every tool read the last
+pair's contacts through its own triangle list: wrong contacts, and an illegal memory
+access. Scenes with one tool were not affected.
 
 **What crosses between the CPU and the GPU per step** (poke test, 1,800 nodes), with a CPU
 tissue: the tissue's free positions (21.6 KB) and its matrix values (0.84 MB) go up; the
@@ -653,22 +703,25 @@ To use it:
 5. No `LinearSolverConstraintCorrection` and no SOFA contact response are needed; the
    component does both jobs.
 
-`tissue_poke_gpu.py` (`_build_constraint_scene`) is a working example.
+`tissue_poke_gpu.py` (`_build_constraint_scene`) is a working example with one rigid body,
+`testscenes/validationtests/grasp_lift.py` with three.
 
 ### 7.9 The GPU tissue
 
 `GpuTissueSolver` runs the tissue's whole step on the GPU. It is an ODE solver for a node
 whose `MechanicalObject` is `CudaVec3f`, with tetrahedra, and it takes the place, stage for
-stage, of the poke test's CPU tissue:
+stage, of these CPU components of SOFA:
 
 | SOFA's CPU component | Its job | On the GPU |
 |---|---|---|
-| `TetrahedronViscoHyperelasticityFEMForceField` with `SLSOgdenFirstOrder` | the Ogden material, with its own relaxing branch | one thread per tetrahedron: deformation, stress, nodal forces and the stiffness of the tetrahedron's 6 edges, in double precision |
-| `TetrahedronViscoelasticityFEMForceField` with `MaxwellFirstOrder` | the separate relaxing branch | the same thread |
+| `TetrahedronHyperelasticityFEMForceField` with `NeoHookean`, `StableNeoHookean`, `StVenantKirchhoff`, `MooneyRivlin` or `Ogden` | SOFA's core hyperelastic materials | one thread per tetrahedron: deformation, stress, nodal forces and the stiffness of the tetrahedron's 6 edges, in double precision, with SOFA's formulas |
+| `TetrahedronViscoHyperelasticityFEMForceField` with `SLSOgdenFirstOrder` | SofaViscoElastic's Ogden, with its own relaxing branch | the same thread |
+| `TetrahedronViscoelasticityFEMForceField` with `MaxwellFirstOrder` | a relaxing (viscous) branch in parallel | the same thread |
 | `MeshMatrixMass` | consistent (not lumped) mass from the density | vertex masses ρV/10 and edge masses ρV/20 per tetrahedron; gravity on the lumped mass, as SOFA does |
-| `FixedProjectiveConstraint` | the fixed base | read once from the node's own `CudaVec3f` constraint |
+| `FixedProjectiveConstraint`, `PartialFixedProjectiveConstraint` | held DOFs | fixed vertices read once from the node's own `CudaVec3f` constraint; partly held ones from `partialFixedIndices` and `partialFixedMasks` (SofaCUDA has no GPU `PartialFixedProjectiveConstraint`) |
+| `ConstantForceField` | loads | the node's own `CudaVec3f` `ConstantForceField`s, through SOFA's `addForce`, read again whenever their data change |
 | `EulerImplicitSolver` | one implicit Euler step | the same right-hand side and matrix |
-| `SparseLDLSolver` | exact solve | dense Cholesky in single precision, plus one refinement step in double precision |
+| `SparseLDLSolver` | exact solve | a band Cholesky after renumbering (or a dense one), in single precision, plus one refinement step in double precision; LU when the matrix is not positive definite |
 
 **One step:**
 
@@ -683,9 +736,26 @@ stage, of the poke test's CPU tissue:
    taken out the way SOFA's linear system does it: their rows and columns are cleared, the
    diagonal is set to 1 and b to 0. A is built block by block in double precision and copied
    into a dense single-precision matrix.
-4. **Solve.** A Cholesky factorisation (cuSOLVER), a solve, then one refinement step: the
-   residual b − A dv in double precision and a second solve for the correction. That brings
-   dv from single-precision to double-precision accuracy.
+4. **Solve.** A Cholesky factorisation, a solve, then one refinement step: the residual
+   b − A dv in double precision and a second solve for the correction. That brings dv from
+   single-precision to double-precision accuracy.
+   - **Band Cholesky** (the default whenever it pays). At start-up the DOFs are renumbered
+     once with reverse Cuthill-McKee, so that every nonzero of A lies within a band around
+     the diagonal (half-bandwidth b). Cut into blocks w ≥ b wide (b rounded up to a
+     multiple of `bandPanel`), A is then block tridiagonal, and only its diagonal blocks
+     D_k and the blocks S_k below them are stored: 2·n·w floats instead of n². The block
+     Cholesky works through them in order (cuSOLVER's Cholesky of D_k, cuBLAS's triangular
+     solve for S_k and its update of D_k+1), about 2.3·n·w² operations instead of n³/3,
+     all on whole w × w blocks. A solve is one triangular solve and one matrix product per
+     block. It is used when 3b < n (`factorization="auto"`); `"dense"` and `"band"` force
+     either.
+   - **Dense Cholesky** (cuSOLVER) otherwise, on the whole n × n matrix.
+   - **LU with pivoting** for a step whose matrix is not positive definite (a strongly
+     compressed state, where the geometric stiffness outweighs M/h²): single-precision
+     Cholesky would stop there, and SOFA's `SparseLDLSolver` doesn't (LDLᵀ takes pivots of
+     either sign). It works on a dense copy of A, which the band mode allocates for the
+     first such step (so a mesh too big for n² floats can't take one). `luFallbackSteps`
+     counts such steps.
 5. **Update.** v_free = v + dv and x_free = x + h v_free, straight into the tissue's GPU state.
 
 The constraint contact then uses the same Cholesky factor for the compliance and the
@@ -738,7 +808,21 @@ axis, whatever their real directions). SOFA's core `Ogden` material replaced the
 17/11/2025 ("incorrect eigenvector computation for 3x3 matrices"); SofaViscoElastic v25.12
 still has it, in `SLSOgdenFirstOrder` and `SLSOgdenSecondOrder`.
 
-`ogdenEigenvectors` chooses what the GPU does:
+**SOFA's core Ogden has a problem of its own where stretches coincide.** Its replacement
+takes the eigenvectors from Eigen's general (non-symmetric) `EigenSolver` and builds
+C^(α/2−1) as V D Vᵀ, which assumes the eigenvectors are orthonormal. Where two principal
+stretches are equal, or differ only by rounding, the general solver's eigenvectors are not
+orthogonal, and V D Vᵀ is wrong by up to 100% (measured with Eigen on such states: 97% in
+uniaxial strain, 96% in an axisymmetric state, 186% at rest with noise of 1e-16; exact to
+1e-14 when the stretches are distinct). This happens at rest, in uniaxial states (the
+confined compression test) and under a round probe on its axis. The GPU computes C's
+eigenvectors with a symmetric method, so it has the material as written: in the confined
+compression test SOFA's forces differ from it by up to 4.6e-4 (relative) in the few steps
+where two stretches coincided to rounding, while NeoHookean in the same test agrees to
+1e-13. `patches/SOFA-Ogden-orthonormal-eigenvectors.patch` is the fix (Eigen's
+`SelfAdjointEigenSolver` with `Eigen::ComputeEigenvectors`).
+
+`ogdenEigenvectors` chooses what the GPU does for SofaViscoElastic's Ogden (`ogdenParameters`):
 
 - `sofa` (the default): the same pairing as SOFA's, for the stress and the stiffness, so the
   GPU scene and the CPU scene have the same material and can be compared directly.
@@ -750,21 +834,24 @@ move their forces differed by 19 to 30% on identical positions. A separate NumPy
 of the formulas agreed with the GPU to 1e-14 and not with SOFA. Rebuilding Eigen's work
 matrix in NumPy then matched SOFA's forces to 1e-14.
 
-**Size limit.** A is dense: 5,400 × 5,400 floats (117 MB) for the poke's 1,800 nodes. Memory
-grows with the square of the node count and the factorisation's work with the cube; about
-10,000 nodes would fill the 4 GB GPU. A sparse factorisation would lift this
-([17](#17-whats-next)).
+**Size.** With the band factorisation, memory grows with 2·n·w and the work with n·w², where
+the bandwidth b ≤ w grows with the mesh's cross-section (about the number of DOFs in one
+layer of the renumbered mesh). The dense one needs n² floats: 117 MB for the poke's 5,400
+DOFs, and about 10,000 nodes would fill the 4 GB GPU. How the time grows with the mesh is measured
+in [14.6](#146-time-per-step-as-the-scene-grows).
 
 To use it:
 
 1. A `MechanicalObject` with template `CudaVec3f` and a tetrahedral topology in the same node
    (`TetrahedronSetTopologyContainer`).
-2. The fixed DOFs with `FixedProjectiveConstraint`, template `CudaVec3f`. Only fixed DOFs are
-   supported.
-3. `GpuTissueSolver` with `ogdenParameters` (as `SLSOgdenFirstOrder`'s `ParameterSet`:
-   μ1 α1 G1 τ k0), `maxwellParameters` (as `MaxwellFirstOrder`'s: G1 τ λ, or empty),
-   `massDensity`, and `restPositions` in double precision (the `CudaVec3f` state holds only
-   single precision).
+2. Fully held vertices with `FixedProjectiveConstraint`, template `CudaVec3f`; partly held ones
+   in `partialFixedIndices` and `partialFixedMasks`. Loads: `ConstantForceField`s (`CudaVec3f`)
+   in the same node.
+3. `GpuTissueSolver` with the material: `hyperelasticMaterial` and `hyperelasticParameters`
+   (as `TetrahedronHyperelasticityFEMForceField`'s `materialName` and `ParameterSet`) and/or
+   `ogdenParameters` (as `SLSOgdenFirstOrder`'s: μ1 α1 G1 τ k0), with `maxwellParameters`
+   (as `MaxwellFirstOrder`'s: G1 τ λ, or empty); `massDensity`, and `restPositions` in
+   double precision (the `CudaVec3f` state holds only single precision).
 4. Its collision surface: a `CudaVec3f` child node with `IdentityMapping`
    (template `CudaVec3f,CudaVec3f`).
 5. With the GPU constraint contact: link its `deformableGpuSolver` to the tissue solver, use
@@ -787,6 +874,36 @@ the checker names the object, the vector and when it happened (`frame-begin` or
 **What it can't see:** a read that is followed by a GPU write before either check, because
 the GPU write resets the flag. Catching that would need hooks inside SofaCUDA's copy
 functions.
+
+### 7.11 Cutting
+
+Cutting removes the tetrahedra a blade has passed through (element removal), the way
+SOFA's own cutting examples do, and the GPU tissue follows.
+
+1. **The blade** (`TetrahedronCutter`, [9.12](#912-tetrahedroncutter)): a straight edge moving
+   in a plane. Before each step it removes every tetrahedron whose centroid the edge has
+   passed and which lies within `kerf` of the plane. It takes the centroids in the rest
+   configuration, so a CPU scene and a GPU scene with the same mesh remove exactly the same
+   tetrahedra in the same steps. It is a CPU component: it only edits the topology, through
+   SOFA's `TetrahedronSetTopologyModifier`.
+2. **SOFA's components follow the change** as they always do: on the CPU, `MeshMatrixMass` and
+   the material's force field update their per-element data; a boundary surface built with
+   `Tetra2TriangleTopologicalMapping` gains the faces the cut exposes.
+3. **`GpuTissueSolver` follows it too.** Before the next step it sees fewer tetrahedra,
+   rebuilds its element arrays and gather lists for the remaining ones (with the edges
+   numbered as at creation, so the matrix pattern and the band renumbering stay valid; an
+   edge no tetrahedron uses any more just adds nothing), recomputes the mass as
+   `MeshMatrixMass` does for the remaining tetrahedra, and moves each tetrahedron's viscous
+   state to its new position (SOFA moves the last tetrahedron into each hole). (A vertex
+   that loses all its tetrahedra but stays in the state has no mass and no stiffness; it is
+   held in place.)
+4. **Collision** sees the new surface: the GPU narrow phase re-reads a surface's triangle
+   list when its size changes.
+
+SOFA removes a vertex that no tetrahedron uses any more (and renumbers the rest), which the
+GPU tissue refuses: cut whole layers of cells (a kerf of one cell), so that every vertex
+keeps a tetrahedron. The validation test `cutting.py` cuts a slot one cell wide into a
+loaded beam; SOFA's CPU run and the GPU run agree to 1.3 nm ([14.5](#145-validation-tests)).
 
 ---
 
@@ -862,6 +979,7 @@ code. Set them in the scene, for example
 | `useFeatureBasedProximity` | false | Use the closest-feature distance math ([7.5](#75-the-exact-distance-math)). All test scenes turn it on. When false, the older yes/no intersection test runs. |
 | `useVertexTriangleProximity` | false | Send self-collision and point-cloud-against-mesh pairs to the vertex-triangle math. Needs `useFeatureBasedProximity`. |
 | `proximityComputeBarycentrics` | true | Store the barycentric weights in each contact. Needed for forces. |
+| `proximityAllVertexContacts` | true | Way 6: every vertex-face pair of two triangles within the contact distance becomes a contact (plus their closest edge-edge pair when that is the closest), as SOFA's point-triangle proximity tests every vertex. false: only the closest feature of each triangle pair; when two flat faces touch, the six vertex-face distances tie and most vertices got no contact (a block resting on large floor triangles sank through). |
 | `proximityMaxContacts` | 1,000,000 | Size of the GPU contact buffer. |
 | `contactDistance` | 0.03 | Two surfaces closer than this count as touching. It also enlarges every triangle's box. |
 
@@ -943,12 +1061,15 @@ How it works and how to set up a scene: [7.8](#78-gpu-constraint-contact-no-over
 |---|---|---|
 | `deformableState`, `deformableSurface`, `deformableLinearSolver`, `deformableOdeSolver` | — | Body 1 on the CPU: its `Vec3d` MechanicalObject, its `CudaVec3f` collision surface (same vertex numbering), its direct linear solver and its ODE solver. |
 | `deformableGpuSolver` | — | Body 1 on the GPU: its `GpuTissueSolver`, instead of `deformableState`, `deformableLinearSolver` and `deformableOdeSolver` (`deformableSurface` is still needed). The free positions, the factor and the correction then stay on the GPU. |
-| `rigidState`, `rigidSurface`, `rigidLinearSolver`, `rigidOdeSolver` | — | Body 2: its `Rigid3d` MechanicalObject (one rigid body), its `CudaVec3f` surface (`RigidMapping`), its direct linear solver and its ODE solver. All required. |
+| `rigidState`, `rigidSurface`, `rigidLinearSolver`, `rigidOdeSolver` | — | Body 2: its `Rigid3d` MechanicalObject (one rigid body, free, on a spring, or held by `FixedProjectiveConstraint`), its `CudaVec3f` surface (`GpuRigidMapping`), its direct linear solver and its ODE solver. All required. |
+| `additionalRigidStates`, `additionalRigidSurfaces`, `additionalRigidLinearSolvers`, `additionalRigidOdeSolvers` | empty | More rigid bodies, one entry per body in each list, in the same order; set up like body 2. All bodies' contacts are solved together ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)). Not with `compareWithCpu` or `response="cpu"`. |
 | `friction` | 0 | Coulomb friction μ. 0 = frictionless, one row per contact instead of three. |
 | `contactDistance` | 0 | The gap kept between the surfaces (SOFA's contact distance). The narrow phase must find contacts at least this far out; give it the alarm distance. |
 | `tolerance`, `maxIterations` | 0.001, 1000 | Gauss-Seidel stopping rule, as in SOFA's constraint solvers. The poke test uses 1e-7 and 1000, like its CPU scene. |
 | `scaleTolerance`, `allVerified`, `sor` | true, false, 1 | As in SOFA: tolerance × number of rows; stop only when every contact is within tolerance; over-relaxation. |
-| `contactFilter` | `vertexFace` | `vertexFace`: one vertex-face contact per vertex, no edge-edge. `all`: every contact the narrow phase found (a bigger, redundant problem). |
+| `contactFilter` | `vertexFace` | `vertexFace`: one vertex-face contact per vertex (its closest face; the copies of it found through each triangle around the vertex count once), no edge-edge. `all`: every contact the narrow phase found (a bigger, redundant problem). |
+| `vertexConeFilter`, `vertexConeTolerance` | true, 0.05 | Keep a vertex-face contact only if its direction leaves its vertex's own surface: within the cone of the faces around that vertex (cosine margin 0.05, about 18° around a flat surface's normal). SOFA's `LocalMinDistance` filters its point contacts the same way. Without it, a floor vertex just ahead of a sliding block made an oblique contact with the block's front edge, and the constraint stopped the block. |
+| `dumpContactsFile` | empty | With `compareWithCpu`: append every compared step's contacts (vertices, weights, points, normal, gap, normal force) to this CSV. For diagnostics. |
 | `exactArithmetic` | false | Run the Gauss-Seidel in double precision with SOFA's exact arithmetic. Slower; for checking. |
 | `response` | `gpu` | `cpu` = SOFA's CPU pipeline moves the bodies, on the GPU's contacts. For checking; slow. |
 | `compareWithCpu`, `compareEvery`, `compareFile` | false, 1, `gpu_constraint_compare.csv` | Run SOFA's CPU pipeline alongside every N-th contact step and write the stage-by-stage differences and both sides' times. Slow. |
@@ -957,6 +1078,7 @@ How it works and how to set up a scene: [7.8](#78-gpu-constraint-contact-no-over
 Outputs (read-only): `currentContacts`, `currentConstraints` (rows), `currentIterations`
 (Gauss-Seidel sweeps), `currentError`, `normalImpulse` (sum of the normal multipliers, in
 N·s), `rigidContactForce` (force and torque on the rigid body, J2ᵀλ/dt),
+`additionalRigidContactForces` (the same for each additional body),
 `stepGpuMilliseconds` and `stageMilliseconds` (rows, factorisation, compliance, solve,
 correction; with `measureTimes`).
 
@@ -966,21 +1088,39 @@ How it works and how to set up a scene: [7.9](#79-the-gpu-tissue).
 
 | Setting | Default | What it does |
 |---|---|---|
-| `ogdenParameters` | — | `SLSOgdenFirstOrder`'s `ParameterSet`: μ1 α1 G1 τ k0 (5 values; G1 = 0 for no relaxing branch of its own). Required. |
+| `hyperelasticMaterial`, `hyperelasticParameters` | empty | A SOFA core material, as `TetrahedronHyperelasticityFEMForceField`'s `materialName` and `ParameterSet`: `Ogden` (μ1 α1 k0), `NeoHookean`, `StableNeoHookean`, `StVenantKirchhoff` (μ λ), `MooneyRivlin` (c1 c2 k0). Stress and stiffness as SOFA computes them. |
+| `ogdenTangent` | `robust` | Core `Ogden`'s stiffness. `robust`: the divided differences between principal stretches computed without cancellation. `sofa`: SOFA's plain quotient, which loses its accuracy when two stretches differ only by rounding. The two agree whenever the stretches are distinct. |
+| `ogdenParameters` | empty | SofaViscoElastic's `SLSOgdenFirstOrder` `ParameterSet`: μ1 α1 G1 τ k0 (5 values; G1 = 0 for no relaxing branch of its own). |
 | `maxwellParameters` | empty | `MaxwellFirstOrder`'s `ParameterSet`: G1 τ λ. Empty: no Maxwell branch. |
-| `ogdenEigenvectors` | `sofa` | `sofa`: C^p built as SofaViscoElastic v25.12 builds it (without eigenvectors), so the results match SOFA's CPU components. `exact`: the true eigenvectors, the Ogden material as written. |
+| `ogdenEigenvectors` | `sofa` | For `ogdenParameters`. `sofa`: C^p built as SofaViscoElastic v25.12 builds it (without eigenvectors), so the results match SOFA's CPU components. `exact`: the true eigenvectors, the Ogden material as written. |
+| `partialFixedIndices`, `partialFixedMasks` | empty | Vertices with some directions held (1 = x, 2 = y, 4 = z, sums for several), as `PartialFixedProjectiveConstraint` (which has no GPU version). Fully held vertices: a `FixedProjectiveConstraint` (`CudaVec3f`) in the node. |
 | `massDensity` | 1 | Density (kg/m³), for `MeshMatrixMass`'s consistent mass. |
 | `rayleighStiffness`, `rayleighMass` | 0, 0 | Rayleigh damping, as in `EulerImplicitSolver`. |
-| `refinementSteps` | 1 | Refinement steps in double precision after the single-precision Cholesky solve. |
+| `refinementSteps` | 1 | Refinement steps in double precision after the single-precision solve. |
+| `factorization` | `auto` | The system matrix's factorisation ([7.9](#79-the-gpu-tissue)): `band` (band Cholesky after a reverse Cuthill-McKee renumbering), `dense` (dense Cholesky), or `auto` (band when the half-bandwidth is under a third of the DOFs). |
+| `bandPanel` | 128 | Band factorisation: the block width is the bandwidth rounded up to a multiple of this. |
 | `restPositions` | the state's | Rest positions in double precision (a `CudaVec3f` state stores single precision). |
 | `topology` | the node's | The tetrahedral topology. |
 | `monitorVertex` | −1 | A vertex whose position is reported in `monitorPosition` after each step, together with `minVolumeRatio`. −1: off. |
 | `measureTimes` | false | Time each GPU stage with CUDA events. |
 | `compareWithCpu`, `compareEvery`, `compareFile` | false, 1, `gpu_tissue_compare.csv` | Run SOFA's own CPU components on the same state every step, and write the differences every N-th step. Slow (about 250 ms per step here). |
 
+At least one of `hyperelasticMaterial` and `ogdenParameters` is needed; both together act
+in parallel, like two force fields on one mesh. Loads: `ConstantForceField`s (`CudaVec3f`)
+in the tissue's node; SOFA's own `addForce` gives their nodal forces, read again whenever
+their data change (a controller may ramp a load). Any other force field or mass in the
+node is refused: the solver computes the material, the mass and gravity itself.
+
+When the system matrix is not positive definite (a strongly compressed state, where the
+geometric stiffness outweighs M/h²), single-precision Cholesky stops; the step is then
+solved with LU with pivoting instead (dense), and the contact uses that factor for the
+step. SOFA's `SparseLDLSolver` gets through such steps too (LDLᵀ takes pivots of either
+sign).
+
 Outputs (read-only): `minVolumeRatio` (the smallest volume / rest volume over the
 tetrahedra), `monitorPosition`, `stepGpuMilliseconds` and `stageMilliseconds` (material,
-assembly, factorisation, solve; with `measureTimes`).
+assembly, factorisation, solve; with `measureTimes`), `luFallbackSteps` (steps solved
+with LU), `bandwidth` (the band factorisation's half-bandwidth in DOFs; 0 = dense).
 
 ### 9.6 `GpuCollisionPipeline`
 
@@ -1041,11 +1181,52 @@ Needs a `MechanicalObject` with template `Rigid3d` in the same node.
 The scenes also read many environment variables and turn them into settings; see
 [section 10.2](#102-environment-variables-read-by-the-scenes).
 
+### 9.11 `GpuRigidMapping`
+
+A rigid body's surface on the GPU: `Rigid3d` pose → `CudaVec3f` points, in place of
+SofaCUDA's `RigidMapping<Rigid3d,CudaVec3f>`. SofaCUDA's version maps surface forces to a
+**wrong torque** in SOFA v25.12 ([16](#16-known-problems-and-limits)), so any body whose
+surface receives forces (penalty contact, a force field on the surface) turns the wrong
+way; a blade that should have come to rest spun up and shot through the tissue.
+
+The points are the surface state's initial positions, in the body's frame. Positions and
+velocities are mapped on the GPU; forces are summed on the GPU (in double) into a force and
+a torque about the body's centre, which come back as 48 bytes. Constraint rows (SOFA's CPU
+constraint solvers) are mapped on the CPU, as `RigidMapping` maps them.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `index` | 0 | Which rigid DOF of the input state. |
+| `mapForces` | true | SOFA's mapping switch. False when nothing acts on the surface through forces (constraint contact), so SOFA's force visitors skip it. |
+
+Checked on a free rigid box pushed at one corner of its surface: after one implicit step
+its angular velocity is (1.132075, 0, 1.024527) rad/s, the exact value
+(1.1320755, 0, 1.0245265) and SOFA's CPU `RigidMapping`'s. SofaCUDA's GPU mapping gives
+(0, 1.973, 0): the torque of the wrong forces about the wrong axis.
+
+### 9.12 `TetrahedronCutter`
+
+Cutting by element removal ([7.11](#711-cutting)). Put it in the tissue's node, next to a
+`TetrahedronSetTopologyContainer` and a `TetrahedronSetTopologyModifier`; it works on the CPU
+and GPU tissues alike.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `restPositions` | — | The mesh's rest positions; the tetrahedra's centroids are taken there. Required. |
+| `planePoint`, `planeNormal` | (0, 0, 0), (1, 0, 0) | The blade's plane. |
+| `cutDirection` | (0, −1, 0) | The direction the edge moves in (projected into the plane). |
+| `kerf` | 0 | Half-width of the removed slab around the plane. |
+| `edgeStart`, `edgeStop`, `speed`, `startTime` | 0, 0, 0, 0 | The edge's position along `cutDirection` from `planePoint`: `edgeStart + speed (t − startTime)` after `startTime`, until `edgeStop`. |
+| `widthMin`, `widthMax` | unbounded | The blade's extent along its edge (`planeNormal` × `cutDirection`), from `planePoint`. |
+| `topology` | the node's | The tetrahedral topology to cut. |
+
+Outputs: `removedCount` (tetrahedra removed so far), `removedLastStep`.
+
 ---
 
 ## 10. Test scenes
 
-There are two groups:
+There are three groups:
 
 - **Collision tests**, in `testscenes/collisiondetectiontests/` ([10.1](#101-the-scenes) and
   [10.2](#102-environment-variables-read-by-the-scenes)). They import their geometry from
@@ -1055,6 +1236,9 @@ There are two groups:
 - **Surgical simulation tests**, in `testscenes/surgicalsimulationtests/`
   ([10.3](#103-surgical-simulation-tests-tissue-poke)): a realistic tissue poke, in a CPU
   version and a GPU version.
+- **Validation tests**, in `testscenes/validationtests/`
+  ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)): seven physics tests
+  (six with known answers), each run on SOFA's CPU components and on the GPU.
 
 ### 10.1 The scenes
 
@@ -1066,7 +1250,7 @@ There are two groups:
 | `collision_xlarge_200k.py` | Huge sheet (316×316 grid) and the 1,568-triangle blade | 200,018 triangles | no | 12,178 (3,615 VF / 4,774 FV / 3,789 EE) | the suite (`xlarge_*` legs) |
 | `self_collision_vertex_triangle.py` | Two stacked sheets 0.05 apart, in one object with `selfCollision=True` | 512 vertices, 900 triangles | no | 2,700, all vertex-face | `run_vertex_triangle_smoke_wsl.sh` |
 | `cross_model_vertex_triangle.py` | A sheet (41×41 grid) and 64 floating points (`CudaPointCollisionModel`) 0.04 above it | 3,200 triangles + 64 points | no | 254, all vertex-face | `run_cross_model_vt_smoke_wsl.sh` |
-| `gpu_resident_fem_contact.py` | A soft tetrahedral block (21×4×21 nodes, 7,200 tetrahedra, sides clamped) and a box blade that falls onto it, with GPU contact forces and the residency checker | 1,764 nodes + 8 blade points | **yes** | changes over time | `run_gpu_resident_scene_wsl.sh` |
+| `gpu_resident_fem_contact.py` | A soft tetrahedral block (21×4×21 nodes, 7,200 tetrahedra, sides clamped) and a rigid box blade that falls onto it, with GPU contact forces and the residency checker | 1,764 nodes + a rigid blade (8 surface points) | **yes** | changes over time | `run_gpu_resident_scene_wsl.sh` |
 
 - **No physics** means: no solver, no mass, no force field, zero gravity. The meshes stand
   still and the contacts are computed and then thrown away.
@@ -1074,9 +1258,11 @@ There are two groups:
   solver over both bodies, time step 0.005 s, gravity −9.81.
   - Tissue: corotational linear FEM (`TetrahedronFEMForceField`, method `large`), Young's
     modulus 3000, Poisson ratio 0.4, total mass 1.0 (`UniformMass`).
-  - Blade: mass 0.05, dropped from a height of 0.6.
-  - Collision: way 6, with `contactDistance` 0.03 and penalty stiffness 2000.
-  - **It is currently broken**: see [section 16](#16-known-problems-and-limits).
+  - Blade: a `Rigid3d` body of mass 0.05 (the box's inertia), dropped from a height of 0.6;
+    its surface is mapped on the GPU with `GpuRigidMapping`, which also sums the contact
+    forces into a force and a torque.
+  - Collision: way 6, with `contactDistance` 0.03 and penalty stiffness 2000, under
+    `GpuCollisionPipeline` (no per-frame bounding boxes).
 - **Where results go:** each scene writes to `$SOFA_BENCHMARK_LOG_DIR`. If that isn't set,
   it writes to the repo's `output/benchmark_logs/`. The scripts always set a timestamped
   folder.
@@ -1186,7 +1372,7 @@ That is 820 steps of 0.01 s.
 
 | Piece | Choice | Why |
 |---|---|---|
-| Tissue material | Viscoelastic Ogden (SofaViscoElastic). Ogden μ1 = 2 kPa and α1 = 6: long-term shear modulus 1 kPa, stiffening strongly under large stretch. Plus a relaxing branch: G1 = 1 kPa that relaxes with time constant 0.58 s. Bulk modulus 20 kPa, so nearly incompressible. | Real liver stiffens as it is stretched, and relaxes under a held load. The values are in the range published for liver. |
+| Tissue material | Viscoelastic Ogden: SOFA's core Ogden (`TetrahedronHyperelasticityFEMForceField`), μ1 = 2 kPa and α1 = 6: long-term shear modulus 1 kPa, stiffening strongly under large stretch; plus SofaViscoElastic's Maxwell branch in parallel: G1 = 1 kPa that relaxes with time constant 0.58 s. Bulk modulus 20 kPa, so nearly incompressible. | Real liver stiffens as it is stretched, and relaxes under a held load. The values are in the range published for liver. |
 | Mass | From density, 1,060 kg/m³ (`MeshMatrixMass`) | Correct mass even on an uneven mesh. |
 | Mesh | 1,800 nodes, 8,232 tetrahedra: 2 mm elements in a 12 mm-wide zone under the probe (and 6 mm down), growing by 1.5 times per element to about 10 mm at the edges | Fine where the tissue deforms, cheap elsewhere. |
 | Probe motion | A rigid body (0.1 kg) pulled along its path by a stiff spring (2,000 N/m), like a haptic device holding a tool | The spring's stretch gives the force directly: force = spring stiffness × (probe position − target position). |
@@ -1195,29 +1381,37 @@ That is 820 steps of 0.01 s.
 
 Both use a contact distance of 0.5 mm.
 
-**Why the material is built in two parts.** SofaViscoElastic's one-piece
+**How the material is built** (`SOFA_POKE_MATERIAL`, the same in both scenes):
+
+- `core` (the default): SOFA's core `Ogden` (`TetrahedronHyperelasticityFEMForceField`) for
+  the long-term spring, whose stress and stiffness follow the Ogden law exactly (except
+  where two stretches coincide, [7.9](#79-the-gpu-tissue)), plus SofaViscoElastic's
+  `MaxwellFirstOrder` branch (`TetrahedronViscoelasticityFEMForceField`, [G1, τ, 0]) in
+  parallel. This is the material as written.
+- `split`: SofaViscoElastic's `SLSOgdenFirstOrder` with G1 = 0 for the long-term spring,
+  plus the same Maxwell branch. The earlier default; its Ogden has the eigenvector bug
+  described below.
+- `single`: the one-piece `SLSOgdenFirstOrder`, to reproduce the blow-up below.
+
+**Why the relaxing branch is a separate component.** SofaViscoElastic's one-piece
 `SLSOgdenFirstOrder` has its relaxing branch in the stress, but the stiffness matrix it gives
 the solver leaves that branch out, and every viscoelastic material in that plugin does the
 same. So the solver sees the tissue at about half its real stiffness right after
 loading. It overshoots every step, the solution rings from one step to the next, and an
 element under the probe turns inside out: the CPU poke blew up 2.5 mm in.
-`poke_common.add_tissue_material()` therefore builds exactly the same stress from two parts
-on the same mesh, so that the stiffness matrix now covers both:
-
-- `SLSOgdenFirstOrder` with G1 = 0: the long-term Ogden spring. Its stiffness matrix is a
-  close approximation: it treats each stretch change as lined up with the current stretch.
-- the plugin's `MaxwellFirstOrder` element with [G1, τ, 0]: the relaxing branch, whose
-  stiffness matrix is its instant stiffness G1.
-
-SOFA's own Ogden also has an exact stiffness matrix, but it rebuilds a 6×6 tensor 18
-times per element per step, which takes about 6 s per step on this mesh.
+`poke_common.add_tissue_material()` therefore gives the relaxing branch its own component
+on the same mesh (the plugin's `MaxwellFirstOrder` element with [G1, τ, 0], whose stiffness
+matrix is its instant stiffness G1), next to the long-term Ogden spring, so that the
+stiffness matrix covers both. SOFA's core Ogden is slow on the CPU (it rebuilds a 6×6
+tensor 18 times per tetrahedron per step): the CPU poke takes about 1.9 s per step with it.
 
 **SofaViscoElastic's Ogden is not quite the Ogden material.** Its stress uses C's
 eigenvalues with the wrong directions whenever the tissue is deformed, because its call to
-Eigen asks for no eigenvectors ([7.9](#79-the-gpu-tissue)). Both scenes use it as it
-is, so they can be compared. `SOFA_POKE_OGDEN=exact` gives the GPU scene the material as
-written: in this poke, 42% more peak force ([14.4](#144-tissue-poke)). The CPU scene has no
-such switch; SofaViscoElastic itself would need fixing.
+Eigen asks for no eigenvectors ([7.9](#79-the-gpu-tissue)). In `split` and `single` mode
+both scenes use it as it is, so they can be compared; `SOFA_POKE_OGDEN=exact` gives the
+GPU scene the material as written. That is why the default is now `core`: with SOFA's
+core Ogden, the poke gives 42% more peak force than with SofaViscoElastic's
+([14.4](#144-tissue-poke)).
 
 **Where the GPU scene runs each piece.** It checks at load time and prints a `placement`
 line.
@@ -1228,7 +1422,7 @@ line.
 | Tissue collision surface | GPU | A `CudaVec3f` copy of the tissue with `IdentityMapping` (from the GPU tissue, or from the CPU tissue). |
 | Collision detection | GPU | Way 6, contacts kept on the GPU; with the GPU tissue, `GpuCollisionPipeline` (no per-frame bounding boxes). |
 | Contact response | GPU | `GpuContactConstraintSolver` (constraint mode, the default) or `CudaContactPenaltyForceField` (penalty mode). |
-| Probe collision surface | GPU | Mapped from the rigid probe with `RigidMapping`, computed on the GPU from the probe's pose. |
+| Probe collision surface | GPU | Mapped from the rigid probe with `GpuRigidMapping` ([9.11](#911-gpurigidmapping)), computed on the GPU from the probe's pose. |
 | Probe body | CPU | A 6-DOF rigid body (7 numbers) on a spring, with its own implicit solver. Moving it to the GPU would save nothing: its whole state is smaller than one GPU launch's arguments. |
 
 **Solvers.** In constraint mode the GPU scene is built like the CPU scene: a
@@ -1324,14 +1518,16 @@ you watch.
 | `SOFA_POKE_COUPLING_STIFFNESS` | 2000 | The probe's spring (N/m). |
 | `SOFA_POKE_CONTACT_DISTANCE` | 0.0005 | Contact distance (m). The alarm distance is 3 times it. |
 | `SOFA_POKE_FRICTION` | 0.1 | Friction μ of the constraint contact (both scenes). |
-| `SOFA_POKE_MATERIAL` | `split` | `single` = the one-piece `SLSOgdenFirstOrder`, to reproduce the blow-up. |
+| `SOFA_POKE_MATERIAL` | `core` | `split` = SofaViscoElastic's `SLSOgdenFirstOrder` (G1 = 0) + Maxwell; `single` = the one-piece `SLSOgdenFirstOrder`, to reproduce the blow-up. |
 | `SOFA_POKE_FORCE_CPU` | 0 | GPU scene: use the CPU fallback even when the GPU plugins load. |
 | `SOFA_POKE_GPU_CONTACT` | `constraint` | GPU scene: `penalty` = the GPU penalty contact instead of the GPU constraint contact. |
 | `SOFA_POKE_RESPONSE` | `gpu` | GPU constraint mode: `cpu` = SOFA's CPU pipeline computes the contact response on the GPU's contacts (slow; also turns the comparison on). |
 | `SOFA_POKE_COMPARE`, `SOFA_POKE_COMPARE_EVERY` | 0, 1 | GPU constraint mode: run SOFA's CPU pipeline alongside, every N-th contact step, and write `tissue_poke_gpu_compare.csv`. Slow. With the GPU tissue it also turns on the tissue comparison (next row), and N applies to it too. |
 | `SOFA_POKE_GPU_TISSUE` | `gpu` | GPU constraint mode: `cpu` = the tissue on the CPU, as in the CPU scene. |
 | `SOFA_POKE_COMPARE_TISSUE` | 0 | GPU tissue: run SOFA's CPU tissue components alongside every step and write `tissue_poke_gpu_tissue_compare.csv`. About 250 ms per step. |
-| `SOFA_POKE_OGDEN` | `sofa` | GPU tissue: `exact` = the Ogden material as written, instead of SofaViscoElastic's as it runs ([7.9](#79-the-gpu-tissue)). |
+| `SOFA_POKE_OGDEN` | `sofa` | GPU tissue, `split` and `single`: `exact` = the Ogden material as written, instead of SofaViscoElastic's as it runs ([7.9](#79-the-gpu-tissue)). |
+| `SOFA_POKE_OGDEN_TANGENT` | `robust` | GPU tissue, `core`: `GpuTissueSolver`'s `ogdenTangent` (`sofa` = SOFA's formula for the stiffness). |
+| `SOFA_POKE_FACTORIZATION` | `auto` | GPU tissue: `GpuTissueSolver`'s `factorization` (`band`, `dense`). |
 | `SOFA_POKE_VISUAL` | 1 | 0 = no visual models. |
 | `SOFA_POKE_MEASURE_TIMES` | 0 | GPU constraint mode: time each GPU stage of the contact and of the GPU tissue (into `tissue_poke_gpu_constraints.csv`). |
 | `SOFA_POKE_PENALTY_STIFFNESS` | 10 | GPU penalty mode: stiffness per contact (N/m). |
@@ -1341,6 +1537,97 @@ you watch.
 | `SOFA_POKE_TRACE` | 0 | Print one line per step: time, tip, surface, force and the smallest volume ratio. |
 
 The results are in [14.4](#144-tissue-poke).
+
+### 10.4 Validation tests (known answers, SOFA's CPU against the GPU)
+
+Seven physics tests in `testscenes/validationtests/`. Each one builds the same set-up twice
+from `validation_common.py`, chosen by `SOFA_VALIDATION_SIDE`:
+
+- `cpu`: SOFA's own, widely used CPU components. This is the reference.
+- `gpu`: this plugin's GPU components.
+
+The two runs are compared with each other and with an answer known from theory, which
+doesn't depend on any code.
+
+| Piece | `cpu` (SOFA) | `gpu` (this plugin) |
+|---|---|---|
+| Tissue | `MechanicalObject` (`Vec3d`) with tetrahedra, `MeshMatrixMass`, the material's force fields, `EulerImplicitSolver` + `SparseLDLSolver`, `FixedProjectiveConstraint` / `PartialFixedProjectiveConstraint`, `ConstantForceField` loads | `GpuTissueSolver` on a `CudaVec3f` tissue: the same material, density, held DOFs (`partialFixedIndices`) and loads (`ConstantForceField`, `CudaVec3f`) |
+| Contact | `FreeMotionAnimationLoop`, SOFA's collision pipeline (`BruteForceBroadPhase`, `BVHNarrowPhase`, `LocalMinDistance`), `FrictionContactConstraint`, `BlockGaussSeidelConstraintSolver`, `LinearSolverConstraintCorrection` | `GpuCollisionPipeline`, the GPU broad and narrow phase (way 6), `GpuContactConstraintSolver` |
+| Rigid bodies | `Rigid3d`, `UniformMass`, `EulerImplicitSolver` + `SparseLDLSolver`, held by a spring (`RestShapeSpringsForceField`) or fixed | the same SOFA components; the surface on the GPU through `GpuRigidMapping` |
+
+Both sides use a contact distance of 0.5 mm (alarm 1.5 mm), a Gauss-Seidel tolerance of
+1e-7 and at most 1,000 sweeps. SOFA's CPU side uses point-triangle contacts (no line
+models), like the GPU's vertex-face contacts ([16](#16-known-problems-and-limits) explains why).
+
+**Materials** (`SOFA_VALIDATION_MATERIAL`), all with density 1,060 kg/m³:
+
+| Name | SOFA component and parameters |
+|---|---|
+| `neohookean`, `stable_neohookean`, `stvk` | `TetrahedronHyperelasticityFEMForceField` with `NeoHookean`, `StableNeoHookean`, `StVenantKirchhoff`: shear modulus 1 kPa, λ = 9 kPa (Poisson's ratio 0.45) |
+| `mooney_rivlin` | the same with `MooneyRivlin`: c1 = 300 Pa, c2 = 200 Pa, bulk modulus 9.67 kPa |
+| `ogden` | the same with `Ogden`: μ1 = 2 kPa, α1 = 6, k0 = 20 kPa (the poke's long-term spring) |
+| `ogden_maxwell` | `ogden` plus SofaViscoElastic's `MaxwellFirstOrder` branch (`TetrahedronViscoelasticityFEMForceField`): G1 = 1 kPa, τ = 0.58 s. The poke's tissue. |
+| `sls_ogden_sofa` | SofaViscoElastic's `SLSOgdenFirstOrder` (G1 = 0) + Maxwell, as it runs in SOFA v25.12, eigenvector bug included ([7.9](#79-the-gpu-tissue)) |
+
+**The tests:**
+
+| Scene | Set-up | Known answer |
+|---|---|---|
+| `material_check.py` | A 2 cm cube, base fixed, under a strong tilted gravity (shear and compression at once), swinging to rest over 0.6 s. Every material. | None; it checks CPU against GPU, whole run and stage by stage (with `compare`: forces, system matrix, velocity change and free motion from the same state). |
+| `confined_compression.py` | A 2 cm cube in a frictionless rigid box (the sides and bottom may only slide), pressed down by a uniform pressure ramped up over 1 s, 10% compression (StVK: 5%, see [16](#16-known-problems-and-limits)). `SOFA_VALIDATION_LOAD=creep`: a small pressure held from t = 0. | The deformation is the same everywhere, F = diag(1, s, 1), which linear tetrahedra represent exactly, so the stretch must equal the one the material law gives for that pressure (solved from the law). Creep: the standard linear solid's curve. |
+| `beam_bending.py` | A 10 × 2 × 2 cm cantilever, clamped at one end, a shear load on the other; `SOFA_VALIDATION_DIVISIONS` cells across the thickness (5 times as many along it). `SOFA_VALIDATION_LOAD=large`: 30% of the length. | Small load: Timoshenko beam theory, d = PL³/(3EI) + PL/(kGA). Linear tetrahedra are too stiff in bending (locking), so the ratio approaches 1 only as the mesh is refined. |
+| `incline_friction.py` | A 2 × 1 × 2 cm block on a fixed floor tilted by `SOFA_VALIDATION_ANGLE` (0, 10, 25 degrees), friction μ = 0.3. | Coulomb: sticks when tan(angle) ≤ μ; otherwise its centre slides x = a t(t + dt)/2 with a = g (sin − μ cos) (implicit Euler's version of a t²/2). |
+| `plate_compression.py` | A 2 cm cube on a frictionless base, pressed 15% by a rigid plate on a spring, through frictionless contact. | The uniform uniaxial-stress state: the plate force is A0 · |P_yy(s)| from the material law. It checks the contact response as a force. |
+| `grasp_lift.py` | Two rigid jaws on springs squeeze a 2 cm block standing on a narrow pedestal, then lift 4 mm; three rigid bodies in one GPU constraint solve. Time step 0.005 s. `SOFA_VALIDATION_FRICTION` sets μ. | Coulomb: the jaws carry the block when 2 μ N ≥ m g (N: each jaw's squeezing force while lifting); otherwise it slips out. |
+| `cutting.py` | The cantilever of `beam_bending.py`, settled under its tip load; then a blade cuts a slot one cell wide into its top half near the clamp (`TetrahedronCutter`, 48 tetrahedra), and the beam settles again. | None; CPU against GPU along the whole run, and the same tetrahedra and surface triangles on both sides. |
+
+**Run** (inside WSL, from `/home/arfin/gpu-sofa`):
+
+```bash
+bash scripts/run_validation_wsl.sh confined_compression.py 300 both
+```
+
+The third argument is `cpu`, `gpu`, `both` or `compare` (the GPU side with the
+stage-by-stage comparison). The scene reads its settings from the environment, for example
+`SOFA_VALIDATION_MATERIAL=ogden`. The whole set, then the summary table:
+
+```bash
+bash scripts/run_validation_suite_wsl.sh
+```
+
+```bash
+python3 scripts/compare_validation.py <log folder>
+```
+
+**Settings read by the tests:**
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SOFA_VALIDATION_SIDE` | `gpu` | `cpu` or `gpu` (set by the run script). |
+| `SOFA_VALIDATION_MATERIAL` | `ogden_maxwell` | The material, from the table above. |
+| `SOFA_VALIDATION_COMPARE`, `SOFA_VALIDATION_COMPARE_EVERY` | 0, 1 | GPU: run SOFA's CPU components on the same state every step, and write the stage-by-stage differences every N-th step. |
+| `SOFA_VALIDATION_DIVISIONS` | per test | Mesh cells along the cube's edge (the beam's thickness). |
+| `SOFA_VALIDATION_LOAD` | per test | `large` / `creep` (confined compression), `small` / `large` (beam). |
+| `SOFA_VALIDATION_RAMP` | 1 | Confined compression: seconds over which the pressure is ramped up (0 = at once). |
+| `SOFA_VALIDATION_JITTER` | 0 | Confined compression: move the inner nodes by up to this fraction of a cell (the exact answer still holds). |
+| `SOFA_VALIDATION_ANGLE`, `SOFA_VALIDATION_FRICTION` | 25, 0.3 (grasp: 0.5) | Incline angle in degrees, and the friction coefficient. |
+| `SOFA_VALIDATION_FLOOR_CELLS` | 1 | Incline: split the floor's top face into n × n cells. |
+| `SOFA_VALIDATION_SQUEEZE` | 0.002 | Grasp: how far each jaw's target goes into the block (m). |
+| `SOFA_VALIDATION_CPU_MODELS` | `point_triangle` | CPU contact models: `point_line_triangle` adds SOFA's line models. |
+| `SOFA_VALIDATION_CPU_INTERSECTION` | `LocalMinDistance` | CPU: `MinProximityIntersection` or `NewProximityIntersection` instead. |
+| `SOFA_VALIDATION_OGDEN_TANGENT`, `SOFA_VALIDATION_FACTORIZATION`, `SOFA_VALIDATION_BAND_PANEL` | `robust`, `auto`, 128 | GPU: `GpuTissueSolver`'s `ogdenTangent`, `factorization` and `bandPanel`. |
+| `SOFA_VALIDATION_MEASURE_TIMES`, `SOFA_VALIDATION_LOG_POSITIONS` | 0, 1 | Time the GPU stages; 0 = don't read positions back each step (timing runs). |
+| `SOFA_VALIDATION_DUMP_CONTACTS` | 0 | GPU with compare: write every compared step's contacts to a CSV. |
+| `SOFA_VALIDATION_RUN_TAG` | empty | Run script: added to the log file names, to keep runs of one scene apart. |
+
+**Output** (in the log folder): one CSV per run with the watched quantities per step
+(`<test>_<material>_<side>.csv`), a one-line `_summary.txt` with the checked value and the
+known answer, and with `compare` the stage-by-stage CSV (`..._gpu_tissue_compare.csv`,
+and `..._contact_compare.csv` for the contact tests). `compare_validation.py` prints the
+largest CPU-against-GPU difference of every run, the stage-by-stage differences, both
+sides' time per step, and each test's result against its known answer.
+
+The results are in [14.5](#145-validation-tests).
 
 ---
 
@@ -1357,6 +1644,7 @@ All scripts are run inside WSL from `/home/arfin/gpu-sofa`, for example
 | **Run one scene** | |
 | `run_gpu_resident_scene_wsl.sh [frames]` | Runs the physics scene (default 60 frames) and prints the residency result. |
 | `run_tissue_poke_wsl.sh [cpu\|gpu\|both] [frames]` | Runs the tissue-poke scenes ([10.3](#103-surgical-simulation-tests-tissue-poke)) and prints where each piece ran, any errors, and the summaries. Default: both scenes, the whole poke (820 steps). `view-cpu` or `view-gpu` opens the scene in SOFA's window instead. |
+| `run_validation_wsl.sh <scene.py> <steps> [cpu\|gpu\|both\|compare]` | Runs one validation test ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)) on SOFA's CPU components, on the GPU, or both; `compare` = the GPU with the stage-by-stage comparison. Prints any errors. |
 | `run_fbp_smoke_test_wsl.sh` | Small sheet scene with proximity on, 20 frames. Fast path by default; add `SOFA_PROXIMITY_READ_CONTACT_COUNTER=1` to see contact counts. |
 | `run_fbp_large_tissue_wsl.sh` | The same for the 79,520-triangle scene. |
 | `run_vertex_triangle_smoke_wsl.sh` | Runs the self-collision scene, with counts. |
@@ -1365,6 +1653,9 @@ All scripts are run inside WSL from `/home/arfin/gpu-sofa`, for example
 | `run_bigcell_parity_wsl.sh` | Runs every way-6 variant in the standalone program. All must find the same contacts as the reference. |
 | `run_sorted_grid_parity_wsl.sh` | The same for the four way-5 variants. |
 | `run_fused_winner_validation_wsl.sh` | Final check of the winning way-6 setup: the parity run plus repeated timing rounds. |
+| `run_validation_suite_wsl.sh [log folder]` | Every validation test on both sides (materials, confined compression, beam at four mesh sizes, incline, plate, grasp), the stage-by-stage comparisons, then the summary. About an hour. |
+| `plot_validation.py <log folder> [png]` | Python (with matplotlib): the validation runs as curves, SOFA's CPU against the GPU against the known answer (grasp, cutting, incline, confined compression). |
+| `compare_validation.py <log folder>` | Python: the validation summary. For each run the largest CPU-against-GPU difference and both sides' time per step, the stage-by-stage differences, and each test against its known answer. |
 | **Compare speed** | |
 | `run_mode_comparison_ab_wsl.sh` | The 12 execution modes on the 14,368-triangle scene, back to back, 160 frames each. Prints a table ranked by kernel time. |
 | `run_full_benchmark_suite_wsl.sh` | Every scene: 16 runs, fast and checking versions. `SOFA_SUITE_ONLY='<regex>'` runs only the matching runs. |
@@ -1373,6 +1664,8 @@ All scripts are run inside WSL from `/home/arfin/gpu-sofa`, for example
 | `run_hash_prefixsum_large_ab_wsl.sh` | Way 2 against way 3 on the 14,368-triangle scene. |
 | `run_branch_comparison_ab_wsl.sh` | Way 2 against way 3 with a small and a large tool. |
 | `run_tiny_ab_wsl.sh` | Way 2 against way 3 on a tiny scene, where the grid should win. |
+| `scaling_study_wsl.sh [tissue\|poke\|both]` | SOFA's CPU against the GPU, time per step as the scene grows: the tissue alone (`material_check.py`, 4 to 16 cells per edge, two materials) and the whole poke at three mesh sizes. `SCALING_*` variables change the sizes. |
+| `summarize_scaling.py <log folder>` | Python: the scaling study's tables (`scaling_tissue.csv`, `scaling_poke.csv`) and plot (`scaling.png`). |
 | **Profile (Nsight)** | |
 | `run_ncu_bigcell_wsl.sh` | Per-kernel GPU metrics for way 6 at 14k, 80k and 200k triangles. |
 | `run_bigcell_detailed_profile_wsl.sh` | Detailed way-6 profile: production timing, per-stage timing, and timings inside the kernel. |
@@ -1583,6 +1876,41 @@ The whole way-6 GPU pipeline, timed on its own in the standalone program: **0.19
 
 ### 14.4 Tissue poke
 
+**The default material** (SOFA's core Ogden with SofaViscoElastic's Maxwell branch: the
+material as written, [10.3](#103-surgical-simulation-tests-tissue-poke)), the whole poke
+(820 steps). SOFA's CPU scene ran on 2026-09-24 (its side has not changed since), the GPU
+scene on 2026-09-25 with the final build (band factorisation, several-body contact code).
+
+| Result | Everything on the GPU | SOFA's CPU scene |
+|---|---:|---:|
+| Contact starts | 2.070 s | 2.070 s |
+| Peak force, at the end of the press | 0.41190 N | 0.41148 N |
+| Force at the start → end of the hold | 0.37997 → 0.34669 N | 0.37958 → 0.34768 N |
+| Relaxed during the 1 s hold | 8.76% | 8.40% |
+| Most squashed element (volume / rest volume) | 0.664 | 0.658 |
+| Surface at the end, compared with its settled height | −0.306 mm | −0.305 mm |
+| Largest force difference over the poke | 1.18 mN (0.29% of the peak) | — |
+| Wall time per step, whole poke | **28.1 ms** | 1,907 ms |
+
+- **68 times faster than SOFA's CPU scene**, with the same forces to 0.3% all along (tip
+  within 0.6 µm, surface within 36 µm). SOFA's CPU scene spends most of its time in its core
+  Ogden's stiffness, which rebuilds a 6×6 tensor 18 times per tetrahedron per step.
+- **GPU time per step**, averaged over the poke: the tissue 15.2 ms (material 1.3,
+  assembly 0.4, band factorisation 9.3, solve 4.3; half-bandwidth 365 of 5,400 DOFs, so
+  the matrix takes 17 MB instead of 117 MB); in the 421 steps with contact, the contact
+  15.8 ms (Gauss-Seidel 10.0 ms: 59 sweeps on average, 0.183 ms each; compliance 2.5 ms;
+  correction 2.3 ms).
+- **The remaining 0.3%** comes from the contacts each side keeps (SOFA's `LocalMinDistance`
+  keeps far fewer, [7.8](#78-gpu-constraint-contact-no-overlap-with-friction)) and, near
+  the probe's axis, from SOFA's core Ogden where two stretches coincide
+  ([7.9](#79-the-gpu-tissue)).
+- **Compared with SofaViscoElastic's Ogden** (the tables below): 42% more peak force, half
+  the relaxation during the hold, and a quicker recovery. That is the material as written
+  against the material with SofaViscoElastic's eigenvector bug.
+
+The runs below are from 2026-09-24, with SofaViscoElastic's Ogden (the `split` material,
+then the default).
+
 **Everything on the GPU** ([7.9](#79-the-gpu-tissue)): the tissue, collision detection and
 constraint contact with friction, the whole poke (820 steps), four runs on 2026-09-24. Full
 details, and the plot `reports/gpu_tissue_20260924.png`, are in
@@ -1707,6 +2035,137 @@ How to read it:
 - The short spikes at 1.0 and 7.2 s, and the small ones at 3.6 and 4.6 s, are the spring
   starting and stopping the 0.1 kg probe (up to about 0.03 N). They are not tissue force.
 
+### 14.5 Validation tests
+
+The whole set ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)),
+`run_validation_suite_wsl.sh`, 2026-09-25: 70 runs in 15 minutes. Every run finished on
+both sides.
+
+**SOFA's CPU components against the GPU, whole runs** (the largest difference of the
+logged quantities over the run; time per step includes each scene's small overheads):
+
+| Test | Runs | Largest CPU-GPU difference | CPU ms/step | GPU ms/step |
+|---|---|---|---:|---:|
+| `material_check`, 2 cm cube (343 nodes) | 7 materials | positions within 1.2 nm (StVK: 0.26 µm) | 8.2 to 30 (Ogden: 266 to 269) | 4.6 to 5.7 |
+| `confined_compression` (125 nodes) | 6 materials + creep | stretch within 9e-8 | 3.8 to 5 (Ogden: 79 to 81) | 3.0 to 5.3 |
+| `beam_bending` (99 to 1,519 nodes) | 4 meshes, 2 materials, large load | tip within 4.2 nm | 2.6 to 96 (Ogden: 408) | 2.7 to 16 |
+| `incline_friction` | 0°, 10°, 25° | 0.57 µm | 4.3 to 4.8 | 8.2 to 13 |
+| `plate_compression` | 3 materials | final force within 1e-6 (relative); 1.7 mN during the press | 7.1 to 90 | 6.2 to 9.2 |
+| `grasp_lift` (3 rigid bodies) | μ = 0.05, 0.25, 0.3, 0.5 | block within 9.4 µm, squeeze force within 0.04% | 17 to 19 | 9.6 to 11 |
+| `cutting` (525 nodes, 48 of 1,920 tetrahedra removed) | NeoHookean, Ogden + Maxwell | tip within 1.3 nm, same tetrahedra (1,872) and surface triangles (704 → 728) | 16.5 (Ogden + Maxwell: 400) | 5 to 8 |
+
+**Stage by stage, on the same state** (with `compare`: SOFA's CPU components run on the
+GPU's state every step; the largest difference over the run; forces and matrix relative
+to their largest values, dv relative to the run's largest dv, x_free in metres):
+
+| Run | Forces | Matrix | dv | x_free |
+|---|---:|---:|---:|---:|
+| `material_check`, 7 materials | ≤ 2.6e-13 | ≤ 4.3e-11 | ≤ 9.6e-10 | ≤ 1.9e-9 |
+| `confined_compression`, NeoHookean | 9.4e-14 | 1.4e-17 | 2.7e-12 | 9.3e-10 |
+| `confined_compression`, Ogden | 4.6e-4 | 1.4e-6 | 2.2e-2 | 4.8e-7 |
+| `plate_compression`, NeoHookean | 3.4e-10 | 1.7e-17 | 1.4e-11 | 1.0e-9 |
+
+x_free differs by about 1 nm because the GPU state is single precision; everything else
+is double precision on both sides. The Ogden row is SOFA's error, not the GPU's: in
+confined compression two principal stretches are equal, and SOFA's core Ogden then builds
+its stress from non-orthogonal eigenvectors ([7.9](#79-the-gpu-tissue)); NeoHookean in
+the same test agrees to 1e-13. The plate's contact response, on the same contacts, over
+200 steps: rows within 1e-7, W within 2.0e-6 (relative), multipliers within 2.0e-6,
+correction within 7.6 nm.
+
+**Against the known answers:**
+
+| Test | Known answer | SOFA's CPU components | GPU |
+|---|---|---|---|
+| Confined compression to s = 0.9 (StVK 0.95), 6 materials | the stretch the law gives for the pressure | exact (error ≤ 1.3e-9) | 5.4e-8 (StVK 6.3e-8): single-precision state |
+| Creep under a held pressure (Ogden + Maxwell) | 0.999 (standard linear solid, long-term) | 0.9990014 | 0.9990015 |
+| Cantilever, small load: tip deflection / Timoshenko | 1 | 0.306, 0.467, 0.589, 0.739 with 2, 3, 4, 6 cells across (NeoHookean; Ogden, 4 cells: 0.457) | the same to 1e-6 |
+| Block on a 25° incline, μ = 0.3: slide in 0.5 s | 0.18852 m | 0.18909 m | 0.18909 m |
+| Block on 0° and 10° inclines: sticks | 0 | 1.8 µm, 46 µm (elastic settling) | 1.2 µm, 46 µm |
+| Plate compression, 15%: force | NeoHookean 0.200893 N, Mooney-Rivlin 0.217004 N, Ogden 0.190801 N | within 1e-4 % | within 1e-4 % |
+| Grasp and lift: lifted iff 2μN ≥ mg | threshold μ = 0.26 (N measured while lifting) | slips at 0.05 and 0.25, lifted at 0.3 and 0.5 | the same, slip within 5 µm |
+
+How to read them:
+
+- **The GPU tissue is SOFA's tissue.** On the same state its forces and matrix equal SOFA's
+  to 1e-13 and 1e-11 (the Ogden exception above is SOFA's), and whole runs stay within
+  nanometres of SOFA's.
+- **The contact is SOFA's contact.** Same contacts give the same multipliers to single
+  precision; whole contact runs (incline, plate, grasp with three rigid bodies) end at
+  the same place to micrometres. They differ more during fast transients (the plate
+  press: 1.7 mN of 0.2 N), because SOFA's `LocalMinDistance` and the GPU keep different
+  sets of contacts ([14.4](#144-tissue-poke)).
+- **Where the answer is exact, both are exact** (confined compression, the plate's
+  uniform state). Where it is not, the error is the mesh's, and the same on both sides:
+  linear tetrahedra are too stiff in bending (31% to 74% of beam theory from 2 to 6
+  cells), and the 25° slide is 0.3% long.
+- **Cutting changes nothing in the agreement.** After 48 tetrahedra are removed, SOFA's CPU
+  run (its own components following the topology change) and the GPU run (which rebuilds
+  its elements and mass) end within 1.3 nm of each other; the slot doubles the tip's
+  deflection (2.0003 times, NeoHookean).
+- **Coulomb's law holds at the contacts.** In the grasp at μ = 0.25 the jaw's vertical
+  force while slipping is 0.0400 N, exactly μN = 0.25 × 0.1603 N.
+- **The grasp's lift threshold uses the squeeze force during the lift.** It drops by about
+  15% once the jaws start to rise: the squeezed block, bulging, had been pressing down on
+  the pedestal through the jaws' friction. With the squeeze force before the lift,
+  Coulomb's balance would predict μ = 0.22, and both sides would seem to slip too early.
+- **Speed.** These meshes are small (at most 1,519 nodes), so the GPU's time is mostly
+  fixed costs (kernel launches and a few waits per step). For the simple materials the GPU
+  is about as fast as SOFA on the smallest meshes, slower in the tiny contact tests
+  (incline: 8 to 13 ms against 4 to 5), and 6 times faster at 1,519 nodes; for Ogden,
+  whose stiffness is expensive in SOFA, 10 to 54 times faster. How the gap grows with the
+  mesh is in [14.6](#146-time-per-step-as-the-scene-grows).
+
+### 14.6 Time per step as the scene grows
+
+`scripts/scaling_study_wsl.sh`, 2026-09-25, the final build. Wall-clock time per step
+(everything a user waits for), SOFA's CPU components against the GPU, averaged after two
+warm-up steps.
+
+**The tissue alone** (`material_check.py`: a cube under a tilted gravity, n cells per edge;
+SOFA's `EulerImplicitSolver` + `SparseLDLSolver` + `MeshMatrixMass` + the material's force
+fields, against `GpuTissueSolver`):
+
+| Cells | Nodes | Tetrahedra | NeoHookean CPU | NeoHookean GPU | × | Ogden + Maxwell CPU | Ogden + Maxwell GPU | × | Band (half-width, DOFs) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 125 | 384 | 2.5 ms | 6.5 ms | 0.4 | 86 ms | 2.5 ms | 34 | 77 |
+| 6 | 343 | 1,296 | 10.1 | 4.0 | 2.6 | 292 | 7.5 | 39 | 149 |
+| 8 | 729 | 3,072 | 33.9 | 6.9 | 4.9 | 703 | 7.0 | 100 | 245 |
+| 10 | 1,331 | 6,000 | 110 | 14.1 | 7.8 | 1,396 | 11.5 | 121 | 365 |
+| 12 | 2,197 | 10,368 | 282 | 17.1 | 16 | 2,569 | 28.3 | 91 | 509 |
+| 14 | 3,375 | 16,464 | 813 | 28.9 | 28 | 4,392 | 30.4 | 145 | 677 |
+| 16 | 4,913 | 24,576 | 1,736 | 46.1 | 38 | 7,115 | 47.7 | 149 | 869 |
+
+**The whole poke** (tissue, collision detection and constraint contact with friction; the
+default material; 300 steps: settling and the first 2 s of the press, about 100 of them in
+contact), at three mesh sizes under the probe:
+
+| Elements under the probe | Nodes | Tetrahedra | SOFA CPU scene | GPU scene | × | In contact: CPU | In contact: GPU | × | Band (half-width) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 mm | 726 | 3,000 | 668 ms | 16.4 ms | 41 | 668 ms | 22.5 ms | 30 | 203 |
+| 2 mm (default) | 1,800 | 8,232 | 1,869 | 22.7 | 82 | 1,936 | 29.2 | 66 | 365 |
+| 1.5 mm | 3,610 | 17,496 | 4,292 | 40.6 | 106 | 4,457 | 49.2 | 91 | 575 |
+
+![SOFA's CPU against the GPU, time per step as the mesh grows](reports/scaling_20260925.png)
+
+How to read it:
+
+- **Below a few hundred nodes the GPU gains little for a simple material**: its step is
+  a fixed few milliseconds of launches and waits (at 125 nodes, NeoHookean, SOFA's CPU is
+  faster). From about 1,000 nodes on, the GPU's lead grows with the mesh: SOFA's sparse
+  factorisation of a 3D mesh grows much faster than the band factorisation on the GPU.
+- **For Ogden the GPU is 34 to 150 times faster at every size**, because SOFA's core Ogden
+  stiffness (a 6×6 tensor rebuilt 18 times per tetrahedron per step) dominates its step,
+  and the GPU does that part in 1 to 4 ms.
+- **The whole poke's lead grows with the mesh too**: 41 times at 726 nodes, 106 times at
+  3,610. In contact steps the GPU also solves the contact problem (about 10 ms of
+  Gauss-Seidel at the default size), and SOFA's CPU scene's contact is small next to its
+  Ogden tissue.
+- **At the largest size the GPU's step is mostly the band factorisation** (37 of 46 ms at
+  14,739 DOFs and a half-bandwidth of 869). The band grows with the mesh's cross-section,
+  so for large 3D meshes a sparse factorisation would scale better ([17](#17-whats-next)).
+  The dense factorisation would take over a second at that size.
+
 ---
 
 ## 15. Correctness checks
@@ -1727,8 +2186,10 @@ How to read it:
 | **Poke agreement** | The GPU tissue poke matches the CPU one (SOFA's own collision detection and constraint contact) along the whole poke. | ✅ Constraint mode: within 0.6% of the peak force, with the tissue on the CPU or on the GPU. Penalty mode: within about 6%. See [14.4](#144-tissue-poke). |
 | **Tissue stages (Gate 4)** | On the same state, the GPU tissue step (`GpuTissueSolver`) gives the same forces, system matrix, velocity change and free motion as SOFA's CPU components (`SLSOgdenFirstOrder` + `MaxwellFirstOrder`, `MeshMatrixMass`, `FixedProjectiveConstraint`, `EulerImplicitSolver` + `SparseLDLSolver`). | ✅ Over a whole poke (every 10th step, 82 steps, contact included): forces within 1.2e-14 and the matrix within 1.7e-16 (relative to their largest values), dv within 2.9e-9, free positions within 1.9 nm (the rounding of the single-precision state), free velocities within 2.8e-8 m/s. |
 | **Tissue on the GPU, whole poke** | Moving the tissue to the GPU changes nothing: the same scene with the tissue on the CPU gives the same poke. | ✅ Force within 0.04% of the peak all along, tip within 0.06 µm, surface within 10 µm. |
-| **Gate 3** | The physics scene settles: the blade keeps its shape, sinks in until the contact forces carry its weight (about `mass × g / (stiffness × number of contacts)`), and energy doesn't grow. | ❌ **Fails.** The blade comes apart ([section 16](#16-known-problems-and-limits)). |
-| **Gate 5** | Nothing is copied from the GPU to the CPU during a frame. | ✅ **Passes in the GPU poke scene** (everything on the GPU): SofaCUDA's copy trace shows 0 state copies either way in every step after the first (240 steps traced, 30 with contact); the plugin itself reads under 200 bytes of numbers per step. ❌ **Fails in the old physics scene**: `position` is copied every frame. |
+| **Validation tests** | SOFA's CPU components and the GPU give the same physics, and both give the known answers ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)). | ✅ All 70 runs plus the cutting test; see [14.5](#145-validation-tests). |
+| **Cutting** | Removing tetrahedra changes the GPU tissue as SOFA's components change. | ✅ A slot of 48 tetrahedra cut into a loaded beam: tip within 1.3 nm of SOFA's run, two materials. |
+| **Gate 3** | The physics scene settles: the blade keeps its shape, sinks in until the contact forces carry its weight (about `mass × g / (stiffness × number of contacts)`), and energy doesn't grow. | ✅ **Passes** since the blade is a rigid body: it lands and rests (its bottom face 0.0255 above the tissue's top, inside the 0.03 contact distance, in the scene's units), tilts less than 0.03°, and its energy settles at 4.6 µJ and stays there over 3 s (600 frames). |
+| **Gate 5** | Nothing is copied from the GPU to the CPU during a frame. | ✅ **Passes in the GPU poke scene** (everything on the GPU): SofaCUDA's copy trace shows 0 state copies either way in every step after the first (240 steps traced, 30 with contact); the plugin itself reads under 200 bytes of numbers per step. ✅ **Passes in the old physics scene**: 0 copies either way in frames 2 to 60 of the copy trace, and no violation in 600 frames of the residency checker. (Before, SOFA's `CollisionPipeline` copied `position` twice a frame to build bounding boxes.) |
 
 Where they run: parity comes from `run_mode_comparison_ab_wsl.sh`, `run_bigcell_parity_wsl.sh`
 and the suite. Gates 1, 1b, 2, 2b, 2c and 2d run in the standalone program; C1 and C2 in
@@ -1745,33 +2206,15 @@ copy tracing (`CUDA_VERBOSE=4`).
 
 ## 16. Known problems and limits
 
-**The old physics scene (`gpu_resident_fem_contact.py`) comes apart.** Run for 300 frames
-(2026-09-24, with the contact fixes), the blade (0.28 tall) behaves like this; the tissue
-spans y = −0.25 to 0.25:
-
-| Frame | Bottom face y | Top face y | Blade height |
-|---:|---:|---:|---:|
-| 1 | 0.46 | 0.74 | 0.28 |
-| 40 | 0.27 | 0.53 | 0.26 (lands) |
-| 60 | 0.27 | 0.29 | 0.02 (flattened) |
-| 100 | 0.27 | 0.34 | 0.07 |
-| 200 | 0.01 | 0.50 | 0.49 |
-| 300 | −1.19 | 0.86 | 2.04 |
-
-Before the contact fixes it was far worse (height 15.7 by frame 300). The cause that remains:
-**the blade isn't a rigid body.** It is 8 points with a mass and no force holding them
-together, so when its bottom face lands, its top face keeps falling onto it. The other cause,
-contact that couldn't tell inside from outside, is fixed ([7.7](#77-gpu-contact-forces)).
-The tissue-poke test does it properly: a `Rigid3d` probe with its surface attached through
-a rigid mapping.
+**The old physics scene (`gpu_resident_fem_contact.py`) used to come apart**: its blade was
+8 loose points with a mass and nothing holding them together, and by frame 300 it was 2.04
+tall instead of 0.28. It is now a `Rigid3d` body with its surface mapped on the GPU
+(`GpuRigidMapping`), and it rests on the tissue (Gate 3, [section 15](#15-correctness-checks)).
+SofaCUDA's own GPU `RigidMapping` could not be used for it: it maps surface forces to a
+wrong torque ([9.11](#911-gpurigidmapping)).
 
 **Other limits:**
 
-- **SOFA's solving loop copies `position` to the CPU every frame** in the physics scene.
-  Switching parts off one at a time shows it is not the collision code, the FEM, the
-  tetrahedron geometry helper or the benchmark controller. What's left is the animation
-  loop, the ODE solver, the linear solver, the mass, the fixed constraint or the mechanical
-  object's own bookkeeping. The exact call is not found yet.
 - **The residency checker has a blind spot**: a copy that is hidden before both of its
   checks ([7.10](#710-the-residency-checker)).
 - **Penalty contact lets objects overlap on purpose.** The force only grows as they sink
@@ -1806,16 +2249,23 @@ a rigid mapping.
   positions go to the GPU and the contact forces come back each frame, and each
   conjugate-gradient iteration does the same with the position and force changes.
 - **GPU tissue: limits** ([7.9](#79-the-gpu-tissue)):
-  - one material: SofaViscoElastic's `SLSOgdenFirstOrder`, with or without a
-    `MaxwellFirstOrder` branch, on linear tetrahedra;
-  - the system matrix is factorised **dense**: 117 MB for the poke's 1,800 nodes; about
-    10,000 nodes would fill the 4 GB GPU;
-  - only fixed DOFs (not other projective constraints), and only fixed vertices in the CPU
-    comparison copy;
+  - SOFA's five core hyperelastic materials (`NeoHookean`, `StableNeoHookean`,
+    `StVenantKirchhoff`, `MooneyRivlin`, `Ogden`), SofaViscoElastic's `SLSOgdenFirstOrder`
+    and a `MaxwellFirstOrder` branch, on linear tetrahedra. SOFA's other materials
+    (`Costa`, `VerondaWestman`, `BoyceAndArruda`, the rest of SofaViscoElastic) are not
+    there;
+  - the band factorisation's size grows with the mesh's cross-section; a sparse
+    factorisation (nested dissection) would scale better for large 3D meshes. The dense
+    one fills the 4 GB GPU at about 10,000 nodes;
+  - fixed and partly fixed DOFs only (no other projective constraint), and loads only from
+    `ConstantForceField`;
   - each step reads back one integer (did the Cholesky succeed?) and, with `monitorVertex`,
     32 bytes; both make the CPU wait for the GPU once per step.
 - **GPU constraint contact: limits** ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)):
-  - one deformable body and one rigid body;
+  - one deformable body against any number of rigid bodies; no contact between two rigid
+    bodies (put them in one collision `group`) and none between two deformable bodies;
+  - the comparison with SOFA's CPU pipeline (`compareWithCpu`, `response="cpu"`) works with
+    one rigid body only;
   - with a CPU tissue, the tissue matrix is copied up and factorised **dense** on the GPU
     every contact step (about 40 ms), on top of SOFA's own factorisation in the free motion.
     With the GPU tissue the free motion's factor is reused;
@@ -1836,6 +2286,45 @@ a rigid mapping.
   - it keeps many more contacts than SOFA's `LocalMinDistance` (533 against 23 in the poke):
     every vertex within the alarm distance. That costs the GPU little, but it would cost
     SOFA's CPU pipeline about 10 s per step.
+- **Cutting: limits** ([7.11](#711-cutting)): element removal only, so a cut is as jagged
+  as the mesh and a whole cell wide; no vertex may lose all its tetrahedra (SOFA would
+  remove it and renumber the rest); the GPU tissue's comparison with SOFA's CPU components
+  stops at the first cut; each cut step re-uploads the tissue's element arrays (about the
+  size of the mesh), which costs a few milliseconds.
+- **SOFA's core Ogden is wrong where two principal stretches coincide** (v25.12): at rest,
+  in uniaxial and in axisymmetric states its stress and stiffness can be off by up to 100%,
+  because it builds C^(α/2−1) as V D Vᵀ from the general `EigenSolver`'s eigenvectors,
+  which are not orthogonal there ([7.9](#79-the-gpu-tissue)). The GPU has the material as
+  written. The fix for SOFA is in `patches/SOFA-Ogden-orthonormal-eigenvectors.patch`.
+- **A soft block pinched with high friction needs a short time step.** In the grasp test
+  ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)) with dt = 0.01 s,
+  the Gauss-Seidel stopped converging near full squeeze for μ ≥ 0.3 (1,000 sweeps and
+  more) and the block blew up: with SOFA's `BlockGaussSeidelConstraintSolver`,
+  `NNCGConstraintSolver`, under-relaxation or regularisation, and on the GPU alike. With a
+  long step the implicit matrix is dominated by the stiffness, and for a pinched, nearly
+  incompressible block that makes the contact compliance badly conditioned. With
+  dt = 0.005 s it converges in about 30 sweeps.
+- **Vertex-face contacts can't hold a sharp tool edge against a coarse mesh.** A tool edge
+  that presses into a face between the tissue's vertices is not seen (only vertices are
+  tested against faces, on the CPU with point-triangle models as on the GPU). The first grasp
+  design, with 1.6 cm jaws whose bottom edges pressed into the block's side, lost the block
+  on both sides. The tests keep tool edges off the tissue; a real grasper needs a fine
+  tissue mesh where its edges touch, or edge-edge contacts.
+- **SOFA's CPU contact with line models misbehaves on flat contacts.** With
+  `LineCollisionModel`, `LocalMinDistance` also makes edge-edge contacts between flat faces
+  lying on each other: in the validation tests the block drifted sideways on a level floor
+  and fell through it, and the plate pushed through the block. The validation tests use
+  point-triangle models on the CPU (`SOFA_VALIDATION_CPU_MODELS`).
+- **Some materials lose stability under strong compression, on both sides.** These are
+  properties of the material law and the mesh, not errors, and SOFA's CPU run and the GPU
+  run collapse the same way: St Venant-Kirchhoff loses strong ellipticity in confined
+  compression before 10% (its smallest acoustic-tensor eigenvalue is −56 Pa at s = 0.9),
+  so it is tested at 5%; the Ogden tissue's uniform confined state becomes unstable on the
+  test mesh near s = 0.83 (the stiffness gets a negative eigenvalue).
+- **Linear tetrahedra are too stiff in bending** (locking, worse the closer the material is
+  to incompressible): the cantilever beam reaches 31% of beam theory's deflection with 2
+  cells across its thickness and 74% with 6, identically on both sides
+  ([14.5](#145-validation-tests)).
 - **After a pause of several seconds the GPU runs slower at first.** In the comparison runs
   SOFA's CPU compliance keeps the GPU idle for seconds, and its clocks drop: the Cholesky
   then takes 200 to 300 ms instead of 31 to 40 ms (`SofaGpuCollisionConstraintChecks
@@ -1867,8 +2356,6 @@ a rigid mapping.
   itself.)
 - **The old physics scene's units are not physical.** For example, its 4×0.5×4 tissue block
   weighs 1.0 in total. (The poke test uses SI units and liver-like values.)
-- **The build is not optimised** (CPU code has no `-O` flag, and GPU code targets `sm_52`;
-  see [6.3](#63-build)).
 - **Contact potential energy is reported as 0.**
 - **The force field can find at most 16 surface pairs** per scene.
 - **Ways 3, 4 and the global-hash variant of way 6 drop data when a buffer is full.** They
@@ -1881,48 +2368,40 @@ a rigid mapping.
 
 ## 17. What's next
 
-The work is organised in four "tiers":
+The work was organised in four "tiers"; all four now work:
 
-- **Tier 1**: GPU contact forces. Works: side-aware, checked by 6 self-checks and by the
+- **Tier 1**: GPU contact forces (penalty). Side-aware, checked by 6 self-checks and by the
   tissue-poke test.
-- **Tier 2**: GPU constraint contact, meaning no overlap, plus friction. Works for one
-  deformable and one rigid body, checked stage by stage against SOFA's CPU code
-  ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)).
-- **Tier 3**: realistic tissue material on the GPU. Works: the viscoelastic Ogden tissue's
-  whole step (`GpuTissueSolver`), checked stage by stage against SOFA's CPU components
-  ([7.9](#79-the-gpu-tissue)).
-- **Tier 4**: cutting.
+- **Tier 2**: GPU constraint contact, meaning no overlap, plus friction, between one
+  deformable body and any number of rigid bodies, checked stage by stage against SOFA's CPU
+  code ([7.8](#78-gpu-constraint-contact-no-overlap-with-friction)) and by the validation
+  tests with contact (incline, plate, grasp).
+- **Tier 3**: realistic tissue on the GPU: SOFA's hyperelastic materials and viscous
+  branches, the whole implicit step (`GpuTissueSolver`), checked stage by stage against
+  SOFA's CPU components and by the validation tests ([7.9](#79-the-gpu-tissue)).
+- **Tier 4**: cutting, by element removal ([7.11](#711-cutting)), checked against SOFA's own
+  topology changes.
 
-In order:
+Next, in order:
 
-1. **Fix the old physics scene**: make the blade a rigid body, the way the poke test's probe
-   is (a `Rigid3d` pose with its GPU surface attached through `RigidMapping`). Then run
-   Gate 3 properly: a long run that checks the blade's shape, how far it sinks in, and that
-   energy doesn't grow.
-2. **Find and remove the per-frame `position` copy** (Gate 5).
-3. **More realism tests**, each with a known right answer. Done: the tissue poke, which
-   matches Hertz's formula at small depth and shows relaxation. Still to do:
-   - beam bending, against beam theory;
-   - squeezing a boxed-in block, where the volume should barely change;
-   - a tool sweeping sideways across the tissue (friction and sliding);
-   - accurate absolute poke forces: a mesh that is shown to be converged, or a tetrahedron
-     formulation that doesn't lock (the default mesh is about 50% too stiff).
-4. **Decide which Ogden the scenes should use.** SofaViscoElastic's, as it runs (today's
-   default, so the CPU and GPU scenes can be compared), or the material as written
-   (`SOFA_POKE_OGDEN=exact`, 42% stiffer in the poke). Using the exact one in the CPU scene
-   too needs SofaViscoElastic fixed (one argument, [16](#16-known-problems-and-limits)), or
-   SOFA's core `Ogden` for the long-term branch (about 6 s per step). Worth reporting to
-   SofaViscoElastic's authors.
-5. **Tier 2 and 3, next steps**: a sparse GPU factorisation for the tissue, so that bigger
-   meshes fit (the dense one stops at about 10,000 nodes); a faster Gauss-Seidel for big
-   problems (it works through the contacts one at a time); more than two bodies; grasping.
-6. **Tier 4**: cutting.
-7. **Speed**:
-   - a Release build targeting `sm_75`;
-   - fewer registers in the way-6 kernel;
-   - splitting very busy big cells across more blocks.
-
----
+1. **Cutting that follows the blade more closely.** Element removal leaves a cut one cell
+   wide and as jagged as the mesh. Splitting the tetrahedra along the blade (new vertices
+   and elements) would need the GPU tissue to grow its vertices, edges and band on the fly.
+2. **Report the SOFA bugs upstream** with their patches: SofaViscoElastic's Ogden
+   (eigenvectors, one argument), SOFA's core Ogden (`SelfAdjointEigenSolver` with
+   `ComputeEigenvectors`), SofaCUDA's `RigidMapping` torque.
+3. **A sparse factorisation for large 3D meshes.** The band grows with the mesh's
+   cross-section; nested dissection (for example NVIDIA's cuDSS) would scale better. How far
+   the band goes is in [14.6](#146-time-per-step-as-the-scene-grows).
+4. **Contact between two deformable bodies and between rigid tools**, and edge-edge
+   contacts, so that a tool's sharp edge on a coarse mesh is held ([16](#16-known-problems-and-limits)).
+5. **Accurate absolute poke forces.** Linear tetrahedra lock in the nearly incompressible
+   tissue; the poke's mesh convergence is in [14.6](#146-time-per-step-as-the-scene-grows).
+   Quadratic tetrahedra or a mixed formulation would converge faster.
+6. **Speed**:
+   - fewer bytes of W per Gauss-Seidel sweep (the solve reads all of W every sweep; half
+     precision, or only the rows that changed);
+   - fewer registers in the way-6 kernel, and splitting very busy big cells across blocks.
 
 ## 18. Rules that still apply
 
@@ -1995,6 +2474,10 @@ In order:
 | **Overflow** | Data dropped because a buffer was full. |
 | **Gate** | A pass/fail correctness check ([section 15](#15-correctness-checks)). |
 | **Tier** | A stage of the roadmap ([section 17](#17-whats-next)). |
+| **Validation test** | A physics test run on SOFA's CPU components and on the GPU, compared with each other and with an answer known from theory ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)). |
+| **Band matrix** | A matrix whose nonzeros all lie near the diagonal, within the half-bandwidth; renumbering the mesh's vertices makes the tissue's matrix one. |
+| **Element removal** | Cutting by deleting the tetrahedra a blade passes through ([7.11](#711-cutting)). |
+| **Locking** | Linear tetrahedra being too stiff, in bending and in nearly incompressible materials; it fades as the mesh is refined. |
 | **WSL** | Windows Subsystem for Linux: Linux running inside Windows. |
 
 ---
@@ -2011,12 +2494,13 @@ In order:
 | `reports/tissue_poke_20260924.md` | The tissue-poke test: how it was built, the four problems found on the way, and its results with plots. |
 | `reports/gpu_constraint_contact_20260924.md` | The GPU constraint contact: how each stage follows SOFA, and the stage-by-stage and whole-poke comparisons with SOFA's CPU pipeline, with plots. |
 | `reports/gpu_tissue_20260924.md` | The GPU tissue (the whole poke step on the GPU): how each stage follows SOFA, the bug found in SofaViscoElastic's Ogden, and the stage-by-stage and whole-poke comparisons, with plots. |
+| `reports/validation_20260925.md` | The validation tests against SOFA's CPU components, grasping, cutting, the bugs found in SOFA, and the speed as the scene grows, with plots. |
 | `reports/archive_pre_<date>/` | Older reports, replaced by newer ones. |
 | `explanation/winning_bigcell_algorithm.md` | Way 6 explained from start to finish. |
 | `findings/` | Notes on speeding up the fused kernel. |
 | `tutorial/` | A beginner course in 19 chapters. |
 | `IDEAS.md` | Every speed-up idea, with its measured verdict. |
-| `PLAN_TIER1_TIER3.md` | The plan the GPU contact forces and the GPU tissue were built from. Both have landed; it is kept for its reasoning. |
+| `patches/` | `SofaCUDA-RigidMapping-applyJT-torque.patch`: the one-line fix for SofaCUDA's wrong rigid-body torque ([9.11](#911-gpurigidmapping)). `SOFA-Ogden-orthonormal-eigenvectors.patch`: the fix for SOFA's core Ogden where two stretches coincide ([7.9](#79-the-gpu-tissue)). The plan the GPU contact forces and the GPU tissue were built from (`PLAN_TIER1_TIER3.md`) has landed and is in the git history (commit 9f4bf49). |
 
 The reports, tutorial and idea log were written over time, so some use older names for
 modes and settings, or describe earlier states. **When anything disagrees with this README,

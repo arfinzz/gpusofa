@@ -45,7 +45,7 @@ field — so nothing consumed them.
 response on the GPU. (The first version said this happened with zero device-to-host
 transfer of simulation state; that was wrong — see the correction above.)
 
-Companion docs: plan in `PLAN_TIER1_TIER3.md`, mode/metric explainers in
+Companion docs: plan in `PLAN_TIER1_TIER3.md` (git history, commit 9f4bf49), mode/metric explainers in
 `README_execution_modes.md`, collision performance in `performance_all_modes_20260715.md`.
 
 ---

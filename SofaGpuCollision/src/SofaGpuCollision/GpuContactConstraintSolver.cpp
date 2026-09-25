@@ -235,6 +235,13 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
     , d_contactFilter(initData(&d_contactFilter, std::string("vertexFace"), "contactFilter",
         "vertexFace: one vertex-face contact per vertex (its closest face) on each side, no edge-edge contacts. "
         "all: every contact the narrow phase reported (a larger, rank-deficient problem)."))
+    , d_vertexConeFilter(initData(&d_vertexConeFilter, true, "vertexConeFilter",
+        "vertexFace: keep a contact only if its direction leaves its anchor vertex's surface, within the cone of "
+        "the faces around that vertex, as SOFA's LocalMinDistance filters point contacts. Without it, a flat "
+        "floor's vertex in front of a sliding block made an oblique contact with the block's edge, which the "
+        "step's linearised constraint read as a collision."))
+    , d_vertexConeTolerance(initData(&d_vertexConeTolerance, 0.05_sreal, "vertexConeTolerance",
+        "Cosine margin of vertexConeFilter (0.05: about 18 degrees around a flat surface's normal)."))
     , d_exactArithmetic(initData(&d_exactArithmetic, false, "exactArithmetic",
         "Run the Gauss-Seidel in double with SOFA's own arithmetic (slow; for checks). Default: float."))
     , d_response(initData(&d_response, std::string("gpu"), "response",
@@ -248,6 +255,9 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
         "With compareWithCpu: compare every N-th step that has contacts."))
     , d_compareFile(initData(&d_compareFile, std::string("gpu_constraint_compare.csv"), "compareFile",
         "CSV file written when compareWithCpu is on."))
+    , d_dumpContactsFile(initData(&d_dumpContactsFile, std::string(), "dumpContactsFile",
+        "Diagnostics, with compareWithCpu: append every compared step's contacts (body-1 vertices and weights, "
+        "points, normal, gap) to this CSV file. Empty: off."))
     , d_measureTimes(initData(&d_measureTimes, false, "measureTimes",
         "Time each GPU stage with CUDA events (adds a synchronisation per stage)."))
     , d_currentContacts(initData(&d_currentContacts, 0, "currentContacts", "OUTPUT: contacts kept as constraints this step."))
@@ -275,7 +285,15 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
     , l_rigidOdeSolver(initLink("rigidOdeSolver", "Body 2's ODE solver (for the integration factors)."))
     , l_deformableGpuSolver(initLink("deformableGpuSolver",
         "Body 1 on the GPU: its GpuTissueSolver, instead of deformableState, deformableLinearSolver and deformableOdeSolver."))
+    , l_additionalRigidStates(initLink("additionalRigidStates",
+        "More rigid bodies touching body 1 (other tools, a grasper's second jaw): their mechanical states (Rigid3d)."))
+    , l_additionalRigidSurfaces(initLink("additionalRigidSurfaces", "Their GPU collision surface states (CudaVec3f), in the same order."))
+    , l_additionalRigidLinearSolvers(initLink("additionalRigidLinearSolvers", "Their direct linear solvers, in the same order."))
+    , l_additionalRigidOdeSolvers(initLink("additionalRigidOdeSolvers", "Their ODE solvers, in the same order."))
+    , d_additionalRigidContactForces(initData(&d_additionalRigidContactForces, "additionalRigidContactForces",
+        "OUTPUT: the contact force and torque on each additional rigid body this step (as rigidContactForce)."))
 {
+    d_additionalRigidContactForces.setReadOnly(true);
     d_currentContacts.setReadOnly(true);
     d_currentConstraints.setReadOnly(true);
     d_currentIterations.setReadOnly(true);
@@ -354,6 +372,40 @@ void GpuContactConstraintSolver::init()
         msg_error() << "No CudaTriangleCollisionModel found at or below one of the surface states.";
         return;
     }
+    // More tools: four lists of the same length, one rigid body each.
+    const std::size_t extra = l_additionalRigidStates.size();
+    if (l_additionalRigidSurfaces.size() != extra || l_additionalRigidLinearSolvers.size() != extra ||
+        l_additionalRigidOdeSolvers.size() != extra)
+    {
+        msg_error() << "additionalRigidStates, additionalRigidSurfaces, additionalRigidLinearSolvers and "
+                       "additionalRigidOdeSolvers must list the same number of bodies.";
+        return;
+    }
+    m_additional.assign(extra, AdditionalRigid {});
+    for (std::size_t b = 0; b < extra; ++b)
+    {
+        auto* state = l_additionalRigidStates.get(b);
+        auto* surface = l_additionalRigidSurfaces.get(b);
+        if (state == nullptr || surface == nullptr || l_additionalRigidLinearSolvers.get(b) == nullptr ||
+            l_additionalRigidOdeSolvers.get(b) == nullptr || state->getSize() != 1)
+        {
+            msg_error() << "Additional rigid body " << b + 1 << ": a link is missing or its state does not hold one rigid body.";
+            return;
+        }
+        m_additional[b].surfaceId = surfaceIdOf(surface);
+        if (m_additional[b].surfaceId == 0)
+        {
+            msg_error() << "Additional rigid body " << b + 1 << ": no CudaTriangleCollisionModel at or below its surface state.";
+            return;
+        }
+    }
+    if (extra > 0 && (d_compareWithCpu.getValue() || d_response.getValue() == "cpu"))
+    {
+        msg_warning() << "compareWithCpu and response=\"cpu\" handle one rigid body: turned off with "
+                      << extra + 1 << " rigid bodies.";
+        d_compareWithCpu.setValue(false);
+        d_response.setValue(std::string("gpu"));
+    }
 
     std::string diagnostic;
     m_workspace = backend::createConstraintWorkspace(diagnostic);
@@ -428,6 +480,35 @@ void GpuContactConstraintSolver::reportFailure(const std::string& stage, const s
     }
 }
 
+std::uint8_t GpuContactConstraintSolver::rigidMaskOf(sofa::core::behavior::MechanicalState<RigidTypes>* state, bool& general)
+{
+    // A rigid body's DOFs its projective constraints hold: project a vector of ones.
+    const sofa::core::MechanicalParams* mparams = sofa::core::mechanicalparams::defaultInstance();
+    sofa::core::objectmodel::Data<RigidTypes::VecDeriv> ones;
+    ones.setValue(RigidTypes::VecDeriv(state->getSize(), RigidTypes::Deriv(Vec3d(1.0, 1.0, 1.0), Vec3d(1.0, 1.0, 1.0))));
+    bool used = false;
+    for (auto* constraint : state->getContext()->getObjects<sofa::core::behavior::ProjectiveConstraintSet<RigidTypes>>(BaseContext::Local))
+    {
+        if (constraint->getMState() != state || !constraint->isActive()) continue;
+        constraint->projectResponse(mparams, ones);
+        used = true;
+    }
+    std::uint8_t mask = 0x3F;
+    if (used)
+    {
+        const auto& d = ones.getValue()[0];
+        mask = 0;
+        for (int e = 0; e < 3; ++e)
+        {
+            if (d.getVCenter()[e] != 0.0) mask |= static_cast<std::uint8_t>(1u << e);
+            if (d.getVOrientation()[e] != 0.0) mask |= static_cast<std::uint8_t>(1u << (3 + e));
+            if (d.getVCenter()[e] != 0.0 && d.getVCenter()[e] != 1.0) general = true;
+            if (d.getVOrientation()[e] != 0.0 && d.getVOrientation()[e] != 1.0) general = true;
+        }
+    }
+    return mask;
+}
+
 void GpuContactConstraintSolver::updateDofMasks()
 {
     // Which DOFs the projective constraints hold: project a vector of ones.
@@ -474,31 +555,8 @@ void GpuContactConstraintSolver::updateDofMasks()
             }
         }
     }
-    {
-        auto* state = l_rigidState.get();
-        sofa::core::objectmodel::Data<RigidTypes::VecDeriv> ones;
-        ones.setValue(RigidTypes::VecDeriv(state->getSize(), RigidTypes::Deriv(Vec3d(1.0, 1.0, 1.0), Vec3d(1.0, 1.0, 1.0))));
-        bool used = false;
-        for (auto* constraint : state->getContext()->getObjects<sofa::core::behavior::ProjectiveConstraintSet<RigidTypes>>(BaseContext::Local))
-        {
-            if (constraint->getMState() != state || !constraint->isActive()) continue;
-            constraint->projectResponse(mparams, ones);
-            used = true;
-        }
-        m_rigidMask = 0x3F;
-        if (used)
-        {
-            const auto& d = ones.getValue()[0];
-            m_rigidMask = 0;
-            for (int e = 0; e < 3; ++e)
-            {
-                if (d.getVCenter()[e] != 0.0) m_rigidMask |= static_cast<std::uint8_t>(1u << e);
-                if (d.getVOrientation()[e] != 0.0) m_rigidMask |= static_cast<std::uint8_t>(1u << (3 + e));
-                if (d.getVCenter()[e] != 0.0 && d.getVCenter()[e] != 1.0) general = true;
-                if (d.getVOrientation()[e] != 0.0 && d.getVOrientation()[e] != 1.0) general = true;
-            }
-        }
-    }
+    m_rigidMask = rigidMaskOf(l_rigidState.get(), general);
+    for (std::size_t b = 0; b < m_additional.size(); ++b) m_additional[b].mask = rigidMaskOf(l_additionalRigidStates.get(b), general);
     if (general)
     {
         reportFailure("projective constraints",
@@ -598,7 +656,13 @@ bool GpuContactConstraintSolver::readDeformableMatrix(sofa::core::behavior::Line
 
 bool GpuContactConstraintSolver::readRigidMatrix(double matrix[36], std::string& diagnostic)
 {
-    auto* system = l_rigidLinearSolver->getLinearSystem();
+    return readRigidMatrixOf(l_rigidLinearSolver.get(), matrix, diagnostic);
+}
+
+bool GpuContactConstraintSolver::readRigidMatrixOf(sofa::core::behavior::LinearSolver* solver, double matrix[36],
+                                                   std::string& diagnostic)
+{
+    auto* system = solver != nullptr ? solver->getLinearSystem() : nullptr;
     sofa::linearalgebra::BaseMatrix* base = system != nullptr ? system->getSystemBaseMatrix() : nullptr;
     if (base == nullptr || base->rowSize() != 6 || base->colSize() != 6)
     {
@@ -654,6 +718,27 @@ bool GpuContactConstraintSolver::buildSystem(const sofa::core::ConstraintParams*
         reportFailure("rigid body system", diagnostic);
         return true;
     }
+    if (!m_additional.empty())
+    {
+        std::vector<double> matrices(36 * m_additional.size());
+        std::vector<double> factors(m_additional.size());
+        for (std::size_t b = 0; b < m_additional.size(); ++b)
+        {
+            if (!readRigidMatrixOf(l_additionalRigidLinearSolvers.get(b), m_additional[b].matrix, diagnostic))
+            {
+                reportFailure("rigid body system", "additional body " + std::to_string(b + 1) + ": " + diagnostic);
+                return true;
+            }
+            std::copy(m_additional[b].matrix, m_additional[b].matrix + 36, matrices.begin() + 36 * b);
+            m_additional[b].factor = correctionFactor(l_additionalRigidOdeSolvers.get(b), cParams->constOrder());
+            factors[b] = m_additional[b].factor;
+        }
+        if (!backend::setAdditionalRigidSystems(m_workspace, matrices, factors, diagnostic))
+        {
+            reportFailure("rigid body system", diagnostic);
+            return true;
+        }
+    }
     updateDofMasks();
 
     const void* freeDevice = nullptr;
@@ -696,6 +781,27 @@ bool GpuContactConstraintSolver::buildSystem(const sofa::core::ConstraintParams*
     input.friction = static_cast<float>(d_friction.getValue());
     input.filter = d_contactFilter.getValue() == "all" ? backend::ConstraintContactFilter::All
                                                        : backend::ConstraintContactFilter::VertexFace;
+    input.vertexConeFilter = d_vertexConeFilter.getValue();
+    input.vertexConeTolerance = static_cast<float>(d_vertexConeTolerance.getValue());
+    for (std::size_t b = 0; b < m_additional.size(); ++b)
+    {
+        auto* state = l_additionalRigidStates.get(b);
+        auto* surface = l_additionalRigidSurfaces.get(b);
+        const auto& current = state->read(sofa::core::vec_id::read_access::position)->getValue()[0];
+        const auto& freeVelocity = cParams->readV(state)->getValue()[0];
+        backend::ConstraintRigidBodyInput body;
+        body.surfaceId = m_additional[b].surfaceId;
+        body.surfacePositions = surface->read(sofa::core::vec_id::read_access::position)->getValue().deviceRead();
+        body.vertexCount = static_cast<std::uint32_t>(surface->getSize());
+        for (int e = 0; e < 3; ++e)
+        {
+            body.center[e] = current.getCenter()[e];
+            body.freeStep[e] = dt * freeVelocity.getVCenter()[e];
+            body.freeStep[3 + e] = dt * freeVelocity.getVOrientation()[e];
+        }
+        body.dofMask = m_additional[b].mask;
+        input.additionalRigidBodies.push_back(body);
+    }
     if (!backend::buildContactConstraints(m_workspace, input, &m_buildStats, timings, diagnostic))
     {
         reportFailure("constraint rows", diagnostic);
@@ -709,10 +815,9 @@ bool GpuContactConstraintSolver::buildSystem(const sofa::core::ConstraintParams*
     m_factorRigid = correctionFactor(l_rigidOdeSolver.get(), cParams->constOrder());
     if (gpuMode())
     {
-        // The tissue step's own factor of A1: no copy, no second factorisation.
-        int size = 0;
-        const float* factor = l_deformableGpuSolver->deviceFactor(size);
-        if (!backend::useExternalDeformableFactor(m_workspace, factor, size, diagnostic))
+        // The tissue step's own factor of A1: no copy, no second factorisation
+        // (band or dense Cholesky, or LU on a step where A1 was not positive definite).
+        if (!backend::useTissueFactor(m_workspace, l_deformableGpuSolver->workspace(), diagnostic))
         {
             reportFailure("deformable body system", diagnostic);
             return true;
@@ -773,6 +878,11 @@ bool GpuContactConstraintSolver::applyCorrection(const sofa::core::ConstraintPar
     m_deformableCorrection.assign(3 * deformableSize, 0.0f);
     for (double& v : m_rigidCorrection) v = 0.0;
     m_impulse = backend::ConstraintImpulse {};
+    for (auto& body : m_additional)
+    {
+        for (double& v : body.correction) v = 0.0;
+        for (double& v : body.impulse) v = 0.0;
+    }
     if (m_solved)
     {
         std::string diagnostic;
@@ -786,6 +896,17 @@ bool GpuContactConstraintSolver::applyCorrection(const sofa::core::ConstraintPar
         if (ok)
         {
             m_corrected = true;
+            if (!m_additional.empty())
+            {
+                std::vector<double> corrections, impulses;
+                backend::additionalRigidResults(m_workspace, corrections, impulses);
+                for (std::size_t b = 0; b < m_additional.size() && 6 * (b + 1) <= corrections.size(); ++b)
+                    for (int e = 0; e < 6; ++e)
+                    {
+                        m_additional[b].correction[e] = corrections[6 * b + e];
+                        m_additional[b].impulse[e] = impulses[6 * b + e];
+                    }
+            }
         }
         else
         {
@@ -842,6 +963,13 @@ bool GpuContactConstraintSolver::applyCorrection(const sofa::core::ConstraintPar
     Wrench force;
     for (int e = 0; e < 6; ++e) force[e] = m_appliedImpulse[e] / dt;
     d_rigidContactForce.setValue(force);
+    if (!m_additional.empty())
+    {
+        sofa::type::vector<Wrench> forces(m_additional.size());
+        for (std::size_t b = 0; b < m_additional.size(); ++b)
+            for (int e = 0; e < 6; ++e) forces[b][e] = m_additional[b].impulse[e] / dt;
+        d_additionalRigidContactForces.setValue(forces);
+    }
     d_normalImpulse.setValue(m_appliedNormalImpulse);
     d_stepGpuMilliseconds.setValue(m_timings.buildMs + m_timings.factorizeMs + m_timings.complianceMs +
                                    m_timings.solveMs + m_timings.correctionMs);
@@ -864,9 +992,13 @@ void GpuContactConstraintSolver::applyMotion(const sofa::core::ConstraintParams*
             auto v1 = sofa::helper::getWriteAccessor(*deformable->write(sofa::core::MultiVecDerivId(res1).getId(deformable)));
             v1.wref() = cParams->readV(deformable)->getValue();
         }
-        auto* rigid = l_rigidState.get();
-        auto v2 = sofa::helper::getWriteAccessor(*rigid->write(sofa::core::MultiVecDerivId(res1).getId(rigid)));
-        v2.wref() = cParams->readV(rigid)->getValue();
+        std::vector<sofa::core::behavior::MechanicalState<RigidTypes>*> rigids { l_rigidState.get() };
+        for (std::size_t b = 0; b < l_additionalRigidStates.size(); ++b) rigids.push_back(l_additionalRigidStates.get(b));
+        for (auto* rigid : rigids)
+        {
+            auto v2 = sofa::helper::getWriteAccessor(*rigid->write(sofa::core::MultiVecDerivId(res1).getId(rigid)));
+            v2.wref() = cParams->readV(rigid)->getValue();
+        }
         return;
     }
     if (!gpuMode())   // body 1 on the GPU is corrected by applyDeformableMotionOnDevice
@@ -894,38 +1026,47 @@ void GpuContactConstraintSolver::applyMotion(const sofa::core::ConstraintParams*
             dx[i] = dxi;
         }
     }
+    applyRigidMotion(cParams, res1, res2, l_rigidState.get(), l_rigidOdeSolver.get(), m_appliedRigid, m_appliedImpulse);
+    for (std::size_t b = 0; b < m_additional.size(); ++b)
+        applyRigidMotion(cParams, res1, res2, l_additionalRigidStates.get(b), l_additionalRigidOdeSolvers.get(b),
+                         m_additional[b].correction, m_additional[b].impulse);
+}
+
+void GpuContactConstraintSolver::applyRigidMotion(const sofa::core::ConstraintParams* cParams, sofa::core::MultiVecId res1,
+                                                  sofa::core::MultiVecId res2,
+                                                  sofa::core::behavior::MechanicalState<RigidTypes>* state,
+                                                  sofa::core::behavior::OdeSolver* ode, const double correctionValues[6],
+                                                  const double impulseValues[6])
+{
+    const SReal positionFactor = ode->getPositionIntegrationFactor();
+    const SReal velocityFactor = ode->getVelocityIntegrationFactor();
+    auto x = sofa::helper::getWriteAccessor(*state->write(sofa::core::MultiVecCoordId(res1).getId(state)));
+    auto v = sofa::helper::getWriteAccessor(*state->write(sofa::core::MultiVecDerivId(res2).getId(state)));
+    auto dx = sofa::helper::getWriteAccessor(*state->write(m_dxId.getId(state)));
+    auto lambda = sofa::helper::getWriteAccessor(*state->write(m_lambdaId.getId(state)));
+    const auto& xFree = cParams->readX(state)->getValue();
+    const auto& vFree = cParams->readV(state)->getValue();
+    x.resize(1);
+    v.resize(1);
+    dx.resize(1);
+    lambda.resize(1);
+    RigidTypes::Deriv correction;
+    RigidTypes::Deriv impulse;
+    for (int e = 0; e < 3; ++e)
     {
-        auto* state = l_rigidState.get();
-        const SReal positionFactor = l_rigidOdeSolver->getPositionIntegrationFactor();
-        const SReal velocityFactor = l_rigidOdeSolver->getVelocityIntegrationFactor();
-        auto x = sofa::helper::getWriteAccessor(*state->write(sofa::core::MultiVecCoordId(res1).getId(state)));
-        auto v = sofa::helper::getWriteAccessor(*state->write(sofa::core::MultiVecDerivId(res2).getId(state)));
-        auto dx = sofa::helper::getWriteAccessor(*state->write(m_dxId.getId(state)));
-        auto lambda = sofa::helper::getWriteAccessor(*state->write(m_lambdaId.getId(state)));
-        const auto& xFree = cParams->readX(state)->getValue();
-        const auto& vFree = cParams->readV(state)->getValue();
-        x.resize(1);
-        v.resize(1);
-        dx.resize(1);
-        lambda.resize(1);
-        RigidTypes::Deriv correction;
-        RigidTypes::Deriv impulse;
-        for (int e = 0; e < 3; ++e)
-        {
-            correction.getVCenter()[e] = m_appliedRigid[e];
-            correction.getVOrientation()[e] = m_appliedRigid[3 + e];
-            impulse.getVCenter()[e] = m_appliedImpulse[e];
-            impulse.getVOrientation()[e] = m_appliedImpulse[3 + e];
-        }
-        const RigidTypes::Deriv dxi = correction * positionFactor;
-        x[0] = xFree[0] + dxi;
-        v[0] = vFree[0] + correction * velocityFactor;
-        dx[0] = dxi;
-        // SOFA stores J^T lambda (an impulse) in the lambda vector
-        // (GenericConstraintSolver::storeConstraintLambdas). Only the rigid body's
-        // is stored: body 1's would cost a download of a full DOF vector.
-        lambda[0] = impulse;
+        correction.getVCenter()[e] = correctionValues[e];
+        correction.getVOrientation()[e] = correctionValues[3 + e];
+        impulse.getVCenter()[e] = impulseValues[e];
+        impulse.getVOrientation()[e] = impulseValues[3 + e];
     }
+    const RigidTypes::Deriv dxi = correction * positionFactor;
+    x[0] = xFree[0] + dxi;
+    v[0] = vFree[0] + correction * velocityFactor;
+    dx[0] = dxi;
+    // SOFA stores J^T lambda (an impulse) in the lambda vector
+    // (GenericConstraintSolver::storeConstraintLambdas). Only the rigid bodies' are
+    // stored: body 1's would cost a download of a full DOF vector.
+    lambda[0] = impulse;
 }
 
 void GpuContactConstraintSolver::applyDeformableMotionOnDevice(const sofa::core::ConstraintParams* cParams,
@@ -981,6 +1122,28 @@ bool GpuContactConstraintSolver::runCpuPipeline(const sofa::core::ConstraintPara
     const int rows = static_cast<int>(snap.rows);
     const int rowsPerContact = static_cast<int>(snap.rowsPerContact);
     const int contacts = static_cast<int>(snap.contacts);
+    if (!d_dumpContactsFile.getValue().empty())
+    {
+        if (!m_dumpStream.is_open())
+        {
+            m_dumpStream.open(d_dumpContactsFile.getValue());
+            m_dumpStream << "time,contact,v0,v1,v2,w0,w1,w2,px,py,pz,qx,qy,qz,nx,ny,nz,gap,lambda_n\n";
+        }
+        const double time = this->getContext()->getTime();
+        for (int k = 0; k < contacts; ++k)
+        {
+            const double* g = snap.contactGeometry.data() + static_cast<std::size_t>(k) * 21;
+            const double gap = g[12] * (g[3] - g[0]) + g[13] * (g[4] - g[1]) + g[14] * (g[5] - g[2]);
+            m_dumpStream << time << ',' << k;
+            for (int a = 0; a < 3; ++a) m_dumpStream << ',' << snap.contactVertices[static_cast<std::size_t>(k) * 3 + a];
+            for (int a = 0; a < 3; ++a) m_dumpStream << ',' << snap.contactWeights[static_cast<std::size_t>(k) * 3 + a];
+            for (int a = 0; a < 6; ++a) m_dumpStream << ',' << g[a];
+            for (int a = 12; a < 15; ++a) m_dumpStream << ',' << g[a];
+            const std::size_t row = static_cast<std::size_t>(k) * rowsPerContact;
+            m_dumpStream << ',' << gap << ',' << (row < snap.lambda.size() ? snap.lambda[row] : 0.0) << '\n';
+        }
+        m_dumpStream.flush();
+    }
     const int n = 3 * static_cast<int>(deformableVertexCount());
     const SReal dt = this->getContext()->getDt();
     sofa::core::behavior::LinearSolver* deformableSolver = deformableLinear();

@@ -119,6 +119,7 @@ bool computeSimpleHashProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(firstSurface.surfaceId, secondSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (executionStats != nullptr)
     {
@@ -388,7 +389,8 @@ bool computeSimpleHashProximityContacts(
 
     recordContactHandle(
         ws.proximityContacts, ws.proximityContactCount, proximityConfig.maxContacts,
-        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId);
+        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId,
+        firstSurface.triangleCount, secondSurface.triangleCount);
 
     diagnostic.clear();
     return true;

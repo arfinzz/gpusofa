@@ -6,9 +6,10 @@ out. Geometry, material, motion and logging are shared with the GPU version
 (poke_common.py), so the two can be compared directly.
 
 Realism choices:
-  * tissue: viscoelastic Ogden (SofaViscoElastic) - stiffens under large
-    stretch and relaxes over time; built as an Ogden spring plus a Maxwell
-    branch so the solver gets the right stiffness (poke_common.add_tissue_material);
+  * tissue: viscoelastic Ogden - stiffens under large stretch and relaxes over
+    time; SOFA's core Ogden spring plus SofaViscoElastic's Maxwell branch, so the
+    solver gets the exact stiffness (poke_common.add_tissue_material;
+    SOFA_POKE_MATERIAL=split for the earlier SofaViscoElastic Ogden);
   * mass from density (MeshMatrixMass), gravity on, bottom fixed to the table;
   * contact: Lagrange-multiplier constraints with friction
     (FreeMotionAnimationLoop + FrictionContactConstraint): no overlap, mu = 0.1;
@@ -31,7 +32,7 @@ sys.path.append(current_dir)
 import poke_common as pc  # noqa: E402
 
 LABEL = "tissue_poke_cpu" + os.environ.get("SOFA_BENCHMARK_LABEL_SUFFIX", "")
-NOTES = "CPU: viscoelastic Ogden tissue, constraint contact with friction, direct solvers"
+NOTES = f"CPU: {pc.material_note()} tissue, constraint contact with friction, direct solvers"
 
 
 def createScene(root):

@@ -44,8 +44,8 @@ GROWTH = _env_float("SOFA_POKE_GROWTH", 1.5)              # element growth away 
 #   long-term spring  S = mu1/alpha1 J^(-alpha1/3) (C^(alpha1/2-1) - tr(C^(alpha1/2))/3 C^-1) + k0 ln(J) C^-1
 #   viscous branch    S = 2 G1 (E - E_viscous),  E_viscous relaxing toward E with time constant tau
 # The long-term shear modulus is mu1 / 2; the viscous branch adds G1 at the
-# instant of loading and then relaxes away. This is exactly SofaViscoElastic's
-# SLSOgdenFirstOrder; add_tissue_material() explains why it is built in two parts.
+# instant of loading and then relaxes away. SOFA builds it from its core Ogden and
+# SofaViscoElastic's Maxwell element (MATERIAL_MODE below; add_tissue_material()).
 DENSITY = 1060.0          # kg/m^3, soft tissue
 OGDEN_MU1 = 2000.0        # Pa  -> long-term shear modulus 1 kPa
 OGDEN_ALPHA1 = 6.0        # stiffens under large stretch
@@ -87,50 +87,84 @@ PENALTY_STIFFNESS = _env_float("SOFA_POKE_PENALTY_STIFFNESS", 10.0)  # N/m per c
 TRACE = os.environ.get("SOFA_POKE_TRACE", "0") == "1"
 
 
-# Plugin the tissue material needs (both scenes list it in RequiredPlugin).
-MATERIAL_PLUGINS = ["SofaViscoElastic"]
+# Plugins the tissue material needs (both scenes list them in RequiredPlugin).
+MATERIAL_PLUGINS = ["Sofa.Component.SolidMechanics.FEM.HyperElastic", "SofaViscoElastic"]
 
-# Diagnostics: SOFA_POKE_MATERIAL=single uses the one-piece SLSOgdenFirstOrder
-# instead (same stress, stiffness matrix missing the viscous branch: see below).
-MATERIAL_MODE = os.environ.get("SOFA_POKE_MATERIAL", "split")
+# SOFA_POKE_MATERIAL picks how the material is built (the same on both scenes):
+#   core   (default) SOFA's own Ogden (TetrahedronHyperelasticityFEMForceField, fixed in
+#          SOFA in November 2025: exact eigenvectors, exact stiffness) for the long-term
+#          spring, plus SofaViscoElastic's Maxwell element for the viscous branch.
+#          The material as written. Slow on the CPU (SOFA's Ogden: about 6 s per step here).
+#   split  SofaViscoElastic's SLSOgdenFirstOrder (G1 = 0) + Maxwell element: the earlier
+#          default. SLSOgdenFirstOrder's Eigen call computes no eigenvectors in SOFA
+#          v25.12, so its stress is wrong once the tissue deforms (GpuTissueSolver
+#          reproduces it for comparisons).
+#   single the one-piece SLSOgdenFirstOrder (diagnostics: its stiffness leaves out the
+#          viscous branch, see add_tissue_material).
+MATERIAL_MODE = os.environ.get("SOFA_POKE_MATERIAL", "core")
+if MATERIAL_MODE not in ("core", "split", "single"):
+    raise ValueError(f"SOFA_POKE_MATERIAL must be core, split or single, not {MATERIAL_MODE!r}")
 
 
 def tissue_material_parameters():
-    """The material's two parameter sets, as add_tissue_material() gives them to the
-    CPU force fields: SLSOgdenFirstOrder's [mu1, alpha1, G1, tau, k0] and
-    MaxwellFirstOrder's [G1, tau, lambda] (empty in 'single' mode). The GPU tissue
-    solver takes the same two sets."""
+    """SofaViscoElastic modes ('split', 'single'): the material's two parameter sets, as
+    add_tissue_material() gives them to the CPU force fields: SLSOgdenFirstOrder's
+    [mu1, alpha1, G1, tau, k0] and MaxwellFirstOrder's [G1, tau, lambda] (empty in
+    'single' mode)."""
     if MATERIAL_MODE == "single":
         return [OGDEN_MU1, OGDEN_ALPHA1, VISCOUS_G1, RELAXATION_TAU, BULK_K0], []
     return [OGDEN_MU1, OGDEN_ALPHA1, 0.0, RELAXATION_TAU, BULK_K0], [VISCOUS_G1, RELAXATION_TAU, 0.0]
 
 
+def gpu_tissue_material(ogden_eigenvectors="sofa", ogden_tangent="robust"):
+    """GpuTissueSolver's material settings for MATERIAL_MODE: the same material as
+    add_tissue_material() builds from SOFA's CPU components."""
+    maxwell = [VISCOUS_G1, RELAXATION_TAU, 0.0]
+    if MATERIAL_MODE == "core":
+        return {"hyperelasticMaterial": "Ogden", "hyperelasticParameters": [OGDEN_MU1, OGDEN_ALPHA1, BULK_K0],
+                "maxwellParameters": maxwell, "ogdenTangent": ogden_tangent}
+    ogden, maxwell = tissue_material_parameters()
+    settings = {"ogdenParameters": ogden, "ogdenEigenvectors": ogden_eigenvectors}
+    if maxwell:
+        settings["maxwellParameters"] = maxwell
+    return settings
+
+
+def material_note():
+    return {"core": "viscoelastic Ogden (SOFA core Ogden + SofaViscoElastic Maxwell)",
+            "split": "viscoelastic Ogden (SofaViscoElastic SLSOgdenFirstOrder + Maxwell)",
+            "single": "viscoelastic Ogden (SofaViscoElastic SLSOgdenFirstOrder, one piece)"}[MATERIAL_MODE]
+
+
 def add_tissue_material(node):
     """Adds the viscoelastic Ogden material to the tetrahedral mesh in `node`.
 
-    SofaViscoElastic's SLSOgdenFirstOrder computes this stress in one component,
-    but the stiffness matrix it gives the implicit solver leaves out the viscous
-    branch (every viscoelastic material in that plugin does). The solver then
-    sees the tissue about half as stiff as it is right after loading, overshoots
-    every step, the solution rings from one step to the next, and under the
-    probe an element turns inside out: the poke blew up 2.5 mm in.
-
-    So the same stress is built from two parallel branches on the same mesh:
-      * long-term spring: SLSOgdenFirstOrder with G1 = 0, i.e. pure Ogden (its
-        stiffness matrix is a close approximation of the exact one);
-      * viscous branch: the plugin's Maxwell element, parameters [G1, tau,
+    Both branches act in parallel on the same mesh:
+      * long-term spring: Ogden. 'core': SOFA's own Ogden, whose stiffness matrix is
+        exact. 'split': SofaViscoElastic's SLSOgdenFirstOrder with G1 = 0.
+      * viscous branch: SofaViscoElastic's Maxwell element, parameters [G1, tau,
         lambda = 0], whose stiffness matrix is its instant stiffness G1.
-    (SOFA's own Ogden has an exact stiffness matrix too, but it rebuilds a full
-    6x6 tensor 18 times per element per step: about 6 s per step here.)
+
+    Why two components ('single' shows it): SLSOgdenFirstOrder computes the whole
+    viscoelastic stress in one component, but the stiffness matrix it gives the
+    implicit solver leaves out the viscous branch (every viscoelastic material in
+    that plugin does). The solver then sees the tissue about half as stiff as it
+    is right after loading, overshoots every step, the solution rings from one
+    step to the next, and under the probe an element turns inside out: the poke
+    blew up 2.5 mm in.
     """
     if MATERIAL_MODE == "single":
         node.addObject("TetrahedronViscoHyperelasticityFEMForceField", name="material",
                        materialName="SLSOgdenFirstOrder",
                        ParameterSet=f"{OGDEN_MU1} {OGDEN_ALPHA1} {VISCOUS_G1} {RELAXATION_TAU} {BULK_K0}")
         return
-    node.addObject("TetrahedronViscoHyperelasticityFEMForceField", name="elastic",
-                   materialName="SLSOgdenFirstOrder",
-                   ParameterSet=f"{OGDEN_MU1} {OGDEN_ALPHA1} 0 {RELAXATION_TAU} {BULK_K0}")
+    if MATERIAL_MODE == "core":
+        node.addObject("TetrahedronHyperelasticityFEMForceField", name="elastic", template="Vec3d",
+                       materialName="Ogden", ParameterSet=f"{OGDEN_MU1} {OGDEN_ALPHA1} {BULK_K0}")
+    else:
+        node.addObject("TetrahedronViscoHyperelasticityFEMForceField", name="elastic",
+                       materialName="SLSOgdenFirstOrder",
+                       ParameterSet=f"{OGDEN_MU1} {OGDEN_ALPHA1} 0 {RELAXATION_TAU} {BULK_K0}")
     node.addObject("TetrahedronViscoelasticityFEMForceField", name="viscous", materialName="MaxwellFirstOrder",
                    ParameterSet=f"{VISCOUS_G1} {RELAXATION_TAU} 0")
 

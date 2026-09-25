@@ -70,6 +70,7 @@ private:
     DataBool d_useFeatureBasedProximity;
     DataBool d_useVertexTriangleProximity;       // routes self-collision pairs through computeFeatureBasedVertexTriangleContacts
     DataBool d_proximityComputeBarycentrics;
+    DataBool d_proximityAllVertexContacts;
     DataBool d_proximityReadContactCounter;
     DataBool d_proximityKeepContactsOnDevice;
     DataUInt d_proximityMaxContacts;

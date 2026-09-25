@@ -1,0 +1,52 @@
+SOFA v25.12 core Ogden material (TetrahedronHyperelasticityFEMForceField, materialName
+"Ogden"): wrong stress and stiffness where two principal stretches coincide.
+
+Since 17/11/2025 Ogden::precomputeVariables takes C's eigenvectors from Eigen's general
+(non-symmetric) EigenSolver, then builds C^(alpha1/2 - 1) = V D V^T, i.e. uses V^T as
+V's inverse. That holds only for orthonormal V. Where two eigenvalues of C coincide, or
+differ by rounding only, the general solver's eigenvectors in that plane are not
+orthogonal, and V D V^T (and the elasticity tensor, built from the same V) is wrong.
+Measured with Eigen 3 on C = (F R)^T (F R), F plus noise of size e, R a random rotation,
+alpha1 = 6, largest error of V D V^T over 20,000 samples, relative to |C^2|:
+
+    F                    e = 1e-16   1e-12     1e-8
+    diag(1, 1, 1)        186%        3.6%      1.9e-6     (rest)
+    diag(1, 0.9, 1)      97%         0.71%     5.8e-7     (uniaxial / confined compression)
+    diag(1.05,1.05,0.9)  96%         1.6%      1.1e-6     (axisymmetric, e.g. under a round probe)
+    diag(1.1, 0.9, 1)    8e-15       7e-15     7e-15      (distinct stretches: correct)
+
+SelfAdjointEigenSolver with Eigen::ComputeEigenvectors gives orthonormal eigenvectors;
+with it (or with V D V^-1) every case above is exact to 1e-14. Found in this project by
+comparing SOFA's CPU Ogden with an independent GPU implementation in confined
+compression (README section 16). Apply from the SOFA source root:
+    patch -p1 < SOFA-Ogden-orthonormal-eigenvectors.patch
+
+--- a/Sofa/Component/SolidMechanics/FEM/HyperElastic/src/sofa/component/solidmechanics/fem/hyperelastic/material/Ogden.h
++++ b/Sofa/Component/SolidMechanics/FEM/HyperElastic/src/sofa/component/solidmechanics/fem/hyperelastic/material/Ogden.h
+@@ -79,17 +79,21 @@
+             for (sofa::Index j = 0; j < 3; ++j) 
+                 CEigen(i, j) = C[MatrixSym::voigtID(i, j)];
+ 
+-        // 17/11/2025: Disable /*Eigen::SelfAdjointEigenSolver<EigenMatrix>*/
+-        // due to incorrect eigenvector computation for 3x3 matrices.
+-        Eigen::EigenSolver<Eigen::Matrix<Real, 3, 3> > EigenProblemSolver(CEigen, true);
++        // C is symmetric, and C^(alpha1/2 - 1) is built below as V D V^T: V must be
++        // orthonormal. Eigen's general EigenSolver does not make it so where two
++        // eigenvalues (nearly) coincide - at rest, in uniaxial or axisymmetric states -
++        // and V D V^T is then wrong by up to 100%. SelfAdjointEigenSolver returns
++        // orthonormal eigenvectors, but only with Eigen::ComputeEigenvectors: its second
++        // argument is an option flag, and `true` (= 1) asks for none.
++        Eigen::SelfAdjointEigenSolver<EigenMatrix> EigenProblemSolver(CEigen, Eigen::ComputeEigenvectors);
+         if (EigenProblemSolver.info() != Eigen::Success)
+         {
+             dmsg_warning("Ogden") << "EigenSolver iterations failed to converge";
+             return;
+         }
+ 
+-        sinfo->Evalue = EigenProblemSolver.eigenvalues().real().eval();
+-        sinfo->Evect = EigenProblemSolver.eigenvectors().real().eval();
++        sinfo->Evalue = EigenProblemSolver.eigenvalues();
++        sinfo->Evect = EigenProblemSolver.eigenvectors();
+ 
+         const Real aBy2{alpha1/static_cast<Real>(2)};
+         m_trCaBy2 = static_cast<Real>(0);

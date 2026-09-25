@@ -230,7 +230,9 @@ struct DenseGridConfig
 struct FeatureBasedProximityConfig
 {
     float contactDistance { 0.03f };       // proximity threshold; pairs farther than this are dropped
-    bool emitOnePerPair { true };          // keep only the closest feature pair per triangle pair
+    bool emitOnePerPair { true };          // keep only the closest feature pair per triangle pair; false (way 6):
+                                           // every vertex-face pair under the threshold, plus the closest
+                                           // edge-edge pair when it is the closest feature
     bool computeBarycentrics { true };     // populate firstBarycentrics/secondBarycentrics
     bool keepContactsOnDevice { true };    // skip D2H of contact array (detection-only)
     bool readContactCounter { false };     // copy back the contact count for validation/profiling
@@ -801,6 +803,17 @@ enum class ConstraintContactFilter
     All = 1           // every contact the narrow phase reported
 };
 
+// A further rigid body (tool) touching body 1, described as body 2 is below.
+struct ConstraintRigidBodyInput
+{
+    std::uint64_t surfaceId { 0 };
+    const void* surfacePositions { nullptr };            // DEVICE Vec3f
+    std::uint32_t vertexCount { 0 };
+    double center[3] { 0.0, 0.0, 0.0 };
+    double freeStep[6] { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    std::uint8_t dofMask { 0x3F };
+};
+
 struct ConstraintBuildInput
 {
     std::uint64_t deformableSurfaceId { 0 };
@@ -825,6 +838,15 @@ struct ConstraintBuildInput
     float contactDistance { 0.0f };                      // SOFA's contactDistance (the gap kept)
     float friction { 0.0f };                             // mu; 0 = one row per contact
     ConstraintContactFilter filter { ConstraintContactFilter::VertexFace };
+    // VertexFace filter: keep a contact only if its direction leaves its anchor
+    // vertex's surface, within the cone of the faces around that vertex (as SOFA's
+    // LocalMinDistance filters its point contacts); tolerance = cosine margin.
+    bool vertexConeFilter { true };
+    float vertexConeTolerance { 0.05f };
+    // More rigid bodies touching body 1 (several tools, or a grasper's two jaws):
+    // bodies 1, 2, ... in this order, body 0 being the one above. Each contact pair
+    // (body 1, tool) is selected on its own; the rows share body 1's compliance.
+    std::vector<ConstraintRigidBodyInput> additionalRigidBodies;
 };
 
 struct ConstraintBuildStats
@@ -877,6 +899,18 @@ struct ConstraintProblemSnapshot
 
 SOFA_GPU_COLLISION_API bool setRigidSystem(ConstraintWorkspace* workspace, const double matrix[36], std::string& diagnostic);
 
+// The additional rigid bodies' 6x6 system matrices (36 per body, the order of
+// ConstraintBuildInput::additionalRigidBodies) and their compliance factors (as
+// assembleContactCompliance's rigidFactor, one per body). Empty: body 0 only.
+SOFA_GPU_COLLISION_API bool setAdditionalRigidSystems(
+    ConstraintWorkspace* workspace, const std::vector<double>& matrices, const std::vector<double>& factors,
+    std::string& diagnostic);
+
+// After a correction: the additional rigid bodies' corrections A^-1 J^T lambda and
+// their impulses J^T lambda (6 per body each: force part, then torque).
+SOFA_GPU_COLLISION_API bool additionalRigidResults(
+    const ConstraintWorkspace* workspace, std::vector<double>& corrections, std::vector<double>& impulses);
+
 SOFA_GPU_COLLISION_API bool buildContactConstraints(
     ConstraintWorkspace* workspace,
     const ConstraintBuildInput& input,
@@ -927,11 +961,13 @@ SOFA_GPU_COLLISION_API bool downloadContactProblem(
     ConstraintProblemSnapshot& snapshot,
     std::string& diagnostic);
 
-// Body 1 on the GPU (see the tissue solver below): use its Cholesky factor of A1
-// instead of factorizeDeformableSystem. The factor stays owned by the caller and
-// must stay valid until the correction.
-SOFA_GPU_COLLISION_API bool useExternalDeformableFactor(
-    ConstraintWorkspace* workspace, const float* factor, int size, std::string& diagnostic);
+struct TissueWorkspace;
+
+// Body 1 on the GPU (see the tissue solver below): solve with the factor of A1 its
+// last step left (band or dense Cholesky, or LU on a step where A1 was not positive
+// definite) instead of factorizeDeformableSystem. The tissue workspace stays owned
+// by the caller and its factor must stay valid until the correction.
+SOFA_GPU_COLLISION_API bool useTissueFactor(ConstraintWorkspace* workspace, TissueWorkspace* tissue, std::string& diagnostic);
 
 // Body 1 on the GPU, in two parts. First the correction dv = A1^-1 J1^T lambda,
 // kept on the device (body 2's 6 values come back to the host as in
@@ -998,8 +1034,26 @@ SOFA_GPU_COLLISION_API bool computeDenseComplianceOnGpu(
 
 struct TissueWorkspace;
 
+// SOFA core hyperelastic materials (TetrahedronHyperelasticityFEMForceField's materialName).
+enum class TissueCoreMaterial : int
+{
+    None = 0,
+    Ogden = 1,              // mu1 alpha1 k0
+    NeoHookean = 2,         // mu lambda
+    StableNeoHookean = 3,   // mu lambda
+    StVenantKirchhoff = 4,  // mu lambda
+    MooneyRivlin = 5,       // c1 c2 k0
+};
+
 struct TissueMaterial
 {
+    // A SOFA core hyperelastic material, stress and stiffness as SOFA computes them.
+    TissueCoreMaterial core { TissueCoreMaterial::None };
+    double coreParameters[4] { 0.0, 0.0, 0.0, 0.0 };
+    // Core Ogden's stiffness: true computes the divided differences of lambda^(alpha/2-1)
+    // between principal stretches without cancellation; false as SOFA v25.12 does (a
+    // plain quotient, garbage when two stretches differ only by rounding).
+    bool ogdenRobustTangent { true };
     bool hasOgden { true };        // SLSOgdenFirstOrder: mu1, alpha1, G1 (its viscous branch), tau, k0
     double ogdenMu1 { 0.0 };
     double ogdenAlpha1 { 2.0 };
@@ -1015,9 +1069,19 @@ struct TissueMaterial
     double maxwellLambda { 0.0 };
 };
 
+// How the tissue's system matrix is factorised each step.
+enum class TissueFactorization : int
+{
+    Automatic = 0,   // Band when its band is under a third of the matrix, else Dense
+    Band = 1,        // vertices renumbered by reverse Cuthill-McKee, blocked Cholesky inside the band
+    Dense = 2,       // cuSOLVER's Cholesky on the whole matrix, natural order
+};
+
 struct TissueSetup
 {
     int vertexCount { 0 };
+    TissueFactorization factorization { TissueFactorization::Automatic };
+    int bandPanel { 128 };                         // band: block width = bandwidth rounded up to a multiple of this
     std::vector<int> tetrahedra;                   // 4 per tetrahedron
     std::vector<int> edges;                        // 2 per edge: the topology's edge array
     std::vector<int> tetrahedronEdges;             // 6 per tetrahedron: global edge of local edge j
@@ -1056,8 +1120,45 @@ SOFA_GPU_COLLISION_API bool tissueFreeMotion(
     TissueWorkspace* workspace, const void* x, const void* v, void* xFree, void* vFree,
     const TissueStepConfig& config, TissueTimings* timings, std::string& diagnostic);
 
-// The Cholesky factor of A the last step left (dense, lower, column-major), or null.
-SOFA_GPU_COLLISION_API const float* tissueFactor(const TissueWorkspace* workspace, int& size);
+// After tetrahedra were removed (cutting): the remaining tetrahedra in the topology's
+// new order, with the vertices and edges numbered as at creation (the edges do not
+// change: removal adds none), and the mass recomputed for them. Each tetrahedron's
+// viscous state moves to its new position (previousIndex: its index before; -1 = none).
+struct TissueElementUpdate
+{
+    std::vector<int> tetrahedra;                     // 4 per tetrahedron
+    std::vector<int> tetrahedronEdges;               // 6 per tetrahedron
+    std::vector<unsigned char> tetrahedronEdgeSides; // 6 per tetrahedron, as in TissueSetup
+    std::vector<int> previousIndex;                  // 1 per tetrahedron
+    std::vector<double> restPositions;               // 3 per vertex
+    std::vector<double> vertexMass;
+    std::vector<double> edgeMass;
+    std::vector<double> gravityMass;
+    std::vector<unsigned char> fixedDofs;
+};
+
+SOFA_GPU_COLLISION_API bool updateTissueElements(
+    TissueWorkspace* workspace, const TissueElementUpdate& update, std::string& diagnostic);
+
+// Constant external nodal forces (3 per vertex, host), added to the tissue's forces
+// every step from now on (GpuTissueSolver: the node's ConstantForceFields). Empty: none.
+SOFA_GPU_COLLISION_API bool setTissueExternalForces(
+    TissueWorkspace* workspace, const std::vector<double>& forces, std::string& diagnostic);
+
+// Solves with the factor of A the last step left (band or dense Cholesky, or LU on
+// a step where A was not positive definite), for the contact constraints.
+SOFA_GPU_COLLISION_API int tissueDofCount(const TissueWorkspace* workspace);
+SOFA_GPU_COLLISION_API bool tissueFactorReady(const TissueWorkspace* workspace);
+SOFA_GPU_COLLISION_API int tissueBandwidth(const TissueWorkspace* workspace);   // 0: dense factorisation
+// b <- A^-1 b in place: nrhs device columns of 3 x vertexCount floats (natural order).
+SOFA_GPU_COLLISION_API bool tissueSolveInPlace(TissueWorkspace* workspace, float* b, int nrhs, std::string& diagnostic);
+// G = E^T A^-1 E (device, 3 touched x 3 touched, column-major) for E the identity
+// columns of the touched vertices' DOFs (touchedVertices: device, natural order).
+SOFA_GPU_COLLISION_API bool tissueComplianceBlock(
+    TissueWorkspace* workspace, const int* touchedVertices, int touched, float* G, std::string& diagnostic);
+
+// How many steps so far needed the LU fallback (A not positive definite).
+SOFA_GPU_COLLISION_API int tissueLuFallbackSteps(const TissueWorkspace* workspace);
 
 // The smallest volume ratio det(F) over the tetrahedra, and one vertex's position, for x (device).
 SOFA_GPU_COLLISION_API bool tissueMonitor(
@@ -1067,7 +1168,7 @@ SOFA_GPU_COLLISION_API bool tissueMonitor(
 // The last step's pieces, for comparisons (host, double).
 struct TissueStepSnapshot
 {
-    std::vector<double> force;                   // f at the step's start (material + gravity)
+    std::vector<double> force;                   // f at the step's start (material + gravity + external)
     std::vector<double> stiffnessTimesVelocity;  // K v
     std::vector<double> rhs;                     // b, projected
     std::vector<double> dv;                      // the solution
@@ -1077,5 +1178,17 @@ struct TissueStepSnapshot
 };
 SOFA_GPU_COLLISION_API bool downloadTissueStep(
     TissueWorkspace* workspace, bool withMatrix, TissueStepSnapshot& snapshot, std::string& diagnostic);
+
+// ---------------------------------------------------------------------------
+// A rigid body's surface on the GPU (GpuRigidMapping). Points, outputs and the
+// rotated points are device arrays of n float3; rotation is row-major.
+// ---------------------------------------------------------------------------
+SOFA_GPU_COLLISION_API bool rigidMappingApply(int n, const double rotation[9], const double translation[3],
+    const void* points, void* out, void* rotated, std::string& diagnostic);
+SOFA_GPU_COLLISION_API bool rigidMappingApplyJ(int n, const double velocity[3], const double angular[3],
+    const void* rotated, void* out, bool accumulate, std::string& diagnostic);
+// Force (0..2) and torque about the body's centre (3..5) of the surface forces; reads 6 doubles back.
+SOFA_GPU_COLLISION_API bool rigidMappingApplyJT(int n, const void* rotated, const void* force,
+    double forceAndTorque[6], std::string& diagnostic);
 
 } // namespace SofaGpuCollision::backend

@@ -263,6 +263,16 @@ is the bottleneck. The concept is sound; the 35.5 µs ceiling is what kills it *
 - **Pair-hash dedup as sorted-grid default**: works, but home-cell beats it
   (0.352 vs 0.512 ms) *and* keeps the free pre-cull. Kept only as a toggle
   (`SOFA_SORTED_GRID_PAIRHASH_DEDUP`).
+- **Incremental residuals in the contact Gauss-Seidel** (2026-09-25): keep every
+  row's residual d = W f + dfree up to date after each contact (rows × 3 multiply-adds,
+  no reduction) instead of each contact's dot products with W. Same sweeps as SOFA,
+  but slower on the GTX 1650 Ti, measured in the tissue poke (up to ~1,700 rows):
+  0.178 ms per sweep for the dot-product kernel, 0.263 ms incremental with 128 threads,
+  0.446 ms incremental in one warp. Both kernels read all of W once per sweep, from one
+  block on one SM, so the sweep is bound by how many loads that SM keeps in flight;
+  the incremental one adds shared-memory traffic and barriers per contact and one warp
+  keeps fewer loads in flight. Removed. What could still pay: fewer bytes of W per sweep
+  (half precision, or only the rows of contacts whose force changed).
 
 ## 11. Ranked pending list (snapshot, refreshed 2026-07-15)
 

@@ -22,7 +22,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <memory>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // ============================================================================
@@ -51,3 +54,4 @@
 #include "detail/ContactForces.cuh"
 #include "detail/ContactConstraints.cuh"
 #include "detail/TissueSolver.cuh"
+#include "detail/RigidMapping.cuh"

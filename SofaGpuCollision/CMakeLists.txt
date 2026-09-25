@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.22)
 
+# Defaults for a fresh build directory: optimised code, and GPU code for the
+# target laptop's GTX 1650 Ti (compute capability 7.5). Both can be overridden on
+# the command line.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA architectures")
+endif()
+
 project(SofaGpuCollision VERSION 0.1.0 LANGUAGES CXX)
 
 option(SOFAGPUCOLLISION_ENABLE_CUDA "Build the experimental CUDA backend." OFF)
@@ -10,6 +20,7 @@ find_package(Sofa.Component.Collision.Detection.Intersection REQUIRED)
 find_package(Sofa.Component.Collision.Geometry REQUIRED)
 find_package(Sofa.Component.Controller REQUIRED)
 find_package(Sofa.Component.StateContainer REQUIRED)
+find_package(Sofa.Component.Topology.Container.Dynamic REQUIRED)
 
 set(HEADER_FILES
     src/SofaGpuCollision/config.h
@@ -19,6 +30,7 @@ set(HEADER_FILES
     src/SofaGpuCollision/GpuKinematicRigidController.h
     src/SofaGpuCollision/GpuPipelineBenchmarkController.h
     src/SofaGpuCollision/GpuPipelineProfiling.h
+    src/SofaGpuCollision/TetrahedronCutter.h
 )
 
 set(SOURCE_FILES
@@ -29,6 +41,7 @@ set(SOURCE_FILES
     src/SofaGpuCollision/GpuKinematicRigidController.cpp
     src/SofaGpuCollision/GpuPipelineBenchmarkController.cpp
     src/SofaGpuCollision/GpuPipelineProfiling.cpp
+    src/SofaGpuCollision/TetrahedronCutter.cpp
 )
 
 # Tier 1 contact-consumer components. They include SofaCUDA headers directly
@@ -39,6 +52,7 @@ set(CUDA_COMPONENT_HEADER_FILES
     src/SofaGpuCollision/GpuCollisionPipeline.h
     src/SofaGpuCollision/GpuContactConstraintSolver.h
     src/SofaGpuCollision/GpuResidencyChecker.h
+    src/SofaGpuCollision/GpuRigidMapping.h
     src/SofaGpuCollision/GpuTissueSolver.h
 )
 set(CUDA_COMPONENT_SOURCE_FILES
@@ -46,6 +60,7 @@ set(CUDA_COMPONENT_SOURCE_FILES
     src/SofaGpuCollision/GpuCollisionPipeline.cpp
     src/SofaGpuCollision/GpuContactConstraintSolver.cpp
     src/SofaGpuCollision/GpuResidencyChecker.cpp
+    src/SofaGpuCollision/GpuRigidMapping.cpp
     src/SofaGpuCollision/GpuTissueSolver.cpp
 )
 
@@ -119,6 +134,7 @@ target_link_libraries(${PROJECT_NAME}
         Sofa.Component.Collision.Geometry
         Sofa.Component.Controller
         Sofa.Component.StateContainer
+        Sofa.Component.Topology.Container.Dynamic
 )
 
 if(SOFAGPUCOLLISION_ENABLE_CUDA)

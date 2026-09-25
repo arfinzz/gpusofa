@@ -337,6 +337,7 @@ GpuCollisionNarrowPhase::GpuCollisionNarrowPhase()
     , d_useFeatureBasedProximity(initData(&d_useFeatureBasedProximity, false, "useFeatureBasedProximity", "Replace SAT-style exact triangle intersection with feature-based proximity (VF + EE) using Ericson closest-point math. Outputs barycentric weights for a CUDA constraint solver."))
     , d_useVertexTriangleProximity(initData(&d_useVertexTriangleProximity, false, "useVertexTriangleProximity", "When set together with useFeatureBasedProximity, route self-collision pairs (pair.first == pair.second on a CudaTriangleCollisionModel) through the vertex-triangle proximity kernel. Useful for surgical self-collision such as cutting/tearing."))
     , d_proximityComputeBarycentrics(initData(&d_proximityComputeBarycentrics, true, "proximityComputeBarycentrics", "Populate barycentric weights in each ProximityContact. Set false only when the consumer does not need barys (saves a few writes per contact)."))
+    , d_proximityAllVertexContacts(initData(&d_proximityAllVertexContacts, true, "proximityAllVertexContacts", "Way 6: every vertex-face and face-vertex pair of two triangles closer than contactDistance becomes a contact (plus their closest edge-edge pair when it is the closest), as SOFA's point-triangle proximity tests every vertex. false: only the closest feature pair of each triangle pair, which leaves most vertices without a contact when two flat faces touch (their six vertex-face distances tie)."))
     , d_proximityReadContactCounter(initData(&d_proximityReadContactCounter, false, "proximityReadContactCounter", "Read back the proximity contact count and per-class counters (vf/fv/ee) for profiling. Adds ~20 D2H bytes per frame."))
     , d_proximityKeepContactsOnDevice(initData(&d_proximityKeepContactsOnDevice, true, "proximityKeepContactsOnDevice", "Keep proximity contacts in device memory (constraint-solver-ready). Disable to copy contacts into SOFA DetectionOutput for the CPU collision response path."))
     , d_proximityMaxContacts(initData(&d_proximityMaxContacts, static_cast<unsigned int>(1000000), "proximityMaxContacts", "Capacity of the feature-based proximity contact output buffer."))
@@ -985,7 +986,7 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
 
                     backend::FeatureBasedProximityConfig proximityConfig;
                     proximityConfig.contactDistance = static_cast<float>(d_contactDistance.getValue());
-                    proximityConfig.emitOnePerPair = true;
+                    proximityConfig.emitOnePerPair = !d_proximityAllVertexContacts.getValue();
                     proximityConfig.computeBarycentrics = d_proximityComputeBarycentrics.getValue();
                     // If the user wants contacts published to SOFA, they must
                     // be downloaded to host. Override keepContactsOnDevice in
@@ -1117,7 +1118,7 @@ void GpuCollisionNarrowPhase::endNarrowPhase()
             // Build the shared FBP/v-t proximity config once.
             backend::FeatureBasedProximityConfig proximityConfig;
             proximityConfig.contactDistance = static_cast<float>(d_contactDistance.getValue());
-            proximityConfig.emitOnePerPair = true;
+            proximityConfig.emitOnePerPair = !d_proximityAllVertexContacts.getValue();
             proximityConfig.computeBarycentrics = d_proximityComputeBarycentrics.getValue();
             // copyContactsToHost implies the host-side contacts vector must be
             // populated, so keepContactsOnDevice must be false in that mode.

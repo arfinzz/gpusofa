@@ -1,0 +1,20 @@
+SofaCUDA (SOFA v25.12): RigidMapping<Rigid3,CudaVec3f>::applyJT maps surface forces to a
+wrong torque. After its reduction, RigidMappingCuda3f_applyJT_kernel writes temp[0..5], but
+the torque sums are at temp[3*BSIZE .. 3*BSIZE+2]; temp[3..5] are thread 1's partial forces.
+A rigid body whose surface receives forces then turns the wrong way (found and checked in
+this project; see README section 9.11). Apply from the SOFA source root:
+    patch -p1 < SofaCUDA-RigidMapping-applyJT-torque.patch
+
+--- a/applications/plugins/SofaCUDA/src/SofaCUDA/component/mapping/nonlinear/CudaRigidMapping.cu
++++ b/applications/plugins/SofaCUDA/src/SofaCUDA/component/mapping/nonlinear/CudaRigidMapping.cu
+@@ -192,7 +192,9 @@
+     __syncthreads();
+     if (index1 < 6)
+     {
+-        out[blockIdx.x * 6 + index1] = temp[index1];
++        // Thread 0 holds the block's force sum in temp[0..2] and its torque sum in
++        // temp[3*BSIZE .. 3*BSIZE+2]; temp[3..5] are thread 1's partial forces.
++        out[blockIdx.x * 6 + index1] = index1 < 3 ? temp[index1] : temp[3 * BSIZE + index1 - 3];
+     }
+ }
+ 

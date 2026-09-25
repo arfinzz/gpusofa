@@ -118,6 +118,7 @@ struct BigCellWorkspace
     std::size_t startsCapacity { 0 };
     std::size_t cursorsCapacity { 0 };
     std::size_t entryCapacity { 0 };
+    std::uint32_t entryCapacityFloor { 0 };        // grown when a frame needed more entries than the default
     std::size_t hashSlotCapacity { 0 };
     std::size_t firstAabbCapacity { 0 };
     std::size_t secondAabbCapacity { 0 };
@@ -283,8 +284,7 @@ private:
 
 BigCellWorkspace& bigCellWorkspace()
 {
-    static BigCellWorkspace workspace;
-    return workspace;
+    return pairWorkspace<BigCellWorkspace>();   // the current collision pair's (BackendCommon.cuh)
 }
 
 // One thread per triangle: store its inflated AABB and bump the per-(bigCell,
@@ -860,7 +860,8 @@ __global__ void fusedBigCellNarrowKernel(
     std::uint32_t* eeCount,
     const std::uint32_t maxContacts,
     const float contactDistance,
-    const bool computeBarycentrics)
+    const bool computeBarycentrics,
+    const bool onePerPair)
 {
     __shared__ std::uint32_t sToolIds[256];       // sorted by local small cell
     __shared__ DeviceAabb sToolAabbs[256];
@@ -1002,15 +1003,8 @@ __global__ void fusedBigCellNarrowKernel(
                     const float3 bV[3] = {
                         sToolVerts[3u * u + 0u], sToolVerts[3u * u + 1u], sToolVerts[3u * u + 2u] };
                     if (bigCellRawAabbGapExceeds(aRaw, bRaw, distThreshSq)) continue;
-                    DeviceProximityContact c;
-                    if (!fbpComputeClosestFeatureContact(
-                            aV, bV, distThreshSq, computeBarycentrics, c, true))
-                    {
-                        continue;
-                    }
-                    c.firstPrimitiveIndex = tissueTriId;
-                    c.secondPrimitiveIndex = sToolIds[u];
-                    fbpEmitContact(c, contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts);
+                    fbpEmitPairContacts(aV, bV, distThreshSq, computeBarycentrics, onePerPair, tissueTriId, sToolIds[u],
+                                        contacts, contactCount, overflowCount, vfCount, fvCount, eeCount, maxContacts, true);
                 }
             }
         }
@@ -1062,6 +1056,7 @@ __global__ void profiledFusedBigCellNarrowKernel(
     const std::uint32_t maxContacts,
     const float contactDistance,
     const bool computeBarycentrics,
+    const bool onePerPair,
     DeviceBigCellFusedProfile* profile)
 {
     __shared__ std::uint32_t sToolIds[256];       // sorted by local small cell
@@ -1271,6 +1266,16 @@ __global__ void profiledFusedBigCellNarrowKernel(
                             continue;
                         }
                         ++localFbpCalls;
+                        if (!onePerPair)
+                        {
+                            // Every vertex-face pair: timed as one FBP call, emission included.
+                            filterStart = clock64();
+                            fbpEmitPairContacts(aV, bV, distThreshSq, computeBarycentrics, false, tissueTriId, sToolIds[u],
+                                                contacts, contactCount, overflowCount, vfCount, fvCount, eeCount,
+                                                maxContacts, true);
+                            localFbpCycles += clock64() - filterStart;
+                            continue;
+                        }
                         DeviceProximityContact c;
                         filterStart = clock64();
                         const bool contactFound = fbpComputeClosestFeatureContact(
@@ -1334,6 +1339,7 @@ bool computeBigCellFusedProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(firstSurface.surfaceId, secondSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (executionStats != nullptr)
     {
@@ -1386,9 +1392,12 @@ bool computeBigCellFusedProximityContacts(
     const std::uint32_t binCount = bigCellCount * 2u;
 
     const std::uint32_t totalTriangles = firstSurface.triangleCount + secondSurface.triangleCount;
+    // One entry per (triangle, small cell) it overlaps: entryCapacityScale per triangle
+    // by default, more once a frame has needed more (large triangles over small cells;
+    // see the entry check after the launch).
     const std::uint32_t entryCapacity = std::max(
-        4096u,
-        std::max(1u, bigConfig.entryCapacityScale) * totalTriangles);
+        std::max(4096u, std::max(1u, bigConfig.entryCapacityScale) * totalTriangles),
+        bigCellWorkspace().entryCapacityFloor);
     const bool useHashBuild = bigConfig.useHashTableBuild;
     std::uint32_t slotsPerBigCell = 0;
     if (useHashBuild)
@@ -1658,7 +1667,7 @@ bool computeBigCellFusedProximityContacts(
                 ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,
                 ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
                 proximityConfig.maxContacts, proximityConfig.contactDistance,
-                proximityConfig.computeBarycentrics, ws.fusedProfile);
+                proximityConfig.computeBarycentrics, proximityConfig.emitOnePerPair, ws.fusedProfile);
         }
         else
         {
@@ -1671,7 +1680,7 @@ bool computeBigCellFusedProximityContacts(
                 ws.pairsTestedCount, ws.proximityContactCount, ws.proximityOverflowCount,
                 ws.proximityVfCount, ws.proximityFvCount, ws.proximityEeCount,
                 proximityConfig.maxContacts, proximityConfig.contactDistance,
-                proximityConfig.computeBarycentrics);
+                proximityConfig.computeBarycentrics, proximityConfig.emitOnePerPair);
         }
         recordDetailedEvent(10, s);
     };
@@ -1736,6 +1745,33 @@ bool computeBigCellFusedProximityContacts(
     }
     err = cudaGetLastError();
     if (err != cudaSuccess) { diagnostic = std::string("big-cell launch: ") + cudaGetErrorString(err); return false; }
+
+    // Entries past the buffer are dropped, and with them contacts (a block on a floor
+    // of large triangles lost most of its contacts and sank through it). The count
+    // pass's total (4 bytes) is read back every frame; when it did not fit, the
+    // buffer grows with headroom and the frame runs again, so no frame loses contacts.
+    if (!useHashBuild)
+    {
+        std::uint32_t neededEntries = 0;
+        err = cudaMemcpy(&neededEntries, ws.entryTotalCount, sizeof(neededEntries), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("big-cell entry count readback: ") + cudaGetErrorString(err);
+            return false;
+        }
+        if (executionStats != nullptr) executionStats->deviceToHostBytes += sizeof(neededEntries);
+        if (neededEntries > entryCapacity)
+        {
+            if (ws.entryCapacityFloor >= neededEntries)
+            {
+                diagnostic = "big-cell entries overflow a buffer already grown to fit them";
+                return false;
+            }
+            ws.entryCapacityFloor = neededEntries + neededEntries / 2u;
+            return computeBigCellFusedProximityContacts(firstSurface, secondSurface, gridConfig, bigConfig, proximityConfig,
+                                                        contacts, proximityStats, bigStats, diagnostic, executionStats);
+        }
+    }
 
     float kernelMs = 0.0f;
     float resetMs = 0.0f, buildClearMs = 0.0f, eventMarkerGapMs = 0.0f;
@@ -1905,7 +1941,8 @@ bool computeBigCellFusedProximityContacts(
 
     recordContactHandle(
         ws.proximityContacts, ws.proximityContactCount, proximityConfig.maxContacts,
-        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId);
+        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId,
+        firstSurface.triangleCount, secondSurface.triangleCount);
 
     diagnostic.clear();
     return true;

@@ -4,3 +4,4 @@
 # Windows working files into WSL as-is.
 *.sh    text eol=lf
 *.py    text eol=lf
+*.patch text eol=lf

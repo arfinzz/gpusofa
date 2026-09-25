@@ -230,8 +230,7 @@ private:
 
 HashGridWorkspace& hashGridWorkspace()
 {
-    static HashGridWorkspace workspace;
-    return workspace;
+    return pairWorkspace<HashGridWorkspace, 0>();   // the current collision pair's (BackendCommon.cuh)
 }
 
 // Independent workspace instance for the simple direct-bucket hash ("4th way").
@@ -240,8 +239,7 @@ HashGridWorkspace& hashGridWorkspace()
 // and simple hash paths without thrashing one shared workspace / graph.
 HashGridWorkspace& simpleHashGridWorkspace()
 {
-    static HashGridWorkspace workspace;
-    return workspace;
+    return pairWorkspace<HashGridWorkspace, 1>();
 }
 
 // Hash a linear cell id into a table slot (reuses the MurmurHash3 finalizer).
@@ -665,6 +663,7 @@ bool computeHashPrefixSumProximityContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(firstSurface.surfaceId, secondSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (executionStats != nullptr)
     {
@@ -1337,7 +1336,8 @@ bool computeHashPrefixSumProximityContacts(
 
     recordContactHandle(
         ws.proximityContacts, ws.proximityContactCount, proximityConfig.maxContacts,
-        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId);
+        ws.firstIndices, ws.secondIndices, firstSurface.surfaceId, secondSurface.surfaceId,
+        firstSurface.triangleCount, secondSurface.triangleCount);
 
     diagnostic.clear();
     return true;

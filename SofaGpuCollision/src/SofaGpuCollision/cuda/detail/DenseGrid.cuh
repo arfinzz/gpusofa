@@ -485,8 +485,7 @@ struct DenseGridWorkspace
 
 DenseGridWorkspace& denseGridWorkspace()
 {
-    static DenseGridWorkspace workspace;
-    return workspace;
+    return pairWorkspace<DenseGridWorkspace>();   // the current collision pair's (BackendCommon.cuh)
 }
 
 
@@ -2271,6 +2270,7 @@ bool computeDenseGridIndexedTriangleContacts(
     std::string& diagnostic,
     BackendExecutionStats* executionStats)
 {
+    const PairWorkspaceScope pairScope(tissueSurface.surfaceId, toolSurface.surfaceId);   // this pair's workspace
     contacts.clear();
     if (executionStats != nullptr)
     {

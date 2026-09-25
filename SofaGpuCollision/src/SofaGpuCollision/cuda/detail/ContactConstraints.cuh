@@ -141,6 +141,158 @@ __device__ __forceinline__ unsigned long long constraintAnchorPriority(const Dev
            static_cast<unsigned long long>(tieKey);
 }
 
+// ---- Vertex normal cones (SOFA's LocalMinDistance::testValidity) ------------
+// A vertex-face contact is anchored on a vertex, and its direction (from that
+// vertex to the other surface) must leave the vertex's own surface: lie in the
+// cone of its surrounding faces' normals. A vertex of a flat floor accepts only
+// contacts along the floor's normal; without this test, a floor vertex in front
+// of a sliding block made a contact with the block's leading edge at 58 degrees,
+// which the step's linearised constraint read as a collision and stopped with a
+// large impulse. The cone is kept as the mean unit normal N of the faces around
+// the vertex and the cosine of the widest of them from N.
+
+__global__ void constraintVertexNormalsKernel(
+    const std::uint32_t* __restrict__ indices, const std::uint32_t triangleCount, const float* __restrict__ positions,
+    float* __restrict__ normals)
+{
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < triangleCount; t += stride)
+    {
+        const std::uint32_t a = indices[3u * t], b = indices[3u * t + 1u], c = indices[3u * t + 2u];
+        const float3 pa = make_float3(positions[3u * a], positions[3u * a + 1u], positions[3u * a + 2u]);
+        const float3 pb = make_float3(positions[3u * b], positions[3u * b + 1u], positions[3u * b + 2u]);
+        const float3 pc = make_float3(positions[3u * c], positions[3u * c + 1u], positions[3u * c + 2u]);
+        const float3 n = cross3(sub3(pb, pa), sub3(pc, pa));
+        const float len = sqrtf(dot3(n, n));
+        if (len <= 0.0f) continue;
+        const float3 u = make_float3(n.x / len, n.y / len, n.z / len);
+        const std::uint32_t corners[3] = { a, b, c };
+        for (int k = 0; k < 3; ++k)
+        {
+            atomicAdd(normals + 3u * corners[k], u.x);
+            atomicAdd(normals + 3u * corners[k] + 1u, u.y);
+            atomicAdd(normals + 3u * corners[k] + 2u, u.z);
+        }
+    }
+}
+
+__global__ void constraintNormalizeKernel(const std::uint32_t count, float* __restrict__ normals)
+{
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < count; v += stride)
+    {
+        const float x = normals[3u * v], y = normals[3u * v + 1u], z = normals[3u * v + 2u];
+        const float len = sqrtf(x * x + y * y + z * z);
+        const float inv = len > 1e-20f ? 1.0f / len : 0.0f;
+        normals[3u * v] = x * inv;
+        normals[3u * v + 1u] = y * inv;
+        normals[3u * v + 2u] = z * inv;
+    }
+}
+
+__device__ __forceinline__ void atomicMinFloat(float* address, const float value)
+{
+    int* raw = reinterpret_cast<int*>(address);
+    int old = *raw;
+    while (__int_as_float(old) > value)
+    {
+        const int assumed = old;
+        old = atomicCAS(raw, assumed, __float_as_int(value));
+        if (old == assumed) break;
+    }
+}
+
+__global__ void constraintVertexConesKernel(
+    const std::uint32_t* __restrict__ indices, const std::uint32_t triangleCount, const float* __restrict__ positions,
+    const float* __restrict__ normals, float* __restrict__ coneCos)
+{
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < triangleCount; t += stride)
+    {
+        const std::uint32_t a = indices[3u * t], b = indices[3u * t + 1u], c = indices[3u * t + 2u];
+        const float3 pa = make_float3(positions[3u * a], positions[3u * a + 1u], positions[3u * a + 2u]);
+        const float3 pb = make_float3(positions[3u * b], positions[3u * b + 1u], positions[3u * b + 2u]);
+        const float3 pc = make_float3(positions[3u * c], positions[3u * c + 1u], positions[3u * c + 2u]);
+        const float3 n = cross3(sub3(pb, pa), sub3(pc, pa));
+        const float len = sqrtf(dot3(n, n));
+        if (len <= 0.0f) continue;
+        const std::uint32_t corners[3] = { a, b, c };
+        for (int k = 0; k < 3; ++k)
+        {
+            const std::uint32_t v = corners[k];
+            const float cosine = (n.x * normals[3u * v] + n.y * normals[3u * v + 1u] + n.z * normals[3u * v + 2u]) / len;
+            atomicMinFloat(coneCos + v, cosine);
+        }
+    }
+}
+
+// The two surfaces' vertex cones (null normals: no cone test).
+struct ConstraintVertexCones
+{
+    const float* firstNormals { nullptr };
+    const float* firstCones { nullptr };
+    const float* secondNormals { nullptr };
+    const float* secondCones { nullptr };
+    float tolerance { 0.05f };   // cosine margin
+};
+
+// Whether a vertex-face contact's direction lies in the normal cone of its anchor
+// vertex (on the first surface for kind 0, the second for kind 1). Contacts at
+// (numerically) zero distance have no direction and are kept.
+__device__ __forceinline__ bool constraintInVertexCone(
+    const DeviceProximityContact& c, const std::uint32_t vertex, const ConstraintVertexCones& cones)
+{
+    if (cones.firstNormals == nullptr || c.featureKind == 2u || c.signedDistance <= 1e-7f) return true;
+    const bool onFirst = (c.featureKind == 0u);
+    const float* normals = onFirst ? cones.firstNormals : cones.secondNormals;
+    const float* cone = onFirst ? cones.firstCones : cones.secondCones;
+    // The contact normal points from the first surface to the second: from a
+    // first-surface vertex outward, or into a second-surface vertex.
+    const float sign = onFirst ? 1.0f : -1.0f;
+    const float d = sign * (c.normal.x * normals[3u * vertex] + c.normal.y * normals[3u * vertex + 1u] +
+                            c.normal.z * normals[3u * vertex + 2u]);
+    return d >= cone[vertex] - cones.tolerance;
+}
+
+// The anchored vertex's own triangle corner (triangle << 2 | corner): the same
+// vertex-face contact is reported once for every triangle around the vertex, so this
+// second key keeps exactly one of those identical copies (the lowest, deterministically).
+__device__ __forceinline__ std::uint32_t constraintAnchorOwnKey(const DeviceProximityContact& c)
+{
+    return c.featureKind == 0u ? (c.firstPrimitiveIndex << 2) | (c.firstFeatureLocalIndex & 3u)
+                               : (c.secondPrimitiveIndex << 2) | (c.secondFeatureLocalIndex & 3u);
+}
+
+// Among the contacts that won a vertex (closest face), the one with the lowest own key.
+__global__ void constraintClaimOwnersKernel(
+    const DeviceProximityContact* __restrict__ contacts,
+    const std::uint32_t* __restrict__ contactCount,
+    const std::uint32_t capacity,
+    const std::uint32_t* __restrict__ firstIndices,
+    const std::uint32_t* __restrict__ secondIndices,
+    const bool swapped,
+    const ConstraintVertexCones cones,
+    const unsigned long long* __restrict__ deformableSlots,
+    const unsigned long long* __restrict__ rigidSlots,
+    std::uint32_t* __restrict__ deformableOwners,
+    std::uint32_t* __restrict__ rigidOwners)
+{
+    const std::uint32_t total = min(*contactCount, capacity);
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride)
+    {
+        const DeviceProximityContact c = contacts[i];
+        if (c.featureKind == 2u) continue;
+        std::uint32_t vertex, tieKey;
+        bool onDeformable;
+        constraintAnchorVertex(c, firstIndices, secondIndices, swapped, vertex, onDeformable, tieKey);
+        if (!constraintInVertexCone(c, vertex, cones)) continue;
+        const unsigned long long claimed = onDeformable ? deformableSlots[vertex] : rigidSlots[vertex];
+        if (claimed != constraintAnchorPriority(c, tieKey)) continue;
+        atomicMin(onDeformable ? deformableOwners + vertex : rigidOwners + vertex, constraintAnchorOwnKey(c));
+    }
+}
+
 __global__ void constraintClaimVerticesKernel(
     const DeviceProximityContact* __restrict__ contacts,
     const std::uint32_t* __restrict__ contactCount,
@@ -148,6 +300,7 @@ __global__ void constraintClaimVerticesKernel(
     const std::uint32_t* __restrict__ firstIndices,
     const std::uint32_t* __restrict__ secondIndices,
     const bool swapped,
+    const ConstraintVertexCones cones,
     unsigned long long* __restrict__ deformableSlots,
     unsigned long long* __restrict__ rigidSlots)
 {
@@ -160,6 +313,7 @@ __global__ void constraintClaimVerticesKernel(
         std::uint32_t vertex, tieKey;
         bool onDeformable;
         constraintAnchorVertex(c, firstIndices, secondIndices, swapped, vertex, onDeformable, tieKey);
+        if (!constraintInVertexCone(c, vertex, cones)) continue;
         atomicMin(onDeformable ? deformableSlots + vertex : rigidSlots + vertex, constraintAnchorPriority(c, tieKey));
     }
 }
@@ -172,8 +326,11 @@ __global__ void constraintSelectContactsKernel(
     const std::uint32_t* __restrict__ secondIndices,
     const bool swapped,
     const bool keepAll,
+    const ConstraintVertexCones cones,
     const unsigned long long* __restrict__ deformableSlots,
     const unsigned long long* __restrict__ rigidSlots,
+    const std::uint32_t* __restrict__ deformableOwners,
+    const std::uint32_t* __restrict__ rigidOwners,
     std::uint32_t* __restrict__ selected,
     unsigned long long* __restrict__ sortKeys,
     std::uint32_t* __restrict__ selectedCount)
@@ -190,7 +347,9 @@ __global__ void constraintSelectContactsKernel(
             bool onDeformable;
             constraintAnchorVertex(c, firstIndices, secondIndices, swapped, vertex, onDeformable, tieKey);
             const unsigned long long claimed = onDeformable ? deformableSlots[vertex] : rigidSlots[vertex];
-            keep = (claimed == constraintAnchorPriority(c, tieKey));
+            const std::uint32_t owner = onDeformable ? deformableOwners[vertex] : rigidOwners[vertex];
+            keep = (claimed == constraintAnchorPriority(c, tieKey)) && owner == constraintAnchorOwnKey(c) &&
+                   constraintInVertexCone(c, vertex, cones);
         }
         if (!keep) continue;
         const std::uint32_t slot = atomicAdd(selectedCount, 1u);
@@ -456,10 +615,11 @@ __global__ void constraintAssembleComplianceKernel(
     const float* __restrict__ rowDeformable,
     const float* __restrict__ rowRigid,
     const float* __restrict__ rowRigidResponse,
+    const int* __restrict__ rowBody,                // each row's rigid body
+    const float* __restrict__ bodyFactors,          // W's rigid factor per body
     const float* __restrict__ compliance,
     const int ld,
     const float f1,
-    const float f2,
     float* __restrict__ W)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -488,9 +648,12 @@ __global__ void constraintAssembleComplianceKernel(
             }
         }
     }
+    // Two rows couple through a rigid body only when they act on the same one.
     float acc2 = 0.0f;
-    for (int e = 0; e < 6; ++e) acc2 += rowRigid[static_cast<std::size_t>(i) * 6 + e] * rowRigidResponse[static_cast<std::size_t>(j) * 6 + e];
-    W[static_cast<std::size_t>(i) * rows + j] = f1 * acc1 + f2 * acc2;
+    const int body = rowBody[i];
+    if (body == rowBody[j])
+        for (int e = 0; e < 6; ++e) acc2 += rowRigid[static_cast<std::size_t>(i) * 6 + e] * rowRigidResponse[static_cast<std::size_t>(j) * 6 + e];
+    W[static_cast<std::size_t>(i) * rows + j] = f1 * acc1 + bodyFactors[body] * acc2;
 }
 
 __device__ __forceinline__ float constraintWarpSum(float v)
@@ -818,15 +981,17 @@ __global__ void constraintImpulseKernel(
     const int* __restrict__ rowVertexGlobal,
     const float* __restrict__ rowDeformable,
     const float* __restrict__ rowRigid,
+    const int* __restrict__ rowBody,
     const double* __restrict__ lambda,
     float* __restrict__ deformableRhs,
-    double* __restrict__ rigidRhs)
+    double* __restrict__ rigidRhsAll)       // 7 per rigid body: J^T lambda (6), then the normal sum
 {
     const int stride = gridDim.x * blockDim.x;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < rows; i += stride)
     {
         const double l = lambda[i];
         if (l == 0.0) continue;
+        double* rigidRhs = rigidRhsAll + 7 * rowBody[i];
         if (i % rowsPerContact == 0) atomicAddDouble(rigidRhs + 6, l);
         for (int a = 0; a < 3; ++a)
         {
@@ -925,16 +1090,31 @@ struct ConstraintWorkspace
     std::vector<int> cachedColumns;
     std::vector<float> hostValues;
     bool factorized { false };
-    const float* externalFactor { nullptr };   // body 1 on the GPU: the tissue solver's factor (not owned)
+    TissueWorkspace* tissue { nullptr };       // body 1 on the GPU: the tissue solver, whose factor solves (not owned)
 
     // Body 2: A2^-1 (6x6).
     double rigidInverse[36] {};
     float* rigidInverseDevice { nullptr };  std::size_t rigidInverseCapacity { 0 };
     bool rigidReady { false };
+    // All rigid bodies (body 0 = the one above, then the additional ones): A^-1
+    // (36 per body, host and device), W's rigid factor per body, each row's body,
+    // and the additional bodies' last corrections and impulses (6 per body each).
+    int bodyCount { 1 };
+    std::vector<double> bodyInverse;
+    std::vector<double> bodyFactors;
+    float* bodyInverseDevice { nullptr };   std::size_t bodyInverseCapacity { 0 };
+    float* bodyFactorsDevice { nullptr };   std::size_t bodyFactorsCapacity { 0 };
+    int* rowBody { nullptr };               std::size_t rowBodyCapacity { 0 };
+    std::vector<double> extraCorrections;
+    std::vector<double> extraImpulses;
 
     // Contact selection.
     unsigned long long* deformableSlots { nullptr }; std::size_t deformableSlotsCapacity { 0 };
     unsigned long long* rigidSlots { nullptr };      std::size_t rigidSlotsCapacity { 0 };
+    std::uint32_t* deformableOwners { nullptr };     std::size_t deformableOwnersCapacity { 0 };
+    std::uint32_t* rigidOwners { nullptr };          std::size_t rigidOwnersCapacity { 0 };
+    float* coneNormals { nullptr };                  std::size_t coneNormalsCapacity { 0 };   // first surface, then second: 3 per vertex
+    float* coneCos { nullptr };                      std::size_t coneCosCapacity { 0 };       // 1 per vertex, same layout
     std::uint32_t* selected { nullptr };             std::size_t selectedCapacity { 0 };
     unsigned long long* sortKeys { nullptr };        std::size_t sortKeysCapacity { 0 };
     std::uint32_t* counter { nullptr };              std::size_t counterCapacity { 0 };
@@ -983,8 +1163,8 @@ struct ConstraintWorkspace
         if (blas) cublasDestroy(blas);
         if (solver) cusolverDnDestroy(solver);
         void* buffers[] = {
-            dense, factorWork, info, csrRowPtr, csrColumns, csrValues, rigidInverseDevice,
-            deformableSlots, rigidSlots, selected, sortKeys, counter, flags, scan, vertexCompact,
+            dense, factorWork, info, csrRowPtr, csrColumns, csrValues, rigidInverseDevice, bodyInverseDevice, bodyFactorsDevice, rowBody,
+            deformableSlots, rigidSlots, deformableOwners, rigidOwners, coneNormals, coneCos, selected, sortKeys, counter, flags, scan, vertexCompact,
             compactToGlobal, freePositions, dofMask, rowVertexCompact, rowVertexGlobal, rowDeformable, rowRigid,
             rowRigidResponse, dfree, geometry, contactVertices, contactWeights, selector, compliance, W,
             lambda, lambdaShadow, lambdaBeforeSweep, contactBlocks, solveState, deformableRhs, rigidRhs,
@@ -998,10 +1178,53 @@ struct ConstraintWorkspace
 
 namespace
 {
-// Body 1's Cholesky factor: our own (factorizeDeformableSystem) or the tissue solver's.
-const float* deformableFactorOf(const ConstraintWorkspace* ws)
+// Each rigid body's correction A_b^-1 J_b^T lambda from its impulse (rigidRhsAll: 7
+// per body, J^T lambda then the normal sum): body 0's into rigidCorrection and
+// impulse (whose normal sum covers every body), the others kept in the workspace.
+void rigidBodyResults(ConstraintWorkspace* ws, const std::vector<double>& rigidRhsAll, double rigidCorrection[6],
+                      ConstraintImpulse* impulse)
 {
-    return ws->externalFactor != nullptr ? ws->externalFactor : ws->dense;
+    const int bodies = static_cast<int>(rigidRhsAll.size() / 7);
+    const std::size_t extra = static_cast<std::size_t>(std::max(bodies - 1, 0));
+    ws->extraCorrections.assign(6 * extra, 0.0);
+    ws->extraImpulses.assign(6 * extra, 0.0);
+    double normalSum = 0.0;
+    for (int b = 0; b < bodies; ++b)
+    {
+        const double* rhs = rigidRhsAll.data() + 7 * b;
+        const double* inverse = ws->bodyInverse.size() >= 36u * (b + 1) ? ws->bodyInverse.data() + 36 * b : ws->rigidInverse;
+        double* correction = b == 0 ? rigidCorrection : ws->extraCorrections.data() + 6 * (b - 1);
+        for (int i = 0; i < 6; ++i)
+        {
+            double acc = 0.0;
+            for (int j = 0; j < 6; ++j) acc += inverse[i * 6 + j] * rhs[j];
+            correction[i] = acc;
+        }
+        if (b > 0)
+            for (int e = 0; e < 6; ++e) ws->extraImpulses[6 * (b - 1) + e] = rhs[e];
+        normalSum += rhs[6];
+    }
+    if (impulse != nullptr)
+    {
+        for (int e = 0; e < 6; ++e) impulse->rigid[e] = rigidRhsAll.empty() ? 0.0 : rigidRhsAll[e];
+        impulse->normalSum = normalSum;
+    }
+}
+
+// b <- A1^-1 b for nrhs columns (single precision, in place): with the tissue
+// solver's factor (body 1 on the GPU: band or dense Cholesky, or LU on a step whose
+// matrix was not positive definite), else with our own Cholesky (factorizeDeformableSystem).
+bool solveWithDeformableFactor(ConstraintWorkspace* ws, const int nrhs, float* b, std::string& diagnostic)
+{
+    if (ws->tissue != nullptr) return tissueSolveInPlace(ws->tissue, b, nrhs, diagnostic);
+    if (cusolverDnSpotrs(ws->solver, CUBLAS_FILL_MODE_LOWER, ws->n, nrhs, ws->dense, ws->n, b, ws->n, ws->info) !=
+        CUSOLVER_STATUS_SUCCESS)
+    {
+        diagnostic = "cusolverDnSpotrs failed to launch.";
+        return false;
+    }
+    diagnostic.clear();
+    return true;
 }
 } // namespace
 
@@ -1092,7 +1315,7 @@ bool factorizeDeformableSystem(
     const int n = matrix.size;
     const int nnz = matrix.nonZeros;
     ws->factorized = false;
-    ws->externalFactor = nullptr;
+    ws->tissue = nullptr;
     ws->complianceReady = false;
 
     cudaError_t err = cudaSuccess;
@@ -1166,10 +1389,11 @@ bool factorizeDeformableSystem(
     return true;
 }
 
-bool setRigidSystem(ConstraintWorkspace* ws, const double matrix[36], std::string& diagnostic)
+namespace
 {
-    if (ws == nullptr) { diagnostic = "No constraint workspace."; return false; }
-    // Gauss-Jordan with partial pivoting on the 6x6 system matrix.
+// A 6x6 system matrix's inverse (Gauss-Jordan with partial pivoting); false if singular.
+bool invertRigidSystem(const double* matrix, double* inverse)
+{
     double a[6][12];
     for (int i = 0; i < 6; ++i)
     {
@@ -1179,12 +1403,7 @@ bool setRigidSystem(ConstraintWorkspace* ws, const double matrix[36], std::strin
     {
         int pivot = col;
         for (int r = col + 1; r < 6; ++r) if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) pivot = r;
-        if (std::fabs(a[pivot][col]) < 1.0e-300)
-        {
-            diagnostic = "The rigid body's system matrix is singular.";
-            ws->rigidReady = false;
-            return false;
-        }
+        if (std::fabs(a[pivot][col]) < 1.0e-300) return false;
         if (pivot != col) for (int j = 0; j < 12; ++j) std::swap(a[col][j], a[pivot][j]);
         const double inv = 1.0 / a[col][col];
         for (int j = 0; j < 12; ++j) a[col][j] *= inv;
@@ -1196,17 +1415,36 @@ bool setRigidSystem(ConstraintWorkspace* ws, const double matrix[36], std::strin
             for (int j = 0; j < 12; ++j) a[r][j] -= factor * a[col][j];
         }
     }
-    float inverse[36];
     for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) inverse[i * 6 + j] = a[i][6 + j];
+    return true;
+}
+
+// Every body's inverse to the device (float, 36 per body).
+cudaError_t uploadBodyInverses(ConstraintWorkspace* ws)
+{
+    std::vector<float> inverse(ws->bodyInverse.begin(), ws->bodyInverse.end());
+    cudaError_t err = ensureDeviceBuffer(ws->bodyInverseDevice, ws->bodyInverseCapacity, std::max<std::size_t>(inverse.size(), 36));
+    if (err == cudaSuccess && !inverse.empty())
+        err = cudaMemcpy(ws->bodyInverseDevice, inverse.data(), sizeof(float) * inverse.size(), cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rigidInverseDevice, ws->rigidInverseCapacity, 36);
+    if (err == cudaSuccess) err = cudaMemcpy(ws->rigidInverseDevice, inverse.data(), sizeof(float) * 36, cudaMemcpyHostToDevice);
+    return err;
+}
+} // namespace
+
+bool setRigidSystem(ConstraintWorkspace* ws, const double matrix[36], std::string& diagnostic)
+{
+    if (ws == nullptr) { diagnostic = "No constraint workspace."; return false; }
+    if (!invertRigidSystem(matrix, ws->rigidInverse))
     {
-        for (int j = 0; j < 6; ++j)
-        {
-            ws->rigidInverse[i * 6 + j] = a[i][6 + j];
-            inverse[i * 6 + j] = static_cast<float>(a[i][6 + j]);
-        }
+        diagnostic = "The rigid body's system matrix is singular.";
+        ws->rigidReady = false;
+        return false;
     }
-    cudaError_t err = ensureDeviceBuffer(ws->rigidInverseDevice, ws->rigidInverseCapacity, 36);
-    if (err == cudaSuccess) err = cudaMemcpy(ws->rigidInverseDevice, inverse, sizeof(inverse), cudaMemcpyHostToDevice);
+    if (ws->bodyInverse.size() < 36) ws->bodyInverse.resize(36);
+    std::copy(ws->rigidInverse, ws->rigidInverse + 36, ws->bodyInverse.begin());
+    const cudaError_t err = uploadBodyInverses(ws);
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Rigid compliance upload failed: ") + cudaGetErrorString(err);
@@ -1215,6 +1453,48 @@ bool setRigidSystem(ConstraintWorkspace* ws, const double matrix[36], std::strin
     }
     ws->rigidReady = true;
     diagnostic.clear();
+    return true;
+}
+
+bool setAdditionalRigidSystems(ConstraintWorkspace* ws, const std::vector<double>& matrices, const std::vector<double>& factors,
+                               std::string& diagnostic)
+{
+    if (ws == nullptr) { diagnostic = "No constraint workspace."; return false; }
+    const std::size_t extra = matrices.size() / 36;
+    if (matrices.size() != 36 * extra || factors.size() != extra)
+    {
+        diagnostic = "Additional rigid systems: 36 matrix values and 1 factor per body.";
+        return false;
+    }
+    ws->bodyInverse.resize(36 * (1 + extra));
+    std::copy(ws->rigidInverse, ws->rigidInverse + 36, ws->bodyInverse.begin());
+    for (std::size_t b = 0; b < extra; ++b)
+    {
+        if (!invertRigidSystem(matrices.data() + 36 * b, ws->bodyInverse.data() + 36 * (b + 1)))
+        {
+            diagnostic = "Rigid body " + std::to_string(b + 1) + "'s system matrix is singular.";
+            return false;
+        }
+    }
+    ws->bodyFactors.assign(1 + extra, 0.0);
+    for (std::size_t b = 0; b < extra; ++b) ws->bodyFactors[b + 1] = factors[b];
+    const cudaError_t err = uploadBodyInverses(ws);
+    if (err != cudaSuccess)
+    {
+        diagnostic = std::string("Rigid compliance upload failed: ") + cudaGetErrorString(err);
+        return false;
+    }
+    diagnostic.clear();
+    return true;
+}
+
+bool additionalRigidResults(const ConstraintWorkspace* ws, std::vector<double>& corrections, std::vector<double>& impulses)
+{
+    corrections.clear();
+    impulses.clear();
+    if (ws == nullptr) return false;
+    corrections = ws->extraCorrections;
+    impulses = ws->extraImpulses;
     return true;
 }
 
@@ -1235,23 +1515,55 @@ bool buildContactConstraints(
     ws->mu = input.friction;
     ws->rowsPerContact = input.friction > 0.0f ? 3 : 1;
 
-    if (!ws->rigidReady)
+    // The rigid bodies: body 0 from the single fields, then the additional ones.
+    std::vector<ConstraintRigidBodyInput> bodies(1);
+    bodies[0].surfaceId = input.rigidSurfaceId;
+    bodies[0].surfacePositions = input.rigidSurfacePositions;
+    bodies[0].vertexCount = input.rigidVertexCount;
+    for (int e = 0; e < 3; ++e) bodies[0].center[e] = input.rigidCenter[e];
+    for (int e = 0; e < 6; ++e) bodies[0].freeStep[e] = input.rigidFreeStep[e];
+    bodies[0].dofMask = input.rigidDofMask;
+    bodies.insert(bodies.end(), input.additionalRigidBodies.begin(), input.additionalRigidBodies.end());
+    const int bodyCount = static_cast<int>(bodies.size());
+    ws->bodyCount = bodyCount;
+
+    if (!ws->rigidReady || ws->bodyInverse.size() < 36u * bodyCount)
     {
-        diagnostic = "setRigidSystem must be called before building constraints.";
+        diagnostic = "setRigidSystem (and setAdditionalRigidSystems for more bodies) must be called before building constraints.";
         return false;
     }
-    if (input.deformableSurfacePositions == nullptr || input.rigidSurfacePositions == nullptr ||
-        (input.deformableFreePositions == nullptr && input.deformableFreePositionsDevice == nullptr) ||
-        input.deformableVertexCount == 0 || input.rigidVertexCount == 0)
+    bool complete = input.deformableSurfacePositions != nullptr && input.deformableVertexCount > 0 &&
+                    (input.deformableFreePositions != nullptr || input.deformableFreePositionsDevice != nullptr);
+    for (const auto& body : bodies) complete = complete && body.surfacePositions != nullptr && body.vertexCount > 0;
+    if (!complete)
     {
         diagnostic = "Constraint build input is incomplete (positions or vertex counts missing).";
         return false;
     }
 
-    const RecordedContactHandle* handle = nullptr;
-    bool swapped = false;
-    if (!currentContactsFor(input.deformableSurfaceId, input.rigidSurfaceId, handle, swapped, diagnostic)) return false;
-    if (handle == nullptr)
+    // Each body's contacts from this collision pass: one segment of the selection each.
+    struct Segment
+    {
+        const RecordedContactHandle* handle;
+        bool swapped;
+        int body;
+        std::uint32_t start;
+        std::uint32_t count;
+    };
+    std::vector<Segment> segments;
+    std::size_t capacity = 0;
+    std::uint32_t maxRigidVertices = 0;
+    for (int b = 0; b < bodyCount; ++b)
+    {
+        const RecordedContactHandle* handle = nullptr;
+        bool swapped = false;
+        if (!currentContactsFor(input.deformableSurfaceId, bodies[b].surfaceId, handle, swapped, diagnostic)) return false;
+        if (handle == nullptr) continue;
+        segments.push_back({ handle, swapped, b, 0u, 0u });
+        capacity += handle->capacity;
+        maxRigidVertices = std::max(maxRigidVertices, bodies[b].vertexCount);
+    }
+    if (segments.empty())
     {
         diagnostic.clear();      // no contacts in this collision pass
         return true;
@@ -1259,12 +1571,13 @@ bool buildContactConstraints(
 
     ConstraintEventTimer timer(timings != nullptr);
     const std::uint32_t nd = input.deformableVertexCount;
-    const std::uint32_t nr = input.rigidVertexCount;
 
     cudaError_t err = ensureDeviceBuffer(ws->deformableSlots, ws->deformableSlotsCapacity, nd);
-    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rigidSlots, ws->rigidSlotsCapacity, nr);
-    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->selected, ws->selectedCapacity, handle->capacity);
-    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->sortKeys, ws->sortKeysCapacity, handle->capacity);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rigidSlots, ws->rigidSlotsCapacity, maxRigidVertices);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->deformableOwners, ws->deformableOwnersCapacity, nd);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rigidOwners, ws->rigidOwnersCapacity, maxRigidVertices);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->selected, ws->selectedCapacity, capacity);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->sortKeys, ws->sortKeysCapacity, capacity);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->counter, ws->counterCapacity, 1);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->flags, ws->flagsCapacity, nd);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->scan, ws->scanCapacity, nd);
@@ -1283,38 +1596,98 @@ bool buildContactConstraints(
         diagnostic = std::string("Constraint selection buffers: ") + cudaGetErrorString(err);
         return false;
     }
-
-    launchFill(ws->deformableSlots, nd, ~0ull);
-    launchFill(ws->rigidSlots, nr, ~0ull);
-    launchFill(ws->counter, 1, 0u);
     launchFill(ws->flags, nd, 0);
 
     const bool keepAll = input.filter == ConstraintContactFilter::All;
     constexpr unsigned threads = 256;
-    const unsigned blocks = std::max(1u, std::min((handle->capacity + threads - 1) / threads, 1024u));
-    if (!keepAll)
+    std::uint32_t detectedTotal = 0;
+    std::uint32_t start = 0;
+    for (auto& segment : segments)
     {
-        constraintClaimVerticesKernel<<<blocks, threads>>>(
-            handle->contacts, handle->countDevice, handle->capacity,
-            handle->firstIndices, handle->secondIndices, swapped,
-            ws->deformableSlots, ws->rigidSlots);
-    }
-    constraintSelectContactsKernel<<<blocks, threads>>>(
-        handle->contacts, handle->countDevice, handle->capacity,
-        handle->firstIndices, handle->secondIndices, swapped, keepAll,
-        ws->deformableSlots, ws->rigidSlots, ws->selected, ws->sortKeys, ws->counter);
+        const RecordedContactHandle* handle = segment.handle;
+        const bool swapped = segment.swapped;
+        const ConstraintRigidBodyInput& body = bodies[segment.body];
+        const std::uint32_t nr = body.vertexCount;
+        const unsigned blocks = std::max(1u, std::min((handle->capacity + threads - 1) / threads, 1024u));
+        // Claims are per (body-1 vertex, tool): a vertex pinched between two jaws keeps a contact with each.
+        launchFill(ws->deformableSlots, nd, ~0ull);
+        launchFill(ws->rigidSlots, nr, ~0ull);
+        launchFill(ws->deformableOwners, nd, ~0u);
+        launchFill(ws->rigidOwners, nr, ~0u);
+        launchFill(ws->counter, 1, 0u);
 
-    std::uint32_t detected = 0;
-    std::uint32_t count = 0;
-    err = cudaMemcpy(&detected, handle->countDevice, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
-    if (err == cudaSuccess) err = cudaMemcpy(&count, ws->counter, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess)
-    {
-        diagnostic = std::string("Contact selection: ") + cudaGetErrorString(err);
-        return false;
+        // Vertex normal cones of both surfaces, at the positions the contacts were found at.
+        ConstraintVertexCones cones;
+        if (!keepAll && input.vertexConeFilter && handle->firstTriangleCount > 0 && handle->secondTriangleCount > 0)
+        {
+            const std::uint32_t firstCount = swapped ? nr : nd;
+            const std::uint32_t secondCount = swapped ? nd : nr;
+            const float* firstPositions = static_cast<const float*>(swapped ? body.surfacePositions : input.deformableSurfacePositions);
+            const float* secondPositions = static_cast<const float*>(swapped ? input.deformableSurfacePositions : body.surfacePositions);
+            err = ensureDeviceBuffer(ws->coneNormals, ws->coneNormalsCapacity, 3u * static_cast<std::size_t>(firstCount + secondCount));
+            if (err == cudaSuccess) err = ensureDeviceBuffer(ws->coneCos, ws->coneCosCapacity, static_cast<std::size_t>(firstCount + secondCount));
+            if (err != cudaSuccess)
+            {
+                diagnostic = std::string("Contact cone buffers: ") + cudaGetErrorString(err);
+                return false;
+            }
+            launchFill(ws->coneNormals, 3u * static_cast<std::size_t>(firstCount + secondCount), 0.0f);
+            launchFill(ws->coneCos, static_cast<std::size_t>(firstCount + secondCount), 1.0f);
+            float* firstNormals = ws->coneNormals;
+            float* secondNormals = ws->coneNormals + 3u * static_cast<std::size_t>(firstCount);
+            float* firstCones = ws->coneCos;
+            float* secondCones = ws->coneCos + firstCount;
+            const unsigned firstTriBlocks = std::max(1u, std::min((handle->firstTriangleCount + threads - 1) / threads, 1024u));
+            const unsigned secondTriBlocks = std::max(1u, std::min((handle->secondTriangleCount + threads - 1) / threads, 1024u));
+            constraintVertexNormalsKernel<<<firstTriBlocks, threads>>>(handle->firstIndices, handle->firstTriangleCount, firstPositions, firstNormals);
+            constraintVertexNormalsKernel<<<secondTriBlocks, threads>>>(handle->secondIndices, handle->secondTriangleCount, secondPositions, secondNormals);
+            constraintNormalizeKernel<<<std::max(1u, std::min((firstCount + secondCount + threads - 1) / threads, 1024u)), threads>>>(
+                firstCount + secondCount, ws->coneNormals);
+            constraintVertexConesKernel<<<firstTriBlocks, threads>>>(handle->firstIndices, handle->firstTriangleCount, firstPositions,
+                                                                     firstNormals, firstCones);
+            constraintVertexConesKernel<<<secondTriBlocks, threads>>>(handle->secondIndices, handle->secondTriangleCount, secondPositions,
+                                                                      secondNormals, secondCones);
+            cones.firstNormals = firstNormals;
+            cones.firstCones = firstCones;
+            cones.secondNormals = secondNormals;
+            cones.secondCones = secondCones;
+            cones.tolerance = input.vertexConeTolerance;
+        }
+        if (!keepAll)
+        {
+            constraintClaimVerticesKernel<<<blocks, threads>>>(
+                handle->contacts, handle->countDevice, handle->capacity,
+                handle->firstIndices, handle->secondIndices, swapped, cones,
+                ws->deformableSlots, ws->rigidSlots);
+            constraintClaimOwnersKernel<<<blocks, threads>>>(
+                handle->contacts, handle->countDevice, handle->capacity,
+                handle->firstIndices, handle->secondIndices, swapped, cones,
+                ws->deformableSlots, ws->rigidSlots, ws->deformableOwners, ws->rigidOwners);
+        }
+        constraintSelectContactsKernel<<<blocks, threads>>>(
+            handle->contacts, handle->countDevice, handle->capacity,
+            handle->firstIndices, handle->secondIndices, swapped, keepAll, cones,
+            ws->deformableSlots, ws->rigidSlots, ws->deformableOwners, ws->rigidOwners,
+            ws->selected + start, ws->sortKeys + start, ws->counter);
+
+        std::uint32_t detected = 0;
+        std::uint32_t count = 0;
+        err = cudaMemcpy(&detected, handle->countDevice, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        if (err == cudaSuccess) err = cudaMemcpy(&count, ws->counter, sizeof(std::uint32_t), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Contact selection: ") + cudaGetErrorString(err);
+            return false;
+        }
+        detectedTotal += std::min(detected, handle->capacity);
+        // Order independent of the narrow phase's emission order.
+        if (count > 1) thrust::sort_by_key(thrust::device, ws->sortKeys + start, ws->sortKeys + start + count, ws->selected + start);
+        segment.start = start;
+        segment.count = count;
+        start += count;
     }
-    detected = std::min(detected, handle->capacity);
-    if (stats != nullptr) stats->detectedContacts = detected;
+    const std::uint32_t count = start;
+    if (stats != nullptr) stats->detectedContacts = detectedTotal;
     if (count == 0)
     {
         if (timings != nullptr) timings->buildMs = timer.finish();
@@ -1322,13 +1695,15 @@ bool buildContactConstraints(
         return true;
     }
 
-    // Order independent of the narrow phase's emission order.
-    thrust::sort_by_key(thrust::device, ws->sortKeys, ws->sortKeys + count, ws->selected);
-
-    // Touched body-1 vertices and their compact numbering.
-    const unsigned contactBlocks = std::max(1u, std::min((count + threads - 1) / threads, 1024u));
-    constraintFlagVerticesKernel<<<contactBlocks, threads>>>(
-        handle->contacts, ws->selected, count, handle->firstIndices, handle->secondIndices, swapped, ws->flags);
+    // Touched body-1 vertices (over every tool) and their compact numbering.
+    for (const auto& segment : segments)
+    {
+        if (segment.count == 0) continue;
+        const unsigned segmentBlocks = std::max(1u, std::min((segment.count + threads - 1) / threads, 1024u));
+        constraintFlagVerticesKernel<<<segmentBlocks, threads>>>(
+            segment.handle->contacts, ws->selected + segment.start, segment.count,
+            segment.handle->firstIndices, segment.handle->secondIndices, segment.swapped, ws->flags);
+    }
     thrust::exclusive_scan(thrust::device, ws->flags, ws->flags + nd, ws->scan);
     const unsigned vertexBlocks = std::max(1u, std::min((nd + threads - 1) / threads, 1024u));
     constraintCompactVerticesKernel<<<vertexBlocks, threads>>>(ws->flags, ws->scan, nd, ws->vertexCompact, ws->compactToGlobal);
@@ -1349,6 +1724,7 @@ bool buildContactConstraints(
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rowDeformable, ws->rowDeformableCapacity, rows * 9);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rowRigid, ws->rowRigidCapacity, rows * 6);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rowRigidResponse, ws->rowRigidResponseCapacity, rows * 6);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->rowBody, ws->rowBodyCapacity, rows);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->dfree, ws->dfreeCapacity, rows);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->geometry, ws->geometryCapacity, static_cast<std::size_t>(count) * kContactGeometryValues);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->contactVertices, ws->contactVerticesCapacity, static_cast<std::size_t>(count) * 3);
@@ -1358,18 +1734,6 @@ bool buildContactConstraints(
         diagnostic = std::string("Constraint row buffers: ") + cudaGetErrorString(err);
         return false;
     }
-
-    ConstraintRigidMotion rigid {};
-    rigid.center = make_float3(static_cast<float>(input.rigidCenter[0]),
-                               static_cast<float>(input.rigidCenter[1]),
-                               static_cast<float>(input.rigidCenter[2]));
-    rigid.freeLinear = make_float3(static_cast<float>(input.rigidFreeStep[0]),
-                                   static_cast<float>(input.rigidFreeStep[1]),
-                                   static_cast<float>(input.rigidFreeStep[2]));
-    rigid.freeAngular = make_float3(static_cast<float>(input.rigidFreeStep[3]),
-                                    static_cast<float>(input.rigidFreeStep[4]),
-                                    static_cast<float>(input.rigidFreeStep[5]));
-    for (int e = 0; e < 6; ++e) rigid.dofMask[e] = ((input.rigidDofMask >> e) & 1u) ? 1.0f : 0.0f;
 
     // Body 1's DOF mask changes only when a projective constraint does: upload on change.
     const unsigned char* deviceMask = nullptr;
@@ -1392,15 +1756,36 @@ bool buildContactConstraints(
         deviceMask = ws->dofMask;
     }
 
-    const float* firstPositions = static_cast<const float*>(swapped ? input.rigidSurfacePositions : input.deformableSurfacePositions);
-    const float* secondPositions = static_cast<const float*>(swapped ? input.deformableSurfacePositions : input.rigidSurfacePositions);
-    constraintBuildRowsKernel<<<contactBlocks, threads>>>(
-        handle->contacts, ws->selected, count, handle->firstIndices, handle->secondIndices,
-        firstPositions, secondPositions, swapped,
-        freeDevice, deviceMask, ws->vertexCompact, rigid, ws->rigidInverseDevice,
-        input.contactDistance, rowsPerContact,
-        ws->rowVertexCompact, ws->rowVertexGlobal, ws->rowDeformable, ws->rowRigid, ws->rowRigidResponse,
-        ws->dfree, ws->geometry, ws->contactVertices, ws->contactWeights);
+    for (const auto& segment : segments)
+    {
+        if (segment.count == 0) continue;
+        const ConstraintRigidBodyInput& body = bodies[segment.body];
+        ConstraintRigidMotion rigid {};
+        rigid.center = make_float3(static_cast<float>(body.center[0]), static_cast<float>(body.center[1]),
+                                   static_cast<float>(body.center[2]));
+        rigid.freeLinear = make_float3(static_cast<float>(body.freeStep[0]), static_cast<float>(body.freeStep[1]),
+                                       static_cast<float>(body.freeStep[2]));
+        rigid.freeAngular = make_float3(static_cast<float>(body.freeStep[3]), static_cast<float>(body.freeStep[4]),
+                                        static_cast<float>(body.freeStep[5]));
+        for (int e = 0; e < 6; ++e) rigid.dofMask[e] = ((body.dofMask >> e) & 1u) ? 1.0f : 0.0f;
+
+        const float* firstPositions = static_cast<const float*>(segment.swapped ? body.surfacePositions : input.deformableSurfacePositions);
+        const float* secondPositions = static_cast<const float*>(segment.swapped ? input.deformableSurfacePositions : body.surfacePositions);
+        const std::size_t r0 = static_cast<std::size_t>(segment.start) * rowsPerContact;
+        const unsigned segmentBlocks = std::max(1u, std::min((segment.count + threads - 1) / threads, 1024u));
+        constraintBuildRowsKernel<<<segmentBlocks, threads>>>(
+            segment.handle->contacts, ws->selected + segment.start, segment.count,
+            segment.handle->firstIndices, segment.handle->secondIndices,
+            firstPositions, secondPositions, segment.swapped,
+            freeDevice, deviceMask, ws->vertexCompact, rigid, ws->bodyInverseDevice + 36u * segment.body,
+            input.contactDistance, rowsPerContact,
+            ws->rowVertexCompact + r0 * 3, ws->rowVertexGlobal + r0 * 3, ws->rowDeformable + r0 * 9,
+            ws->rowRigid + r0 * 6, ws->rowRigidResponse + r0 * 6, ws->dfree + r0,
+            ws->geometry + static_cast<std::size_t>(segment.start) * kContactGeometryValues,
+            ws->contactVertices + static_cast<std::size_t>(segment.start) * 3,
+            ws->contactWeights + static_cast<std::size_t>(segment.start) * 3);
+        launchFill(ws->rowBody + r0, static_cast<std::size_t>(segment.count) * rowsPerContact, segment.body);
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
@@ -1453,31 +1838,55 @@ bool assembleContactCompliance(
 
     if (m > 0)
     {
-        // Y = L^-1 E, then G = Y^T Y = E^T A1^-1 E: A1^-1 on the touched DOFs.
-        launchFill(ws->selector, static_cast<std::size_t>(n) * m, 0.0f);
-        constraintSelectorKernel<<<std::max(1, std::min((ws->touched + 255) / 256, 1024)), 256>>>(
-            ws->compactToGlobal, ws->touched, n, ws->selector);
-        const float one = 1.0f;
-        const float zero = 0.0f;
-        cublasStatus_t status = cublasStrsm(ws->blas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                                            CUBLAS_DIAG_NON_UNIT, n, m, &one, deformableFactorOf(ws), n, ws->selector, n);
-        if (status == CUBLAS_STATUS_SUCCESS)
+        // G = E^T A1^-1 E: A1^-1 on the touched DOFs.
+        if (ws->tissue != nullptr)
         {
-            status = cublasSgemm(ws->blas, CUBLAS_OP_T, CUBLAS_OP_N, m, m, n, &one,
-                                 ws->selector, n, ws->selector, n, &zero, ws->compliance, m);
+            // The tissue solver's factor (band or dense Cholesky: Y = L^-1 E, G = Y^T Y;
+            // or LU on a step whose matrix was not positive definite).
+            if (!tissueComplianceBlock(ws->tissue, ws->compactToGlobal, ws->touched, ws->compliance, diagnostic)) return false;
         }
-        if (status != CUBLAS_STATUS_SUCCESS)
+        else
         {
-            diagnostic = std::string("Compliance product failed: cuBLAS ") + cublasStatusName(status);
-            return false;
+            // Our own dense Cholesky: Y = L^-1 E, then G = Y^T Y.
+            launchFill(ws->selector, static_cast<std::size_t>(n) * m, 0.0f);
+            constraintSelectorKernel<<<std::max(1, std::min((ws->touched + 255) / 256, 1024)), 256>>>(
+                ws->compactToGlobal, ws->touched, n, ws->selector);
+            const float one = 1.0f;
+            const float zero = 0.0f;
+            cublasStatus_t status = cublasStrsm(ws->blas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                                                CUBLAS_DIAG_NON_UNIT, n, m, &one, ws->dense, n, ws->selector, n);
+            if (status == CUBLAS_STATUS_SUCCESS)
+            {
+                status = cublasSgemm(ws->blas, CUBLAS_OP_T, CUBLAS_OP_N, m, m, n, &one,
+                                     ws->selector, n, ws->selector, n, &zero, ws->compliance, m);
+            }
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                diagnostic = std::string("Compliance product failed: cuBLAS ") + cublasStatusName(status);
+                return false;
+            }
         }
     }
 
     const dim3 block(16, 16);
     const dim3 grid(static_cast<unsigned>((rows + 15) / 16), static_cast<unsigned>((rows + 15) / 16));
+    // Each rigid body's factor (body 0: rigidFactor; the others as setAdditionalRigidSystems gave them).
+    {
+        std::vector<float> factors(static_cast<std::size_t>(std::max(ws->bodyCount, 1)), 0.0f);
+        factors[0] = static_cast<float>(rigidFactor);
+        for (std::size_t b = 1; b < factors.size() && b < ws->bodyFactors.size(); ++b) factors[b] = static_cast<float>(ws->bodyFactors[b]);
+        err = ensureDeviceBuffer(ws->bodyFactorsDevice, ws->bodyFactorsCapacity, factors.size());
+        if (err == cudaSuccess)
+            err = cudaMemcpy(ws->bodyFactorsDevice, factors.data(), sizeof(float) * factors.size(), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Rigid factors upload: ") + cudaGetErrorString(err);
+            return false;
+        }
+    }
     constraintAssembleComplianceKernel<<<grid, block>>>(
-        ws->rows, ws->rowVertexCompact, ws->rowDeformable, ws->rowRigid, ws->rowRigidResponse,
-        ws->compliance, std::max(m, 1), static_cast<float>(deformableFactor), static_cast<float>(rigidFactor), ws->W);
+        ws->rows, ws->rowVertexCompact, ws->rowDeformable, ws->rowRigid, ws->rowRigidResponse, ws->rowBody,
+        ws->bodyFactorsDevice, ws->compliance, std::max(m, 1), static_cast<float>(deformableFactor), ws->W);
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
@@ -1659,52 +2068,45 @@ bool computeContactCorrection(
         diagnostic = std::string("Correction buffers: ") + cudaGetErrorString(err);
         return false;
     }
-    launchFill(ws->deformableRhs, static_cast<std::size_t>(n), 0.0f);
-    launchFill(ws->rigidRhs, 7, 0.0);
-    constraintImpulseKernel<<<std::max(1, std::min((ws->rows + 255) / 256, 1024)), 256>>>(
-        ws->rows, ws->rowsPerContact, ws->rowVertexGlobal, ws->rowDeformable, ws->rowRigid, ws->lambda,
-        ws->deformableRhs, ws->rigidRhs);
-    if (cusolverDnSpotrs(ws->solver, CUBLAS_FILL_MODE_LOWER, n, 1, deformableFactorOf(ws), n, ws->deformableRhs, n, ws->info) != CUSOLVER_STATUS_SUCCESS)
+    const int bodies = std::max(ws->bodyCount, 1);
+    err = ensureDeviceBuffer(ws->rigidRhs, ws->rigidRhsCapacity, static_cast<std::size_t>(7 * bodies));
+    if (err != cudaSuccess)
     {
-        diagnostic = "cusolverDnSpotrs failed to launch.";
+        diagnostic = std::string("Correction buffers: ") + cudaGetErrorString(err);
         return false;
     }
-    double rigidRhs[7];
+    launchFill(ws->deformableRhs, static_cast<std::size_t>(n), 0.0f);
+    launchFill(ws->rigidRhs, static_cast<std::size_t>(7 * bodies), 0.0);
+    constraintImpulseKernel<<<std::max(1, std::min((ws->rows + 255) / 256, 1024)), 256>>>(
+        ws->rows, ws->rowsPerContact, ws->rowVertexGlobal, ws->rowDeformable, ws->rowRigid, ws->rowBody, ws->lambda,
+        ws->deformableRhs, ws->rigidRhs);
+    if (!solveWithDeformableFactor(ws, 1, ws->deformableRhs, diagnostic)) return false;
+    std::vector<double> rigidRhs(static_cast<std::size_t>(7 * bodies));
     err = cudaMemcpy(deformableCorrection.data(), ws->deformableRhs, sizeof(float) * n, cudaMemcpyDeviceToHost);
-    if (err == cudaSuccess) err = cudaMemcpy(rigidRhs, ws->rigidRhs, sizeof(rigidRhs), cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess) err = cudaMemcpy(rigidRhs.data(), ws->rigidRhs, sizeof(double) * rigidRhs.size(), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Correction download: ") + cudaGetErrorString(err);
         return false;
     }
-    for (int i = 0; i < 6; ++i)
-    {
-        double acc = 0.0;
-        for (int j = 0; j < 6; ++j) acc += ws->rigidInverse[i * 6 + j] * rigidRhs[j];
-        rigidCorrection[i] = acc;
-    }
-    if (impulse != nullptr)
-    {
-        for (int e = 0; e < 6; ++e) impulse->rigid[e] = rigidRhs[e];
-        impulse->normalSum = rigidRhs[6];
-    }
+    rigidBodyResults(ws, rigidRhs, rigidCorrection, impulse);
     if (timings != nullptr) timings->correctionMs = timer.finish();
     diagnostic.clear();
     return true;
 }
 
-bool useExternalDeformableFactor(ConstraintWorkspace* ws, const float* factor, const int size, std::string& diagnostic)
+bool useTissueFactor(ConstraintWorkspace* ws, TissueWorkspace* tissue, std::string& diagnostic)
 {
     if (ws == nullptr) { diagnostic = "No constraint workspace."; return false; }
-    if (factor == nullptr || size <= 0)
+    if (!tissueFactorReady(tissue))
     {
-        ws->externalFactor = nullptr;
+        ws->tissue = nullptr;
         ws->factorized = false;
         diagnostic = "No body-1 factor to use (the tissue step did not factorise its matrix).";
         return false;
     }
-    ws->externalFactor = factor;
-    ws->n = size;
+    ws->tissue = tissue;
+    ws->n = tissueDofCount(tissue);
     ws->factorized = true;
     diagnostic.clear();
     return true;
@@ -1754,36 +2156,28 @@ bool computeContactCorrectionOnDevice(
         diagnostic = std::string("Correction buffers: ") + cudaGetErrorString(err);
         return false;
     }
-    launchFill(ws->deformableRhs, static_cast<std::size_t>(n), 0.0f);
-    launchFill(ws->rigidRhs, 7, 0.0);
-    constraintImpulseKernel<<<std::max(1, std::min((ws->rows + 255) / 256, 1024)), 256>>>(
-        ws->rows, ws->rowsPerContact, ws->rowVertexGlobal, ws->rowDeformable, ws->rowRigid, ws->lambda,
-        ws->deformableRhs, ws->rigidRhs);
-    if (cusolverDnSpotrs(ws->solver, CUBLAS_FILL_MODE_LOWER, n, 1, deformableFactorOf(ws), n,
-                         ws->deformableRhs, n, ws->info) != CUSOLVER_STATUS_SUCCESS)
+    const int bodies = std::max(ws->bodyCount, 1);
+    err = ensureDeviceBuffer(ws->rigidRhs, ws->rigidRhsCapacity, static_cast<std::size_t>(7 * bodies));
+    if (err != cudaSuccess)
     {
-        diagnostic = "cusolverDnSpotrs failed to launch.";
+        diagnostic = std::string("Correction buffers: ") + cudaGetErrorString(err);
         return false;
     }
-    double rigidRhs[7];
-    err = cudaMemcpy(rigidRhs, ws->rigidRhs, sizeof(rigidRhs), cudaMemcpyDeviceToHost);
+    launchFill(ws->deformableRhs, static_cast<std::size_t>(n), 0.0f);
+    launchFill(ws->rigidRhs, static_cast<std::size_t>(7 * bodies), 0.0);
+    constraintImpulseKernel<<<std::max(1, std::min((ws->rows + 255) / 256, 1024)), 256>>>(
+        ws->rows, ws->rowsPerContact, ws->rowVertexGlobal, ws->rowDeformable, ws->rowRigid, ws->rowBody, ws->lambda,
+        ws->deformableRhs, ws->rigidRhs);
+    if (!solveWithDeformableFactor(ws, 1, ws->deformableRhs, diagnostic)) return false;
+    std::vector<double> rigidRhs(static_cast<std::size_t>(7 * bodies));
+    err = cudaMemcpy(rigidRhs.data(), ws->rigidRhs, sizeof(double) * rigidRhs.size(), cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Correction download: ") + cudaGetErrorString(err);
         return false;
     }
     ws->deviceCorrectionValid = true;
-    for (int i = 0; i < 6; ++i)
-    {
-        double acc = 0.0;
-        for (int j = 0; j < 6; ++j) acc += ws->rigidInverse[i * 6 + j] * rigidRhs[j];
-        rigidCorrection[i] = acc;
-    }
-    if (impulse != nullptr)
-    {
-        for (int e = 0; e < 6; ++e) impulse->rigid[e] = rigidRhs[e];
-        impulse->normalSum = rigidRhs[6];
-    }
+    rigidBodyResults(ws, rigidRhs, rigidCorrection, impulse);
     if (timings != nullptr) timings->correctionMs = timer.finish();
     diagnostic.clear();
     return true;

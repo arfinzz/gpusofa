@@ -26,10 +26,16 @@ grep -c CudaContactPenaltyForceField       "${DST}/SofaGpuCollision/CMakeLists.t
 
 SOFA_ROOT="${SOFA_ROOT:-/opt/sofa/install/v25.12}"
 BUILD="${DST}/SofaGpuCollision/build-profile"
+# Optimised CPU code, and GPU code compiled for the GTX 1650 Ti itself (compute
+# capability 7.5) instead of 5.2 code that the driver translates at load time.
+BUILD_TYPE="${SOFA_GPU_BUILD_TYPE:-Release}"
+CUDA_ARCH="${SOFA_GPU_CUDA_ARCH:-75}"
 
-echo "=== CMAKE CONFIGURE ==="
+echo "=== CMAKE CONFIGURE (build type ${BUILD_TYPE}, CUDA arch ${CUDA_ARCH}) ==="
 cmake -S "${DST}/SofaGpuCollision" -B "${BUILD}" \
     -DCMAKE_PREFIX_PATH="${SOFA_ROOT}" \
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
     -DSOFAGPUCOLLISION_ENABLE_CUDA=ON > /home/arfin/_cfg.log 2>&1
 echo "configure_exit=$?"
 

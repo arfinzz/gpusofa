@@ -606,4 +606,53 @@ DeviceDenseGridConfig makeDeviceDenseGridConfig(
     };
 }
 
+// ---- One workspace per collision pair ------------------------------------------
+// Every narrow-phase path keeps its contacts, counters and uploaded triangle indices
+// in its workspace, and the pair's contact handle (recordContactHandle) points into
+// it for the consumers (contact forces, constraint contact) to read after the whole
+// collision pass. With one shared workspace, the pairs computed later in a pass
+// overwrote the earlier pairs' contacts: in a scene with three tools, every tool's
+// handle read the last pair's contacts through its own triangle indices (wrong
+// contacts, and an illegal memory access). So each (first, second) surface pair has
+// its own workspace, CUDA graph and buffer sizes; the entry points of the paths set
+// the current pair with a PairWorkspaceScope. Surfaces without an id (0) share one.
+struct PairWorkspaceKey
+{
+    std::uint64_t first { 0 };
+    std::uint64_t second { 0 };
+};
+
+PairWorkspaceKey& currentPairWorkspaceKey()
+{
+    static PairWorkspaceKey key;
+    return key;
+}
+
+class PairWorkspaceScope
+{
+public:
+    PairWorkspaceScope(const std::uint64_t first, const std::uint64_t second)
+        : m_saved(currentPairWorkspaceKey())
+    {
+        currentPairWorkspaceKey() = PairWorkspaceKey { first, second };
+    }
+    ~PairWorkspaceScope() { currentPairWorkspaceKey() = m_saved; }
+    PairWorkspaceScope(const PairWorkspaceScope&) = delete;
+    PairWorkspaceScope& operator=(const PairWorkspaceScope&) = delete;
+
+private:
+    PairWorkspaceKey m_saved;
+};
+
+// The current pair's workspace of type W (Tag separates two uses of one type).
+template <class W, int Tag = 0>
+W& pairWorkspace()
+{
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, std::unique_ptr<W>> workspaces;
+    const PairWorkspaceKey& key = currentPairWorkspaceKey();
+    std::unique_ptr<W>& slot = workspaces[{ key.first, key.second }];
+    if (!slot) slot = std::make_unique<W>();
+    return *slot;
+}
+
 } // namespace

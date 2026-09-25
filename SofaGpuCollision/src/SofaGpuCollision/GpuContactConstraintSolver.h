@@ -27,7 +27,10 @@ namespace SofaGpuCollision
 
 // ============================================================================
 // Constraint-based contact response on the GPU: Lagrange multipliers with
-// Coulomb friction, for one deformable body touching one rigid body.
+// Coulomb friction, for one deformable body touching one rigid body, or several
+// (additionalRigid* lists: other tools, a grasper's two jaws). All contacts are
+// solved together: they couple through the deformable body's compliance, and
+// two rows couple through a rigid body only when they act on the same one.
 //
 // It takes the place of SOFA's constraint solver in a FreeMotionAnimationLoop.
 // Each step, after the free motion and the GPU collision detection:
@@ -108,11 +111,14 @@ public:
     sofa::core::objectmodel::Data<bool> d_allVerified;
     sofa::core::objectmodel::Data<SReal> d_sor;
     sofa::core::objectmodel::Data<std::string> d_contactFilter;
+    sofa::core::objectmodel::Data<bool> d_vertexConeFilter;
+    sofa::core::objectmodel::Data<SReal> d_vertexConeTolerance;
     sofa::core::objectmodel::Data<bool> d_exactArithmetic;
     sofa::core::objectmodel::Data<std::string> d_response;
     sofa::core::objectmodel::Data<bool> d_compareWithCpu;
     sofa::core::objectmodel::Data<int> d_compareEvery;
     sofa::core::objectmodel::Data<std::string> d_compareFile;
+    sofa::core::objectmodel::Data<std::string> d_dumpContactsFile;
     sofa::core::objectmodel::Data<bool> d_measureTimes;
 
     // Outputs (read-only).
@@ -145,6 +151,18 @@ public:
     // Body 1 on the GPU: replaces deformableState, deformableLinearSolver and deformableOdeSolver.
     sofa::core::objectmodel::SingleLink<GpuContactConstraintSolver, GpuTissueSolver,
         sofa::core::objectmodel::BaseLink::FLAG_STOREPATH | sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK> l_deformableGpuSolver;
+    // More rigid bodies touching body 1 (other tools, or a grasper's second jaw), each
+    // like body 2: the same order in all four lists.
+    sofa::core::objectmodel::MultiLink<GpuContactConstraintSolver, sofa::core::behavior::MechanicalState<RigidTypes>,
+        sofa::core::objectmodel::BaseLink::FLAG_STOREPATH | sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK> l_additionalRigidStates;
+    sofa::core::objectmodel::MultiLink<GpuContactConstraintSolver, sofa::core::behavior::MechanicalState<SurfaceTypes>,
+        sofa::core::objectmodel::BaseLink::FLAG_STOREPATH | sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK> l_additionalRigidSurfaces;
+    sofa::core::objectmodel::MultiLink<GpuContactConstraintSolver, sofa::core::behavior::LinearSolver,
+        sofa::core::objectmodel::BaseLink::FLAG_STOREPATH | sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK> l_additionalRigidLinearSolvers;
+    sofa::core::objectmodel::MultiLink<GpuContactConstraintSolver, sofa::core::behavior::OdeSolver,
+        sofa::core::objectmodel::BaseLink::FLAG_STOREPATH | sofa::core::objectmodel::BaseLink::FLAG_STRONGLINK> l_additionalRigidOdeSolvers;
+    // Output: the contact force and torque on each additional rigid body (as rigidContactForce).
+    sofa::core::objectmodel::Data<sofa::type::vector<Wrench>> d_additionalRigidContactForces;
 
 private:
     struct CpuReference;   // SOFA's CPU pipeline (defined in the .cpp)
@@ -157,6 +175,11 @@ private:
     void updateDofMasks();
     bool readDeformableMatrix(sofa::core::behavior::LinearSolver* solver, backend::HostCsrMatrix& matrix, std::string& diagnostic);
     bool readRigidMatrix(double matrix[36], std::string& diagnostic);
+    static bool readRigidMatrixOf(sofa::core::behavior::LinearSolver* solver, double matrix[36], std::string& diagnostic);
+    static std::uint8_t rigidMaskOf(sofa::core::behavior::MechanicalState<RigidTypes>* state, bool& general);
+    void applyRigidMotion(const sofa::core::ConstraintParams* cParams, sofa::core::MultiVecId res1, sofa::core::MultiVecId res2,
+                          sofa::core::behavior::MechanicalState<RigidTypes>* state, sofa::core::behavior::OdeSolver* ode,
+                          const double correction[6], const double impulse[6]);
     void applyMotion(const sofa::core::ConstraintParams* cParams, sofa::core::MultiVecId res1, sofa::core::MultiVecId res2);
     void applyDeformableMotionOnDevice(const sofa::core::ConstraintParams* cParams, sofa::core::MultiVecId res1,
                                        sofa::core::MultiVecId res2, bool useAppliedCorrection);
@@ -199,6 +222,18 @@ private:
     bool m_deformableMaskUsed { false };
     std::uint8_t m_rigidMask { 0x3F };
 
+    // The additional rigid bodies' per-step data (the order of the additionalRigid* lists).
+    struct AdditionalRigid
+    {
+        std::uint64_t surfaceId { 0 };
+        double matrix[36] {};
+        std::uint8_t mask { 0x3F };
+        double factor { 0.0 };
+        double correction[6] {};
+        double impulse[6] {};
+    };
+    std::vector<AdditionalRigid> m_additional;
+
     // Body 1's matrix in scalar CSR form.
     std::vector<int> m_csrRowPtr;
     std::vector<int> m_csrColumns;
@@ -206,6 +241,7 @@ private:
 
     std::unique_ptr<CpuReference> m_cpu;
     std::ofstream m_compareStream;
+    std::ofstream m_dumpStream;
     int m_contactSteps { 0 };
     std::set<std::string> m_warnedStages;
 };
