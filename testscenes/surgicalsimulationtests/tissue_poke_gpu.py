@@ -129,7 +129,9 @@ class ConstraintStatsLogger(Sofa.Core.Controller):
     COLUMNS = ["time", "contacts", "rows", "sweeps", "gs_error", "gpu_ms", "normal_impulse",
                "contact_force_x", "contact_force_y", "contact_force_z",
                "rows_ms", "factorize_ms", "compliance_ms", "solve_ms", "correction_ms",
-               "tissue_ms", "tissue_material_ms", "tissue_assembly_ms", "tissue_factorize_ms", "tissue_solve_ms"]
+               "tissue_ms", "tissue_material_ms", "tissue_assembly_ms", "tissue_factorize_ms", "tissue_solve_ms",
+               "warm_started", "contacts_on_tissue_vertices", "contacts_on_tool_vertices",
+               "min_separation_tissue_vertices_m", "min_separation_tool_vertices_m"]
 
     def __init__(self, *args, **kwargs):
         Sofa.Core.Controller.__init__(self, *args, **kwargs)
@@ -153,9 +155,13 @@ class ConstraintStatsLogger(Sofa.Core.Controller):
                 band = int(t.bandwidth.value)
                 print(f"TissuePokeGPU factorisation: {'band, half-bandwidth ' + str(band) if band > 0 else 'dense'}", flush=True)
             tissue = [float(t.stepGpuMilliseconds.value)] + ([float(v) for v in t.stageMilliseconds.value] or [0.0] * 4)
+        sides = list(s.contactSideCounts.value) or [-1, -1]
+        # nan: not measured (only with measureTimes or verifyEvery), or no contact on that side
+        separations = [float(v) if abs(float(v)) < 1.0 else float("nan")
+                       for v in (list(s.contactSideMinSeparation.value) or [float("nan")] * 2)]
         row = [self.root.time.value, s.currentContacts.value, s.currentConstraints.value, s.currentIterations.value,
                s.currentError.value, s.stepGpuMilliseconds.value, s.normalImpulse.value,
-               float(force[0]), float(force[1]), float(force[2])] + [float(v) for v in stages] + tissue
+               float(force[0]), float(force[1]), float(force[2])] + [float(v) for v in stages] + tissue +               [int(s.warmStartedContacts.value), int(sides[0]), int(sides[1])] + separations
         self.csv.write(",".join(f"{v:.9g}" if isinstance(v, float) else str(v) for v in row) + "\n")
         self.csv.flush()
 
@@ -326,7 +332,14 @@ def _build_constraint_scene(root, mesh, probe_mesh, gpu_tissue):
         rigidLinearSolver=probe.linearSolver.getLinkPath(), rigidOdeSolver=probe.odeSolver.getLinkPath(),
         response=RESPONSE, compareWithCpu=COMPARE, compareEvery=COMPARE_EVERY,
         compareFile=os.path.join(pc.default_log_dir(current_dir), LABEL + "_compare.csv"),
-        measureTimes=MEASURE_TIMES, **body1)
+        measureTimes=MEASURE_TIMES,
+        # SOFA_CONTACT_WARM_START, _SOLVER_KERNEL, _SIDES, _VERIFY_EVERY (validation_common.py)
+        warmStart=os.environ.get("SOFA_CONTACT_WARM_START", "1") == "1",
+        solverKernel=os.environ.get("SOFA_CONTACT_SOLVER_KERNEL", "tiled"),
+        contactSides=os.environ.get("SOFA_CONTACT_SIDES", "both"),
+        verifyEvery=int(os.environ.get("SOFA_CONTACT_VERIFY_EVERY", "0")),
+        verifyFile=os.path.join(pc.default_log_dir(current_dir), LABEL + "_contact_verify.csv"),
+        **body1)
     root.addObject(ConstraintStatsLogger(
         name="constraintStats", root=root, solver=solver, tissue_solver=tissue.odeSolver if gpu_tissue else None,
         path=os.path.join(pc.default_log_dir(current_dir), LABEL + "_constraints.csv")))

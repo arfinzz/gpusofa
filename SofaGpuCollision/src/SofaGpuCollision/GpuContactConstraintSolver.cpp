@@ -260,6 +260,26 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
         "points, normal, gap) to this CSV file. Empty: off."))
     , d_measureTimes(initData(&d_measureTimes, false, "measureTimes",
         "Time each GPU stage with CUDA events (adds a synchronisation per stage)."))
+    , d_warmStart(initData(&d_warmStart, true, "warmStart",
+        "Start the Gauss-Seidel from the previous step's multipliers (each contact matched by its body, side and "
+        "anchor vertex, its impulse turned into the new contact frame) instead of from zero. Same solution, "
+        "fewer sweeps while the contacts persist. Off while compareWithCpu or response='cpu' runs SOFA's "
+        "solver alongside (it starts from zero, and the two must be comparable)."))
+    , d_solverKernel(initData(&d_solverKernel, std::string("tiled"), "solverKernel",
+        "oneBlock: one GPU block walks every contact. tiled: the same Gauss-Seidel (same order and arithmetic) "
+        "on the whole GPU, tiles of contacts solved in turn while every multiprocessor reads W (cooperative "
+        "launch; falls back to oneBlock with exactArithmetic, sor != 1 or no cooperative launch)."))
+    , d_contactSides(initData(&d_contactSides, std::string("both"), "contactSides",
+        "vertexFace filter: which vertices hold contacts. both: body 1's vertices against the tool's faces and "
+        "the tool's vertices against body 1's faces (one touch seen from both sides). deformable: body 1's "
+        "vertices only. rigid: the tool's vertices only. One side is enough when the other surface is smooth "
+        "and finer: a sharp tool edge or corner between body 1's vertices needs 'both'."))
+    , d_verifyEvery(initData(&d_verifyEvery, 0, "verifyEvery",
+        "Check every N-th solved step on the CPU, in double: download W, dfree and lambda, measure the overlap, "
+        "the friction-cone excess, forces on open contacts, and how far one more exact Gauss-Seidel sweep moves "
+        "lambda; write them to verifyFile. 0: off. Slow: for verification runs."))
+    , d_verifyFile(initData(&d_verifyFile, std::string("gpu_constraint_verify.csv"), "verifyFile",
+        "CSV file written when verifyEvery > 0."))
     , d_currentContacts(initData(&d_currentContacts, 0, "currentContacts", "OUTPUT: contacts kept as constraints this step."))
     , d_currentConstraints(initData(&d_currentConstraints, 0, "currentConstraints", "OUTPUT: constraint rows this step."))
     , d_currentIterations(initData(&d_currentIterations, 0, "currentIterations", "OUTPUT: Gauss-Seidel sweeps this step."))
@@ -273,6 +293,15 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
     , d_stageMilliseconds(initData(&d_stageMilliseconds, "stageMilliseconds",
         "OUTPUT: this step's GPU time per stage: rows, factorization, compliance, Gauss-Seidel, correction "
         "(only with measureTimes or compareWithCpu)."))
+    , d_warmStartedContacts(initData(&d_warmStartedContacts, 0, "warmStartedContacts",
+        "OUTPUT: contacts that started from the previous step's multipliers this step (warmStart)."))
+    , d_contactSideCounts(initData(&d_contactSideCounts, "contactSideCounts",
+        "OUTPUT: contacts on body 1's vertices and on the tools' vertices this step (only with measureTimes "
+        "or verifyEvery)."))
+    , d_contactSideMinSeparation(initData(&d_contactSideMinSeparation, "contactSideMinSeparation",
+        "OUTPUT: per side (body 1's vertices, the tools' vertices), the smallest side-aware separation (m) of "
+        "a vertex from its own closest face this collision pass, kept as a contact or not; < 0 = behind the "
+        "other surface (only with measureTimes or verifyEvery)."))
     , l_deformableState(initLink("deformableState", "Body 1: the deformable body's mechanical state (Vec3d)."))
     , l_deformableSurface(initLink("deformableSurface",
         "Body 1's GPU collision surface state (CudaVec3f) with body 1's vertex numbering (IdentityMapping)."))
@@ -302,6 +331,9 @@ GpuContactConstraintSolver::GpuContactConstraintSolver()
     d_rigidContactForce.setReadOnly(true);
     d_stepGpuMilliseconds.setReadOnly(true);
     d_stageMilliseconds.setReadOnly(true);
+    d_warmStartedContacts.setReadOnly(true);
+    d_contactSideCounts.setReadOnly(true);
+    d_contactSideMinSeparation.setReadOnly(true);
 }
 
 GpuContactConstraintSolver::~GpuContactConstraintSolver()
@@ -433,6 +465,31 @@ void GpuContactConstraintSolver::init()
         return;
     }
     if (d_response.getValue() == "cpu") m_cpu = std::make_unique<CpuReference>();
+    const std::string& kernel = d_solverKernel.getValue();
+    const std::string& sides = d_contactSides.getValue();
+    if (kernel != "oneBlock" && kernel != "tiled")
+    {
+        msg_error() << "solverKernel must be 'oneBlock' or 'tiled', not '" << kernel << "'.";
+        return;
+    }
+    if (sides != "both" && sides != "deformable" && sides != "rigid")
+    {
+        msg_error() << "contactSides must be 'both', 'deformable' or 'rigid', not '" << sides << "'.";
+        return;
+    }
+    if (d_verifyEvery.getValue() > 0)
+    {
+        m_verifyStream.open(d_verifyFile.getValue());
+        if (!m_verifyStream)
+            msg_warning() << "Could not open " << d_verifyFile.getValue() << "; verifyEvery disabled.";
+        else
+            m_verifyStream <<
+                "time,contacts,rows,sweeps,gpu_error,tolerance,warm_started,tiled,"
+                "check_sweep_error,check_error_over_tolerance,check_max_dlambda_rel,"
+                "max_overlap_m,max_open_gap_with_force_m,min_lambda_n,max_cone_excess_rel,max_stick_slip_m,"
+                "lambda_n_sum,lambda_t_sum,reference_sweeps,reference_converged,distance_to_reference_m,"
+                "normal_impulse_error_rel\n";
+    }
     if (d_compareWithCpu.getValue())
     {
         m_compareStream.open(d_compareFile.getValue());
@@ -783,6 +840,8 @@ bool GpuContactConstraintSolver::buildSystem(const sofa::core::ConstraintParams*
                                                        : backend::ConstraintContactFilter::VertexFace;
     input.vertexConeFilter = d_vertexConeFilter.getValue();
     input.vertexConeTolerance = static_cast<float>(d_vertexConeTolerance.getValue());
+    input.contactSides = d_contactSides.getValue() == "deformable" ? 1u : (d_contactSides.getValue() == "rigid" ? 2u : 3u);
+    input.countSides = timing || m_verifyStream.is_open();
     for (std::size_t b = 0; b < m_additional.size(); ++b)
     {
         auto* state = l_additionalRigidStates.get(b);
@@ -809,6 +868,11 @@ bool GpuContactConstraintSolver::buildSystem(const sofa::core::ConstraintParams*
     }
     d_currentContacts.setValue(static_cast<int>(m_buildStats.contacts));
     d_currentConstraints.setValue(static_cast<int>(m_buildStats.rows));
+    if (input.countSides)
+    {
+        d_contactSideCounts.setValue({ static_cast<int>(m_buildStats.deformableAnchored), static_cast<int>(m_buildStats.rigidAnchored) });
+        d_contactSideMinSeparation.setValue({ m_buildStats.deformableMinSeparation, m_buildStats.rigidMinSeparation });
+    }
     if (m_buildStats.rows == 0) return true;
 
     m_factorDeformable = correctionFactor(deformableOde(), cParams->constOrder());
@@ -846,6 +910,7 @@ bool GpuContactConstraintSolver::solveSystem(const sofa::core::ConstraintParams*
 {
     d_currentIterations.setValue(0);
     d_currentError.setValue(0.0);
+    d_warmStartedContacts.setValue(0);
     if (!m_haveRows) return true;
 
     const bool timing = d_measureTimes.getValue() || m_compareStream.is_open();
@@ -856,6 +921,10 @@ bool GpuContactConstraintSolver::solveSystem(const sofa::core::ConstraintParams*
     config.allVerified = d_allVerified.getValue();
     config.sor = d_sor.getValue();
     config.doubleAccumulation = d_exactArithmetic.getValue();
+    // SOFA's CPU pipeline, when it runs alongside, solves from zero: so must the GPU, to compare.
+    config.warmStart = d_warmStart.getValue() && !m_compareStream.is_open() && d_response.getValue() != "cpu";
+    config.kernel = d_solverKernel.getValue() == "tiled" ? backend::ConstraintSolverKernel::Tiled
+                                                         : backend::ConstraintSolverKernel::OneBlock;
     std::string diagnostic;
     if (!backend::solveContactConstraints(m_workspace, config, &m_solveStats, timing ? &m_timings : nullptr, diagnostic))
     {
@@ -865,7 +934,171 @@ bool GpuContactConstraintSolver::solveSystem(const sofa::core::ConstraintParams*
     m_solved = true;
     d_currentIterations.setValue(m_solveStats.iterations);
     d_currentError.setValue(m_solveStats.error);
+    d_warmStartedContacts.setValue(m_solveStats.warmStarted);
+    ++m_solvedSteps;
+    if (m_verifyStream.is_open() && (m_solvedSteps - 1) % std::max(1, d_verifyEvery.getValue()) == 0)
+    {
+        const double tolerance = (config.scaleTolerance && !config.allVerified)
+            ? config.tolerance * static_cast<double>(m_buildStats.rows) : config.tolerance;
+        verifySolution(tolerance);
+    }
     return true;
+}
+
+void GpuContactConstraintSolver::verifySolution(const double tolerance)
+{
+    // Independent of the GPU kernels: W, dfree and lambda as the GPU left them, and every
+    // check in double on the CPU. d = dfree + W lambda is each row's violation after the
+    // correction (normal: the gap kept beyond contactDistance, > 0 = apart; tangents: the
+    // slip). A solution of SOFA's contact problem has, per contact: d_n >= 0, lambda_n >= 0,
+    // lambda_n = 0 where d_n > 0; |lambda_t| <= mu lambda_n, and d_t = 0 while it sticks.
+    backend::ConstraintProblemSnapshot snap;
+    std::string diagnostic;
+    if (!backend::downloadContactProblem(m_workspace, true, snap, diagnostic))
+    {
+        reportFailure("verify", diagnostic, "this step is not checked");
+        return;
+    }
+    const int rows = static_cast<int>(snap.rows);
+    const int rpc = static_cast<int>(snap.rowsPerContact);
+    const int contacts = static_cast<int>(snap.contacts);
+    if (rows == 0 || snap.compliance.size() != static_cast<std::size_t>(rows) * rows || snap.lambda.size() != static_cast<std::size_t>(rows))
+        return;
+    const double mu = snap.friction;
+    const std::vector<double>& W = snap.compliance;
+    auto w = [&](int i, int j) { return W[static_cast<std::size_t>(i) * rows + j]; };
+    std::vector<double> lambda = snap.lambda;
+    std::vector<double> d(rows);
+    for (int i = 0; i < rows; ++i)
+    {
+        double sum = snap.dfree[i];
+        for (int k = 0; k < rows; ++k) sum += w(i, k) * lambda[k];
+        d[i] = sum;
+    }
+
+    double maxOverlap = 0.0, maxOpenGap = 0.0, minLambdaN = 0.0, maxConeExcess = 0.0, maxStickSlip = 0.0;
+    double lambdaNSum = 0.0, lambdaTSum = 0.0, maxLambdaN = 0.0;
+    for (int c = 0; c < contacts; ++c)
+    {
+        const int j = c * rpc;
+        maxLambdaN = std::max(maxLambdaN, lambda[j]);
+    }
+    const double forceFloor = 1e-6 * std::max(maxLambdaN, 1e-300);   // "carries a force"
+    for (int c = 0; c < contacts; ++c)
+    {
+        const int j = c * rpc;
+        const double ln = lambda[j];
+        lambdaNSum += ln;
+        minLambdaN = std::min(minLambdaN, ln);
+        maxOverlap = std::max(maxOverlap, -d[j]);
+        if (ln > forceFloor) maxOpenGap = std::max(maxOpenGap, d[j]);
+        if (rpc == 3)
+        {
+            const double lt = std::sqrt(lambda[j + 1] * lambda[j + 1] + lambda[j + 2] * lambda[j + 2]);
+            lambdaTSum += lt;
+            if (ln > forceFloor)
+            {
+                maxConeExcess = std::max(maxConeExcess, (lt - mu * ln) / (mu * ln));
+                if (lt < mu * ln * (1.0 - 1e-3))   // sticking: no slip
+                    maxStickSlip = std::max(maxStickSlip, std::sqrt(d[j + 1] * d[j + 1] + d[j + 2] * d[j + 2]));
+            }
+        }
+    }
+
+    // SOFA's Gauss-Seidel in double (BlockGaussSeidelConstraintSolver with
+    // UnilateralConstraintResolution(WithFriction)), from this lambda. The first sweep's
+    // error is SOFA's convergence measure (at a solution it hardly moves); the sweeps
+    // then go on to a tolerance 10^5 times tighter (at most 2,000), a reference
+    // solution: how far d is from it says how far the GPU stopped from the solution.
+    const std::vector<double> dGpu = d;
+    std::vector<double> columns(W.size());   // W transposed: each column contiguous, for the updates of d
+    for (int i = 0; i < rows; ++i)
+        for (int k = 0; k < rows; ++k) columns[static_cast<std::size_t>(k) * rows + i] = w(i, k);
+    double sweepError = 0.0, maxDelta = 0.0, maxLambda = 0.0;
+    for (double v : lambda) maxLambda = std::max(maxLambda, std::abs(v));
+    double firstSweepError = 0.0, firstMaxDelta = 0.0;
+    int referenceSweeps = 0;
+    bool referenceConverged = false;
+    for (; referenceSweeps < 2000 && !referenceConverged; ++referenceSweeps)
+    {
+        sweepError = 0.0;
+        maxDelta = 0.0;
+        for (int c = 0; c < contacts; ++c)
+        {
+            const int j = c * rpc;
+            double old[3] = { lambda[j], 0.0, 0.0 };
+            double dd[3] = { d[j], 0.0, 0.0 };
+            double nw[3] = { 0.0, 0.0, 0.0 };
+            if (rpc == 3)
+            {
+                old[1] = lambda[j + 1]; old[2] = lambda[j + 2];
+                dd[1] = d[j + 1]; dd[2] = d[j + 2];
+                double fn = old[0] - dd[0] / w(j, j);
+                double ft = old[1], fs = old[2];
+                if (fn < 0.0)
+                {
+                    fn = 0.0; ft = 0.0; fs = 0.0;
+                }
+                else
+                {
+                    dd[1] += w(j, j + 1) * (fn - old[0]);
+                    dd[2] += w(j, j + 2) * (fn - old[0]);
+                    ft -= 2.0 * dd[1] / (w(j + 1, j + 1) + w(j + 2, j + 2));
+                    fs -= 2.0 * dd[2] / (w(j + 1, j + 1) + w(j + 2, j + 2));
+                    const double norm = std::sqrt(ft * ft + fs * fs);
+                    if (norm > mu * fn)
+                    {
+                        ft *= mu * fn / norm;
+                        fs *= mu * fn / norm;
+                    }
+                }
+                nw[0] = fn; nw[1] = ft; nw[2] = fs;
+            }
+            else
+            {
+                nw[0] = std::max(0.0, old[0] - dd[0] / w(j, j));
+            }
+            double delta[3] = { nw[0] - old[0], nw[1] - old[1], nw[2] - old[2] };
+            for (int l = 0; l < rpc; ++l)
+            {
+                double lineSq = 0.0;
+                for (int m = 0; m < rpc; ++m)
+                {
+                    const double e = w(j + l, j + m) * delta[m];
+                    lineSq += e * e;
+                }
+                sweepError += std::sqrt(lineSq);
+                maxDelta = std::max(maxDelta, std::abs(delta[l]));
+            }
+            for (int m = 0; m < rpc; ++m)
+            {
+                if (delta[m] == 0.0) continue;
+                lambda[j + m] = nw[m];
+                const double* column = columns.data() + static_cast<std::size_t>(j + m) * rows;
+                for (int i = 0; i < rows; ++i) d[i] += column[i] * delta[m];
+            }
+        }
+        if (referenceSweeps == 0)
+        {
+            firstSweepError = sweepError;
+            firstMaxDelta = maxDelta;
+        }
+        referenceConverged = sweepError < 1e-5 * tolerance;
+    }
+    double distanceToReference = 0.0, referenceNormalSum = 0.0;
+    for (int i = 0; i < rows; ++i) distanceToReference = std::max(distanceToReference, std::abs(dGpu[i] - d[i]));
+    for (int c = 0; c < contacts; ++c) referenceNormalSum += lambda[c * rpc];
+    sweepError = firstSweepError;
+    maxDelta = firstMaxDelta;
+
+    m_verifyStream << this->getContext()->getTime() << ',' << contacts << ',' << rows << ',' << m_solveStats.iterations << ','
+                   << m_solveStats.error << ',' << tolerance << ',' << m_solveStats.warmStarted << ','
+                   << (m_solveStats.tiled ? 1 : 0) << ',' << sweepError << ',' << sweepError / std::max(tolerance, 1e-300) << ','
+                   << maxDelta / std::max(maxLambda, 1e-300) << ',' << maxOverlap << ',' << maxOpenGap << ',' << minLambdaN << ','
+                   << maxConeExcess << ',' << maxStickSlip << ',' << lambdaNSum << ',' << lambdaTSum << ','
+                   << referenceSweeps << ',' << (referenceConverged ? 1 : 0) << ',' << distanceToReference << ','
+                   << std::abs(lambdaNSum - referenceNormalSum) / std::max(std::abs(referenceNormalSum), 1e-300) << '\n';
+    m_verifyStream.flush();
 }
 
 bool GpuContactConstraintSolver::applyCorrection(const sofa::core::ConstraintParams* cParams, sofa::core::MultiVecId res1, sofa::core::MultiVecId res2)

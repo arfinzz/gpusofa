@@ -365,7 +365,7 @@ bool downloadContactProblem(ConstraintWorkspace*, bool, ConstraintProblemSnapsho
 
 bool solveFrictionProblemOnGpu(int, int, const std::vector<double>&, const std::vector<double>&, double,
                                const ConstraintSolveConfig&, std::vector<double>& lambda, ConstraintSolveStats* stats,
-                               std::string& diagnostic)
+                               std::string& diagnostic, const std::vector<double>*)
 {
     lambda.clear();
     if (stats != nullptr) *stats = ConstraintSolveStats {};

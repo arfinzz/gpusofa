@@ -843,6 +843,14 @@ struct ConstraintBuildInput
     // LocalMinDistance filters its point contacts); tolerance = cosine margin.
     bool vertexConeFilter { true };
     float vertexConeTolerance { 0.05f };
+    // VertexFace filter: which anchor vertices may hold a contact. Bit 0: body 1's
+    // vertices against the tool's faces; bit 1: the tool's vertices against body 1's
+    // faces. 3 (both, the default) describes one touch from both sides; 1 keeps one
+    // side only, which is enough when the tool is smooth and finer than body 1's mesh.
+    std::uint8_t contactSides { 3 };
+    // Count the kept contacts per side, and find each side's smallest raw separation
+    // (ConstraintBuildStats; diagnostics, one more read-back).
+    bool countSides { false };
     // More rigid bodies touching body 1 (several tools, or a grasper's two jaws):
     // bodies 1, 2, ... in this order, body 0 being the one above. Each contact pair
     // (body 1, tool) is selected on its own; the rows share body 1's compliance.
@@ -855,6 +863,20 @@ struct ConstraintBuildStats
     std::uint32_t contacts { 0 };           // kept as constraints
     std::uint32_t rows { 0 };
     std::uint32_t touchedVertices { 0 };    // body-1 vertices the rows act on
+    std::uint32_t deformableAnchored { 0 }; // with countSides: contacts on body 1's vertices
+    std::uint32_t rigidAnchored { 0 };      // with countSides: contacts on the tools' vertices
+    // With countSides: per anchor side, the smallest side-aware separation of a vertex from
+    // its own closest face (kept or not); < 0 = a vertex behind the other surface. With
+    // one-sided contacts it shows how far the unconstrained side sinks in.
+    float deformableMinSeparation { 0.0f };
+    float rigidMinSeparation { 0.0f };
+};
+
+// The Gauss-Seidel kernel.
+enum class ConstraintSolverKernel
+{
+    OneBlock = 0,   // one GPU block walks every contact (each dot product split over its threads)
+    Tiled = 1       // the whole GPU: tiles of contacts solved in turn, W read by every multiprocessor
 };
 
 struct ConstraintSolveConfig
@@ -868,6 +890,14 @@ struct ConstraintSolveConfig
     // against SOFA to machine precision); false: float with precomputed
     // per-contact divisors, the fast mode for simulation.
     bool doubleAccumulation { false };
+    // Start from the previous solve's multipliers, matched contact by contact
+    // (body, side, anchor vertex) and turned into the new contact frames, instead of
+    // from zero. The solution is the same fixed point; only the sweeps change.
+    bool warmStart { false };
+    // Tiled runs the same Gauss-Seidel (same order, same local resolution, same error)
+    // on the whole GPU. It needs cooperative launches and float arithmetic; with
+    // doubleAccumulation, sor != 1 or no cooperative launch it falls back to OneBlock.
+    ConstraintSolverKernel kernel { ConstraintSolverKernel::OneBlock };
 };
 
 struct ConstraintSolveStats
@@ -876,6 +906,8 @@ struct ConstraintSolveStats
     double error { 0.0 };
     bool converged { false };
     double gpuMilliseconds { 0.0 };   // the Gauss-Seidel itself (CUDA events), no uploads
+    int warmStarted { 0 };            // contacts that started from the previous solve
+    bool tiled { false };             // the tiled kernel ran
 };
 
 // The built problem, for comparisons with SOFA's CPU pipeline.
@@ -1002,7 +1034,8 @@ SOFA_GPU_COLLISION_API bool downloadDeformableCorrection(
     ConstraintWorkspace* workspace, std::vector<float>& correction, std::string& diagnostic);
 
 // Standalone pieces, for the checks in the test program:
-// the Gauss-Seidel solver on a given problem (W row-major rows x rows) ...
+// the Gauss-Seidel solver on a given problem (W row-major rows x rows), starting
+// from initialLambda when given (rows values; else from zero) ...
 SOFA_GPU_COLLISION_API bool solveFrictionProblemOnGpu(
     int rows,
     int rowsPerContact,
@@ -1012,7 +1045,8 @@ SOFA_GPU_COLLISION_API bool solveFrictionProblemOnGpu(
     const ConstraintSolveConfig& config,
     std::vector<double>& lambda,
     ConstraintSolveStats* stats,
-    std::string& diagnostic);
+    std::string& diagnostic,
+    const std::vector<double>* initialLambda = nullptr);
 
 // ... and the block of A^-1 on the given vertices' DOFs (3*count square,
 // column-major), through the same Cholesky + triangular solve + product.

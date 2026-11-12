@@ -11,6 +11,14 @@
 //       (float) against a double-precision CPU factorisation (Eigen
 //       SimplicialLDLT) of the same sparse matrix: an FEM-like 3D grid matrix the
 //       size of the tissue-poke block.
+//   C3  tiled kernel. The whole-GPU Gauss-Seidel against the one-block kernel and
+//       SOFA on C1's problems (plus bigger ones): the same sweeps, the same
+//       multipliers and violations to float accuracy, and the same answer twice.
+//   C4  warm start. The next step's problem (dfree moved a little) solved from zero
+//       and from the previous solution, on the GPU (both kernels) and in SOFA
+//       (started from the same values). The GPU must follow SOFA from either start;
+//       both starts are measured against a reference solved 10^5 times tighter (the
+//       stopping rule bounds the change per sweep, not the distance to the solution).
 //
 // Prints one line per case, then C1/C2 PASS or FAIL. Exit code 0 = all passed.
 
@@ -159,7 +167,8 @@ struct SofaSolveResult
 
 SofaSolveResult solveWithSofa(BlockGaussSeidelConstraintSolver* solver, int rows, int rowsPerContact, double mu,
                               const std::vector<double>& W, const std::vector<double>& dfree,
-                              const backend::ConstraintSolveConfig& config)
+                              const backend::ConstraintSolveConfig& config,
+                              const std::vector<double>* initial = nullptr)
 {
     GenericConstraintProblem problem(solver);
     problem.clear(rows);
@@ -167,7 +176,7 @@ SofaSolveResult solveWithSofa(BlockGaussSeidelConstraintSolver* solver, int rows
     {
         for (int j = 0; j < rows; ++j) problem.W.set(i, j, W[static_cast<std::size_t>(i) * rows + j]);
         problem.dFree.set(i, dfree[i]);
-        problem.f.set(i, 0.0);
+        problem.f.set(i, initial != nullptr ? (*initial)[i] : 0.0);
     }
     for (int i = 0; i < rows; i += rowsPerContact)
     {
@@ -436,6 +445,172 @@ bool runC2(const bool cadence)
     return pass;
 }
 
+// ---------------------------------------------------------------------------
+// C3: the tiled kernel (whole GPU) against the one-block kernel and SOFA.
+// ---------------------------------------------------------------------------
+bool runC3()
+{
+    const FrictionCase cases[] = {
+        { "frictionless",          60, 0.0, false, 11u },
+        { "mu=0.1",                60, 0.1, false, 12u },
+        { "mu=0.8",                60, 0.8, false, 13u },
+        { "mu=0.1 redundant",      90, 0.1, true,  14u },
+        { "mu=0.1 400 contacts",  400, 0.1, false, 15u },
+        { "mu=0.1 800 contacts",  800, 0.1, false, 16u },
+        { "frictionless 1000",   1000, 0.0, false, 18u },
+        { "mu=0.1 1600 contacts", 1600, 0.1, false, 17u },
+    };
+    auto sofaSolver = sofa::core::objectmodel::New<BlockGaussSeidelConstraintSolver>();
+    bool allPassed = true;
+    for (const FrictionCase& fc : cases)
+    {
+        int rows = 0;
+        std::vector<double> W, dfree;
+        buildFrictionProblem(fc, rows, W, dfree);
+        const int rowsPerContact = fc.mu > 0.0 ? 3 : 1;
+        backend::ConstraintSolveConfig config;
+        config.maxIterations = 1000;
+        config.tolerance = 1.0e-6;
+        config.scaleTolerance = true;
+        const SofaSolveResult sofa = solveWithSofa(sofaSolver.get(), rows, rowsPerContact, fc.mu, W, dfree, config);
+
+        std::vector<double> lambdaOne, lambdaTiled, lambdaTiled2;
+        backend::ConstraintSolveStats one, tiled, tiled2;
+        std::string diagnostic;
+        config.kernel = backend::ConstraintSolverKernel::OneBlock;
+        bool ok = backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, dfree, fc.mu, config, lambdaOne, &one, diagnostic);
+        config.kernel = backend::ConstraintSolverKernel::Tiled;
+        ok = ok && backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, dfree, fc.mu, config, lambdaTiled, &tiled, diagnostic);
+        ok = ok && backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, dfree, fc.mu, config, lambdaTiled2, &tiled2, diagnostic);
+        if (!ok)
+        {
+            std::cout << "C3 " << fc.name << ": GPU solve failed: " << diagnostic << "\n";
+            return false;
+        }
+        const double scale = std::max(maxAbs(sofa.lambda), 1e-30);
+        const double tiledVsOne = maxAbsDiff(lambdaTiled, lambdaOne) / scale;
+        const double tiledVsSofa = maxAbsDiff(lambdaTiled, sofa.lambda) / scale;
+        const double violationDiff = maxAbsDiff(violations(rows, W, dfree, lambdaTiled), violations(rows, W, dfree, sofa.lambda)) /
+                                     std::max(maxAbs(dfree), 1e-30);
+        const bool repeatable = lambdaTiled == lambdaTiled2 && tiled.iterations == tiled2.iterations;
+        const int sofaSweeps = sofa.iterations - 1;
+        const int sweepSlack = std::max(2, one.iterations / 20);
+        const bool pass = tiled.tiled && tiled.converged == one.converged && repeatable &&
+                          std::abs(tiled.iterations - one.iterations) <= sweepSlack &&
+                          std::abs(tiled.iterations - sofaSweeps) <= std::max(3, sofaSweeps / 5) &&
+                          tiledVsSofa < 1e-3 && violationDiff < 1e-4;
+        allPassed = allPassed && pass;
+        std::printf("C3 %-20s rows=%4d  sweeps one-block=%4d tiled=%4d sofa=%4d  lambda_rel tiled-one=%.2e tiled-sofa=%.2e  "
+                    "violation_diff=%.2e  repeatable=%s  gpu one-block=%7.2f ms tiled=%7.2f ms (x%.1f) %s\n",
+                    fc.name, rows, one.iterations, tiled.iterations, sofaSweeps, tiledVsOne, tiledVsSofa, violationDiff,
+                    repeatable ? "yes" : "NO", one.gpuMilliseconds, tiled.gpuMilliseconds,
+                    one.gpuMilliseconds / std::max(tiled.gpuMilliseconds, 1e-9), pass ? "[ok]" : "[MISMATCH]");
+    }
+    std::printf("C3_TILED_KERNEL=%s\n", allPassed ? "PASS" : "FAIL");
+    return allPassed;
+}
+
+// ---------------------------------------------------------------------------
+// C4: warm start. The problem of the step after: the same W, dfree moved a little (as
+// contacts move between steps). Pass: from either start the GPU follows SOFA started
+// the same way (same sweeps, same multipliers), and the warm start needs no more
+// sweeps. Reported: how far each start stops from a reference solved 10^5 times
+// tighter (GPU, double), in the violations (unique even when the multipliers are not).
+// ---------------------------------------------------------------------------
+bool runC4()
+{
+    const FrictionCase cases[] = {
+        { "frictionless",          60, 0.0, false, 21u },
+        { "mu=0.1",                60, 0.1, false, 22u },
+        { "mu=0.8",                60, 0.8, false, 23u },
+        { "mu=0.1 redundant",      90, 0.1, true,  24u },
+        { "mu=0.1 800 contacts",  800, 0.1, false, 26u },
+        { "mu=0.1 1600 contacts", 1600, 0.1, false, 27u },
+    };
+    auto sofaSolver = sofa::core::objectmodel::New<BlockGaussSeidelConstraintSolver>();
+    bool allPassed = true;
+    for (const FrictionCase& fc : cases)
+    {
+        int rows = 0;
+        std::vector<double> W, dfree;
+        buildFrictionProblem(fc, rows, W, dfree);
+        const int rowsPerContact = fc.mu > 0.0 ? 3 : 1;
+        backend::ConstraintSolveConfig config;
+        config.maxIterations = 1000;
+        config.tolerance = 1.0e-6;
+        std::string diagnostic;
+        std::vector<double> previous;
+        backend::ConstraintSolveStats stats;
+        if (!backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, dfree, fc.mu, config, previous, &stats, diagnostic))
+        {
+            std::cout << "C4 " << fc.name << ": GPU solve failed: " << diagnostic << "\n";
+            return false;
+        }
+        // The next step: every free violation moved by up to 2% of its range.
+        std::mt19937 rng(fc.seed + 1000u);
+        std::uniform_real_distribution<double> uni(-1.0, 1.0);
+        const double range = std::max(maxAbs(dfree), 1e-30);
+        std::vector<double> next(dfree);
+        for (double& d : next) d = static_cast<double>(static_cast<float>(d + 0.02 * range * uni(rng)));
+
+        const SofaSolveResult sofaCold = solveWithSofa(sofaSolver.get(), rows, rowsPerContact, fc.mu, W, next, config);
+        const SofaSolveResult sofaWarm = solveWithSofa(sofaSolver.get(), rows, rowsPerContact, fc.mu, W, next, config, &previous);
+        // The reference: double arithmetic, tolerance 10^5 times tighter.
+        backend::ConstraintSolveConfig tight = config;
+        tight.doubleAccumulation = true;
+        tight.tolerance = config.tolerance * 1e-5;
+        tight.maxIterations = 100000;
+        std::vector<double> reference;
+        backend::ConstraintSolveStats referenceStats;
+        if (!backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, next, fc.mu, tight, reference, &referenceStats, diagnostic))
+        {
+            std::cout << "C4 " << fc.name << ": reference solve failed: " << diagnostic << "\n";
+            return false;
+        }
+        const std::vector<double> dReference = violations(rows, W, next, reference);
+        const double dScale = std::max(maxAbs(next), 1e-30);
+        const double sofaColdError = maxAbsDiff(violations(rows, W, next, sofaCold.lambda), dReference) / dScale;
+        const double sofaWarmError = maxAbsDiff(violations(rows, W, next, sofaWarm.lambda), dReference) / dScale;
+        std::printf("C4 %-20s rows=%4d reference: %d sweeps (converged=%s); SOFA stops from zero %.2e and warm %.2e from it\n",
+                    fc.name, rows, referenceStats.iterations, referenceStats.converged ? "yes" : "NO", sofaColdError, sofaWarmError);
+        bool casePassed = true;
+        for (const auto kernel : { backend::ConstraintSolverKernel::OneBlock, backend::ConstraintSolverKernel::Tiled })
+        {
+            config.kernel = kernel;
+            std::vector<double> cold, warm;
+            backend::ConstraintSolveStats coldStats, warmStats;
+            bool ok = backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, next, fc.mu, config, cold, &coldStats, diagnostic);
+            ok = ok && backend::solveFrictionProblemOnGpu(rows, rowsPerContact, W, next, fc.mu, config, warm, &warmStats, diagnostic,
+                                                          &previous);
+            if (!ok)
+            {
+                std::cout << "C4 " << fc.name << ": GPU solve failed: " << diagnostic << "\n";
+                return false;
+            }
+            const double coldVsSofa = maxAbsDiff(violations(rows, W, next, cold), violations(rows, W, next, sofaCold.lambda)) / dScale;
+            const double warmVsSofa = maxAbsDiff(violations(rows, W, next, warm), violations(rows, W, next, sofaWarm.lambda)) / dScale;
+            const double warmLambdaVsSofa = maxAbsDiff(warm, sofaWarm.lambda) / std::max(maxAbs(sofaWarm.lambda), 1e-30);
+            const double coldError = maxAbsDiff(violations(rows, W, next, cold), dReference) / dScale;
+            const double warmError = maxAbsDiff(violations(rows, W, next, warm), dReference) / dScale;
+            const int sofaColdSweeps = sofaCold.iterations - 1;
+            const int sofaWarmSweeps = sofaWarm.iterations - 1;
+            const bool pass = coldVsSofa < 1e-4 && warmVsSofa < 1e-4 && warmLambdaVsSofa < 1e-3 && warmStats.converged &&
+                              warmStats.iterations <= coldStats.iterations &&
+                              std::abs(coldStats.iterations - sofaColdSweeps) <= std::max(3, sofaColdSweeps / 5) &&
+                              std::abs(warmStats.iterations - sofaWarmSweeps) <= std::max(3, sofaWarmSweeps / 5);
+            casePassed = casePassed && pass;
+            std::printf("C4 %-20s rows=%4d %-9s sweeps cold=%4d warm=%4d (sofa %4d / %4d)  gpu-vs-sofa violations cold=%.2e "
+                        "warm=%.2e  distance to reference cold=%.2e warm=%.2e  gpu cold=%7.2f ms warm=%7.2f ms %s\n",
+                        fc.name, rows, kernel == backend::ConstraintSolverKernel::Tiled ? "tiled" : "one-block",
+                        coldStats.iterations, warmStats.iterations, sofaColdSweeps, sofaWarmSweeps, coldVsSofa, warmVsSofa,
+                        coldError, warmError, coldStats.gpuMilliseconds, warmStats.gpuMilliseconds, pass ? "[ok]" : "[MISMATCH]");
+        }
+        allPassed = allPassed && casePassed;
+    }
+    std::printf("C4_WARM_START=%s\n", allPassed ? "PASS" : "FAIL");
+    return allPassed;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -445,9 +620,14 @@ int main(int argc, char** argv)
     std::cout << "GPU contact constraints vs SOFA CPU, identical inputs\n";
     const bool c1 = runC1();
     const bool c2 = runC2(cadence);
-    std::cout << "CONSTRAINT_CHECKS=" << ((c1 && c2) ? "PASS" : "FAIL") << "\n"
+    const bool c3 = runC3();
+    const bool c4 = runC4();
+    const bool all = c1 && c2 && c3 && c4;
+    std::cout << "CONSTRAINT_CHECKS=" << (all ? "PASS" : "FAIL") << "\n"
               << "  C1 = GPU block Gauss-Seidel with friction vs SOFA's BlockGaussSeidelConstraintSolver\n"
               << "       (same W, dfree, mu, tolerance): multipliers and final violations\n"
-              << "  C2 = GPU dense Cholesky compliance (float) vs CPU LDL^T (double) on an FEM-like matrix\n";
-    return (c1 && c2) ? 0 : 1;
+              << "  C2 = GPU dense Cholesky compliance (float) vs CPU LDL^T (double) on an FEM-like matrix\n"
+              << "  C3 = tiled (whole-GPU) Gauss-Seidel vs the one-block kernel and SOFA: sweeps, multipliers, violations\n"
+              << "  C4 = warm start vs a cold start, on the GPU and in SOFA: violations and sweeps\n";
+    return all ? 0 : 1;
 }

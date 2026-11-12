@@ -636,11 +636,42 @@ SOFA's own constraint contact does. It takes the place of SOFA's constraint solv
    product (cuBLAS); after an LU step, full solves. Each rigid body's 6×6 is inverted on
    the CPU.
 5. **Solve** (GPU). SOFA's block Gauss-Seidel with its friction cone: the same update per
-   contact, the same error measure, the same tolerance scaling and stopping rule. It runs in
-   one GPU block. Single precision by default; `exactArithmetic` switches to SOFA's own
-   double-precision arithmetic, which reproduces SOFA to machine precision.
+   contact, the same error measure, the same tolerance scaling and stopping rule. By default
+   it starts from the previous step's multipliers (warm start) and runs on the whole GPU
+   (tiled kernel); both are described below. Single precision by default;
+   `exactArithmetic` switches to SOFA's own double-precision arithmetic in one GPU block,
+   which reproduces SOFA to machine precision.
 6. **Correction** (GPU). dv = A⁻¹ Jᵀ λ for both bodies, then x = x_free + dt·dv and
    v = v_free + dv, as `LinearSolverConstraintCorrection` does.
+
+**The Gauss-Seidel, step by step.** The unknowns are λ, three per contact (the normal
+push and two friction parts; impulses, force × dt). A sweep visits the contacts in order;
+for contact i it takes the current violation d_i = dfree_i + W_i · λ (with every earlier
+contact's new λ), solves contact i alone with SOFA's rule (push ≥ 0, friction within
+μ × push) and moves on. Sweeps repeat until the change of one sweep, Σ |W_block Δλ|, is
+below tolerance × rows.
+
+- **Warm start** (`warmStart`, default on). The old way began every step at λ = 0 and needed
+  45 to 60 sweeps. Now each solve keeps, per contact, its push as one vector in space
+  (λn n + λt t + λs s) and the contact's identity: its tool, its side and the vertex it
+  sits on, which stay the same from one step to the next even when the contact list is
+  rebuilt, reordered, or its closest face changes. Before the next solve every contact
+  looks its identity up (binary search in the sorted list) and starts from that vector
+  projected on its new normal and tangents, kept ≥ 0 and inside the friction cone. New
+  contacts start at 0; contacts that left are dropped. The solution is the same fixed point
+  within the same tolerance; it takes 4 to 8 sweeps instead of 45 to 60. While SOFA's own
+  solver runs alongside (`compareWithCpu`, `response="cpu"`) the GPU starts from zero too.
+- **Tiled kernel** (`solverKernel="tiled"`, default). The old kernel ran in one GPU block:
+  for each contact, in turn, the block's threads formed W_i · λ over all rows, so one of the
+  GPU's 16 multiprocessors read all of W (16 MB at 2,000 rows) every sweep. The tiled kernel
+  keeps the violations acc = dfree + W λ instead, and splits a sweep into tiles of 96 rows
+  (32 contacts): every multiprocessor computes acc for all rows; then one warp solves the
+  tile's contacts in order, with the tile's 96 × 96 block of W in shared memory, adding
+  each contact's change to the tile's acc (exactly what the next contact's dot product
+  would see); then every multiprocessor adds the tile's changes to the acc of all later
+  rows. Grid-wide syncs (one cooperative launch for the whole solve) separate the parts.
+  Same order, same arithmetic, same sweeps: the same answer up to float rounding. It falls
+  back to the one-block kernel with `exactArithmetic`, `sor` ≠ 1 or no cooperative launch.
 
 **Why the exact compliance, rebuilt every step:** the tissue stiffens under load (Ogden), so
 a compliance worked out once at rest would be wrong in exactly the moments that matter.
@@ -1075,13 +1106,25 @@ How it works and how to set up a scene: [7.8](#78-gpu-constraint-contact-no-over
 | `response` | `gpu` | `cpu` = SOFA's CPU pipeline moves the bodies, on the GPU's contacts. For checking; slow. |
 | `compareWithCpu`, `compareEvery`, `compareFile` | false, 1, `gpu_constraint_compare.csv` | Run SOFA's CPU pipeline alongside every N-th contact step and write the stage-by-stage differences and both sides' times. Slow. |
 | `measureTimes` | false | Time each GPU stage with CUDA events. |
+| `warmStart` | true | Start each Gauss-Seidel from the previous step's multipliers instead of from zero. Each contact is matched by its body, its side and its anchor vertex (so it survives a change of closest face); its impulse is carried into the new contact frame (normal part ≥ 0, tangent part inside the friction cone). Same solution, far fewer sweeps while contacts last ([14.9](#149-contact-solver-ab-warm-start-tiled-kernel-one-sided-contacts)). Off while `compareWithCpu` or `response="cpu"` runs SOFA's solver alongside. |
+| `solverKernel` | `tiled` | `oneBlock`: one GPU block walks every contact. `tiled`: the same Gauss-Seidel (same order, same local resolution, same error) on the whole GPU: the residuals d + Wλ are kept, tiles of 32 contacts are solved in turn by one warp with the tile's part of W in shared memory, and every multiprocessor brings the tile's changes into the later rows (one cooperative launch, grid-wide syncs). Falls back to `oneBlock` with `exactArithmetic`, `sor` ≠ 1 or no cooperative launch. |
+| `contactSides` | `both` | Which vertices hold contacts. `both`: the tissue's vertices against the tool's faces and the tool's vertices against the tissue's faces (one touch seen from both sides). `deformable`: the tissue's vertices only. `rigid`: the tool's only. One side is enough when the other surface is smooth and at least as fine; a sharp tool edge or corner between the tissue's vertices needs `both`. |
+| `verifyEvery`, `verifyFile` | 0, `gpu_constraint_verify.csv` | Check every N-th solve on the CPU in double: W, dfree and λ are downloaded; overlap, pushing while apart, friction beyond the cone, slip while sticking; one more exact Gauss-Seidel sweep (SOFA's error measure) and the distance to a reference solved 10⁵ times tighter. Slow; for verification. |
 
 Outputs (read-only): `currentContacts`, `currentConstraints` (rows), `currentIterations`
 (Gauss-Seidel sweeps), `currentError`, `normalImpulse` (sum of the normal multipliers, in
 N·s), `rigidContactForce` (force and torque on the rigid body, J2ᵀλ/dt),
 `additionalRigidContactForces` (the same for each additional body),
 `stepGpuMilliseconds` and `stageMilliseconds` (rows, factorisation, compliance, solve,
-correction; with `measureTimes`).
+correction; with `measureTimes`), `warmStartedContacts` (contacts started from the
+previous step), and with `measureTimes` or `verifyEvery`: `contactSideCounts` (contacts on
+the tissue's and on the tools' vertices) and `contactSideMinSeparation` (each side's
+closest vertex to the other surface among all vertex-face contacts found, kept or not).
+
+The scenes (the poke, the validation tests, the hard pokes) set the last four settings from
+`SOFA_CONTACT_WARM_START` (default 1), `SOFA_CONTACT_SOLVER_KERNEL` (default `tiled`),
+`SOFA_CONTACT_SIDES` (default `both`) and `SOFA_CONTACT_VERIFY_EVERY` (default 0). The old
+method: `SOFA_CONTACT_WARM_START=0 SOFA_CONTACT_SOLVER_KERNEL=oneBlock`.
 
 ### 9.5 `GpuTissueSolver`
 
@@ -1227,7 +1270,7 @@ Outputs: `removedCount` (tetrahedra removed so far), `removedLastStep`.
 
 ## 10. Test scenes
 
-There are three groups:
+There are four groups:
 
 - **Collision tests**, in `testscenes/collisiondetectiontests/` ([10.1](#101-the-scenes) and
   [10.2](#102-environment-variables-read-by-the-scenes)). They import their geometry from
@@ -1240,6 +1283,9 @@ There are three groups:
 - **Validation tests**, in `testscenes/validationtests/`
   ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)): seven physics tests
   (six with known answers), each run on SOFA's CPU components and on the GPU.
+- **Contact stress tests**, in `testscenes/contactstresstests/`
+  ([10.5](#105-contact-stress-tests-hard-poke)): a big tool pressed hard into a diaphragm-like
+  sheet and into a block, so that hundreds of contacts form, with every clock of the step recorded.
 
 ### 10.1 The scenes
 
@@ -1637,6 +1683,49 @@ sides' time per step, and each test's result against its known answer.
 
 The results are in [14.5](#145-validation-tests).
 
+### 10.5 Contact stress tests (hard poke)
+
+Two scenes in `testscenes/contactstresstests/` push a large tool deep into tissue, so the
+contact patch holds 600 to 700 contacts (about 2,000 constraint rows) instead of the
+poke's 95. They share `hard_poke_common.py` and build their bodies, contact and solvers
+from `validation_common.py`, so they run on the GPU (`SOFA_VALIDATION_SIDE=gpu`, default)
+or on SOFA's CPU components (`cpu`).
+
+| Scene | Tissue | Mesh | Motion |
+|---|---|---|---|
+| `diaphragm_poke.py` | A thin flat sheet, 8 × 8 cm and 4.5 mm thick, clamped on its rim. Muscle-like: Ogden (μ1 20 kPa, α 6, k0 200 kPa) + Maxwell (G1 10 kPa, τ 0.58 s). | 3,844 nodes, 16,200 tetrahedra, 4,320 surface triangles (1.5 mm in the middle, 3 layers) | The sheet sags under its weight; the tool goes from 5 mm above to 20 mm below its undeformed plane, and the sheet wraps around it. |
+| `cuboid_poke.py` | A block, 6 × 6 cm and 3 cm tall, its base fixed. Liver-like: the poke's material. | 4,851 nodes, 24,000 tetrahedra, 3,200 surface triangles (2 mm in the middle) | The tool goes from 5 mm above to 12 mm deep: the whole tip and the start of the shaft sink in. |
+
+- **The tool:** a rigid rod with a hemispherical tip, 8 mm in radius and 30 mm long, finely
+  triangulated (48 segments around, 16 rings on the tip: 818 vertices, 1,632 triangles). It is
+  pulled along its path by a 10,000 N/m spring, which gives the force.
+- **The motion:** settle 0.5 s, press at 20 mm/s, hold 0.5 s, pull back at 20 mm/s, rest
+  0.5 s; time step 0.01 s (400 steps for the diaphragm, 320 for the cuboid).
+- **Contact:** constraints with friction (μ 0.1), contact distance 0.5 mm, alarm distance
+  1.5 mm; the GPU collision has room for 2,000,000 raw contacts.
+- **Settings:** `SOFA_HARD_POKE_FINE_STEP`, `_DEPTH`, `_SPEED`, `_DT`, `_FRICTION`,
+  `_TOOL_RADIUS`, `_TOOL_SEGMENTS`, `_TOOL_RINGS`, `_COUPLING_STIFFNESS`, `_MAX_RAW_CONTACTS`;
+  `SOFA_HARD_POKE_VISUAL=0` leaves out the visual models.
+
+**Run** `bash scripts/run_hard_poke_wsl.sh [diaphragm|cuboid|both] [gpu|cpu]`. Each scene
+runs end to end once per kind of clock, while `nvidia-smi` logs the GPU every 200 ms:
+
+| Run | Clock | What it gives |
+|---|---|---|
+| `plain` | Python's clock, nothing else | The real time per frame (`frame_ms`), and inside SOFA's step (`step_ms`) |
+| `gpuevents` | CUDA events (`SOFA_VALIDATION_MEASURE_TIMES=1`, `SOFA_HARD_POKE_COLLISION_TIMES=1`) | Every GPU stage: the tissue's material, assembly, factorisation and solve; the collision's kernels and its raw contact counts; the contact's rows, W, Gauss-Seidel and correction |
+| `sofatimer` | SOFA's timer (`--computationTimeSampling 1`), waiting for the GPU at each stage | Every SOFA stage of every step, each with its own GPU time |
+| `sofatimer_nosync` | the same with `CUDA_TIMER_SYNC=0` | Where the CPU really waits for the GPU |
+
+**Output** (`output/benchmark_logs/hard_poke_<date>/`): `report.md` (`hard_poke_report.py`:
+every setting, the frame time per phase, every stage per phase and at the step with the
+most contacts, the time against the number of contacts, SOFA's whole timer tree, the GPU's
+clocks and temperature per run), `machine.txt`, `gpu_monitor.csv`, and per scene
+`steps_merged.csv` (one row per step with every clock) and each run's CSVs,
+`_parameters.json` and `_summary.txt`.
+
+The results are in [14.8](#148-hard-poke-hundreds-of-contacts).
+
 ---
 
 ## 11. Scripts
@@ -1652,6 +1741,10 @@ All scripts are run inside WSL from `/home/arfin/gpu-sofa`, for example
 | **Run one scene** | |
 | `run_gpu_resident_scene_wsl.sh [frames]` | Runs the physics scene (default 60 frames) and prints the residency result. |
 | `run_tissue_poke_wsl.sh [cpu\|gpu\|both] [frames]` | Runs the tissue-poke scenes ([10.3](#103-surgical-simulation-tests-tissue-poke)) and prints where each piece ran, any errors, and the summaries. Default: both scenes, the whole poke (820 steps). `view-cpu` or `view-gpu` opens the scene in SOFA's window instead. |
+| `run_hard_poke_wsl.sh [diaphragm\|cuboid\|both] [gpu\|cpu]` | Runs the contact stress tests ([10.5](#105-contact-stress-tests-hard-poke)) once per kind of clock while logging the GPU, then writes `report.md` with `hard_poke_report.py`. About 6 minutes for both scenes on the GPU. |
+| `hard_poke_report.py <log folder>` | Python: the hard-poke report and the per-step CSVs of every clock. |
+| `run_solver_ab_wsl.sh [log folder]` | A/B of the contact solver ([14.9](#149-contact-solver-ab-warm-start-tiled-kernel-one-sided-contacts)): the kernel checks, then the hard pokes and the poke with the old method and each new option (plain runs twice, CUDA events, CPU-checked solutions), then the contact validation tests per option against SOFA. About an hour. |
+| `solver_ab_report.py <log folder>` | Python: the A/B report (`report.md`). |
 | `run_validation_wsl.sh <scene.py> <steps> [cpu\|gpu\|both\|compare]` | Runs one validation test ([10.4](#104-validation-tests-known-answers-sofas-cpu-against-the-gpu)) on SOFA's CPU components, on the GPU, or both; `compare` = the GPU with the stage-by-stage comparison. Prints any errors. |
 | `run_fbp_smoke_test_wsl.sh` | Small sheet scene with proximity on, 20 frames. Fast path by default; add `SOFA_PROXIMITY_READ_CONTACT_COUNTER=1` to see contact counts. |
 | `run_fbp_large_tissue_wsl.sh` | The same for the 79,520-triangle scene. |
@@ -1760,6 +1853,13 @@ solver's two numerical parts against SOFA's CPU code, on identical inputs, witho
   default single-precision mode, to single precision.
 - **C2**: the GPU dense Cholesky compliance against a double-precision LDLᵀ (Eigen) on an
   FEM-like matrix of the poke's size (5,400 unknowns).
+- **C3**: the tiled (whole-GPU) Gauss-Seidel against the one-block kernel and SOFA, on C1's
+  problems plus 1,000 frictionless contacts: the same sweeps, the same multipliers and
+  violations to single precision, and the same answer on a second run.
+- **C4**: the warm start. The next step's problem (dfree moved by up to 2%) solved from zero
+  and from the previous solution, with both kernels and in SOFA started the same way: the
+  GPU must follow SOFA from either start and need no more sweeps warm than cold; both are
+  measured against a reference solved 10⁵ times tighter.
 
 ```bash
 cd /home/arfin/gpu-sofa
@@ -2194,6 +2294,238 @@ meshes):
 - **Only the band storage makes the finest mesh fit**: 37,845 DOFs, whose dense matrix
   would need 5.7 GB on a 4 GB GPU; the band's blocks take about 430 MB.
 
+### 14.7 Where the time goes in one step
+
+Measured on 2026-10-01, on the poke at the mesh sizes of the convergence table above, over
+the first 300 steps (settling, the approach and the first 1.1 s in contact; contact rows
+from about step 187). Three kinds of run:
+
+- **Plain runs** give the time per step a user waits for.
+- **SOFA's own timer** (`runSofa ... --computationTimeSampling 1 -o stdout`) splits every
+  step into SOFA's stages as the CPU sees them. SOFA's CPU scene is measured this way too.
+  SofaCUDA makes this timer wait for the GPU at every stage boundary unless
+  `CUDA_TIMER_SYNC=0` is set; with it set, the stages show where the CPU really waits.
+- **`SOFA_POKE_MEASURE_TIMES=1`** times each GPU stage with CUDA events (the columns of
+  `tissue_poke_gpu_constraints.csv`).
+
+Timing every stage makes the CPU wait at the end of each one, so the stages add up to more
+than a plain run takes: there, part of the GPU's work overlaps the CPU's (the tissue's solve
+runs while the CPU moves the probe and hands out SOFA's events). Plain runs of the same scene
+also differ by 5 to 10% from one run to the next: the laptop's GPU reached 91 °C and slowed
+itself down for heat in 59% of the samples, its clock between 645 and 1,920 MHz.
+Nsight Systems (`nsys`, CUDA API trace; the GPU's own activity can't be traced in this WSL)
+counted the kernel launches and the waits.
+
+**One contact step at 2 mm (the default mesh), in order:**
+
+| Stage | Where | What happens | Time |
+|---|---|---|---:|
+| Move the target | CPU (Python) | `ProbeDriver` sets the probe's target | 0.5 ms |
+| Tissue free motion | GPU | material per tetrahedron, gather, matrix blocks, band Cholesky, solve with one refinement step. The CPU launches about 400 kernels and waits once, for the factorisation's result | 16.5 ms |
+| Probe free motion | CPU | the probe's 6 DOFs (`EulerImplicitSolver` + `SparseLDLSolver`) | 0.3 ms |
+| Collision | GPU | way 6, one CUDA graph; the CPU waits for one count | 0.8 ms |
+| Contact rows | GPU | contacts kept, sorted, 3 rows each; several small waits | 1.2 ms |
+| Compliance W | GPU | band forward solves on the touched DOFs, one product; the probe's 6×6 on the CPU | 2.4 ms |
+| Gauss-Seidel | GPU | one GPU block, 31 sweeps over 285 rows | 4.7 ms |
+| Correction | GPU | dv = A⁻¹Jᵀλ (band solve), positions and velocities corrected; the probe's 6 values back to the CPU | 2.6 ms |
+| Events, loggers, mappings | CPU (SOFA, Python) | SOFA hands 5 events per step to each of the 3 Python controllers; the loggers write their CSV rows | 3.7 ms |
+| | | **Sum (plain runs: 26.8 to 30.2 ms)** | **32.8 ms** |
+
+**The GPU scene's stages as the mesh grows** (milliseconds per step, mean over the steps in
+contact; GPU stages from CUDA events, the rest from SOFA's timer):
+
+| | 3 mm | 2 mm | 1.5 mm | 1 mm | 0.75 mm |
+|---|---:|---:|---:|---:|---:|
+| Nodes / tetrahedra | 726 / 3,000 | 1,800 / 8,232 | 3,610 / 17,496 | 8,125 / 41,472 | 12,615 / 65,856 |
+| Band half-width (block width) | 203 (256) | 365 (384) | 575 (640) | 980 (1,024) | 1,310 (1,408) |
+| Contacts (rows), Gauss-Seidel sweeps | 77 (232), 44 | 95 (285), 31 | 118 (354), 33 | 144 (431), 30 | 176 (528), 28 |
+| Tissue: material + gather | 0.7 | 1.3 | 2.8 | 6.4 | 12.6 |
+| Tissue: matrix assembly | 0.2 | 0.4 | 0.9 | 2.5 | 4.7 |
+| Tissue: band factorisation | 4.2 | 9.7 | 23.6 | 66.1 | 195.2 |
+| Tissue: solve + refinement | 3.3 | 5.1 | 7.3 | 10.8 | 20.1 |
+| Collision | 0.6 | 0.8 | 1.4 | 2.4 | 5.5 |
+| Contact: rows | 1.1 | 1.2 | 1.4 | 1.2 | 1.4 |
+| Contact: compliance W | 1.1 | 2.4 | 5.5 | 14.3 | 43.1 |
+| Contact: Gauss-Seidel | 5.3 | 4.7 | 5.7 | 7.5 | 12.5 |
+| Contact: correction | 1.6 | 2.6 | 3.6 | 5.4 | 10.2 |
+| CPU: SOFA, Python, the probe | 4.0 | 4.5 | 4.0 | 4.0 | 4.3 |
+| **Sum** | 22.1 | 32.7 | 56.2 | 120.5 | 309.6 |
+| **Plain runs, steps in contact** | 21.0 / 18.6 | 30.2 / 28.3 | 52.0 / 53.4 | 134.8 / 121.5 | 312.4 / 309.7 |
+| Plain runs, steps before contact | 10.7 / 11.1 | 20.6 / 18.4 | 35.1 / 35.3 | 93.8 / 90.8 | 239.6 / 238.4 |
+
+Without the timer's waits (`CUDA_TIMER_SYNC=0`), the CPU waits in three places in a 2 mm
+contact step: for the factorisation's result (in the tissue stage, 7 to 10 ms), for the
+narrow phase's count (in collision, 2.1 ms, which also covers the end of the tissue's solve)
+and at the contact stages' read-backs (10.7 ms). Nsight Systems found these waits at 1 mm
+too: 76 ms per step in the band Cholesky, 5.8 ms in the narrow phase.
+
+**The same stages in SOFA's CPU scene** (milliseconds per step in contact; SOFA's timer):
+
+| | 3 mm | 2 mm | 1.5 mm | 1 mm (before contact) |
+|---|---:|---:|---:|---:|
+| Tissue: forces | 5.4 | 13.5 | 25.1 | 58.6 |
+| Tissue: Ogden stiffness (`ComputeRHTerm`) | 828 | 2,088 | 3,909 | 9,286 |
+| Tissue: matrix assembly | 17.0 | 39.5 | 68.7 | 159 |
+| Tissue: LDL factorisation | 18.8 | 134 | 573 | 3,877 |
+| Tissue: solve | 0.8 | 3.1 | 7.7 | 24.3 |
+| Collision (`LocalMinDistance`) | 4.8 | 6.9 | 9.5 | - |
+| Contact: compliance | 12.7 | 54.0 | 259 | - |
+| Contact: Gauss-Seidel | 0.9 | 1.1 | 1.2 | - |
+| Contact: correction | 0.9 | 3.2 | 8.0 | - |
+| SOFA, Python, the probe | 8.8 | 4.5 | 6.2 | 8.6 |
+| **Step** | 900 | 2,354 | 4,882 | 13,526 |
+| Contacts (rows), sweeps | 11 (32), 118 | 12 (37), 177 | 21 (62), 107 | - |
+
+How to read it:
+
+- **On the GPU, the factorisation takes over as the mesh grows**: 19% of a contact step at
+  3 mm, 30% at 2 mm, 42% at 1.5 mm, 55% at 1 mm and 63% at 0.75 mm. The compliance W comes
+  next (5% at 3 mm, 14% at 0.75 mm); the Gauss-Seidel and the CPU's part grow far less
+  than the step.
+- **On small meshes the GPU's step is mostly waiting and launching**: about 4 ms of SOFA and
+  Python work at every size, about 5 ms of Gauss-Seidel in one GPU block, and solves that
+  are chains of small cuBLAS calls. At 3 mm the GPU is slower than SOFA's CPU at the solve
+  (3.3 against 0.8 ms), the Gauss-Seidel (5.3 against 0.9 ms, with 7 times the rows) and the
+  correction (1.6 against 0.9 ms).
+- **SOFA's CPU scene is mostly its Ogden stiffness**: 92% of its step at 3 mm, 89% at 2 mm,
+  80% at 1.5 mm and 69% at 1 mm, where its LDL factorisation (19 ms at 3 mm, 3.9 s at 1 mm)
+  catches up. The GPU computes the same stiffness, with the forces and the matrix, in 0.9 ms
+  at 3 mm and 8.9 ms at 1 mm. The GPU's lead over the whole step (about 45 times at 3 mm, 80
+  at 2 mm, 93 at 1.5 mm and 150 at 1 mm on this day) comes mostly from there; with NeoHookean,
+  SOFA's tissue is 4 to 13 times faster than with its Ogden ([14.6](#146-time-per-step-as-the-scene-grows)).
+- **The laptop's speed changes from day to day**: SOFA's CPU scene took 900 ms per contact
+  step at 3 mm on 2026-10-01 against 668 ms on 2026-09-25, while the GPU scene's times
+  matched within 7%. Compare CPU and GPU times from the same session.
+
+
+### 14.8 Hard poke: hundreds of contacts
+
+The contact stress tests ([10.5](#105-contact-stress-tests-hard-poke)) on 2026-11-12, GPU
+side, `scripts/run_hard_poke_wsl.sh both`. Milliseconds per step, mean over the 0.5 s hold
+at full depth (the most contacts). Stages from the CUDA-event run; frames from the plain run.
+
+| | Diaphragm | Cuboid |
+|---|---:|---:|
+| Mesh (nodes / tetrahedra / surface triangles) | 3,844 / 16,200 / 4,320 | 4,851 / 24,000 / 3,200 |
+| Raw contacts from the collision | 67,168 | 43,707 |
+| Contacts kept (constraint rows) | 652 (1,957) | 691 (2,073) |
+| Gauss-Seidel sweeps | 58 | 65 |
+| Tissue free motion (of which band factorisation) | 31.0 (19.5) | 52.3 (39.0) |
+| Collision, GPU kernels | 3.2 | 2.2 |
+| A. Choose contacts + rows | 1.2 | 1.2 |
+| B. Compliance W | 11.2 | 17.6 |
+| **C. Gauss-Seidel** | **79.0** | **98.6** |
+| D. Correction | 4.2 | 3.8 |
+| Rest: SOFA, Python, the tool's CPU solve, waits | 4.0 | 4.4 |
+| Frame with CUDA events | 133.8 | 180.1 |
+| **Frame, plain run (in hold)** | **130.9** | **170.6** |
+| Frame, plain run, before contact | 33.4 | 52.1 |
+
+What this shows:
+
+- **With many contacts the Gauss-Seidel takes over**: 59% of the diaphragm's frame and 55%
+  of the cuboid's, against about 15% in the poke (95 contacts). Each sweep takes 1.4 to
+  1.5 ms at about 2,000 rows, and 55 to 65 sweeps are needed. The solve runs in **one GPU
+  block** (one of the 16 multiprocessors), which reads the whole W (2,000 × 2,000 floats,
+  16 MB, too big for shared memory) from global memory every sweep. Grouped by rows, its
+  time grows from 0.4 ms (under 500 rows, one sweep) to 14 ms (500 to 1,000), 41 to 43 ms
+  (1,000 to 1,500) and 67 to 97 ms (over 1,500): faster than linear, as both the rows per
+  sweep and the sweeps grow.
+- **The collision stays cheap** even with 44,000 to 67,000 raw contacts per step: 2.2 to
+  3.2 ms. 99% of them are thrown away by the contact solver, which keeps one per vertex.
+- **W grows with the touched vertices** (11 to 18 ms), the rows and the correction stay at
+  1 to 5 ms, and the tissue's step doesn't depend on the contact (31 and 52 ms, mostly its
+  band factorisation).
+- **The frame goes from 33 to 131 ms (diaphragm) and from 52 to 171 ms (cuboid)** when the
+  tool is fully in: 30 to 8 frames per second, and 19 to 6.
+- **The laptop slowed itself down during the cuboid's runs** (86 to 87 °C, slowed for heat in
+  94% of the samples, SM clock 1,390 to 1,520 MHz on average against up to 1,920): its
+  numbers are with a hot GPU. The diaphragm ran cooler (60 to 86 °C).
+
+The whole report, with every phase, SOFA's timer tree with and without its GPU waits, and
+each run's GPU clocks: `output/benchmark_logs/hard_poke_20261112/report.md` (WSL copy) and
+`steps_merged.csv` per scene.
+
+
+### 14.9 Contact solver A/B: warm start, tiled kernel, one-sided contacts
+
+`scripts/run_solver_ab_wsl.sh` on 2026-11-12: the old method (**A**: one GPU block, every
+solve from zero, contacts on both sides) against `warmStart` (**W**), `solverKernel=tiled`
+(**T**), `contactSides=deformable` (**D**) and their combinations, on the two hard pokes
+([10.5](#105-contact-stress-tests-hard-poke)), the tissue poke and the contact validation
+tests. Whole report: `output/benchmark_logs/solver_ab_20261112/report.md`.
+
+**Speed.** Gauss-Seidel (CUDA events, mean over the steps in contact) and the plain runs'
+frame in contact (mean of two runs, the second in reverse order):
+
+| | Diaphragm | Cuboid | Tissue poke |
+|---|---:|---:|---:|
+| Rows, sweeps (A) | 1,517, 45 | 1,634, 49 | 365, 59 |
+| Gauss-Seidel A | 51.8 ms | 75.6 ms | 14.0 ms |
+| Gauss-Seidel W (sweeps) | 7.3 ms (5.9) | 12.3 ms (8.0) | 1.5 ms (3.8) |
+| Gauss-Seidel T | 35.1 ms | 43.4 ms | 9.4 ms |
+| Gauss-Seidel WT | **5.1 ms** | **8.1 ms** | **1.2 ms** |
+| Frame in contact A | 120 ms | 194 ms | 55 ms |
+| Frame in contact WT | **70 ms (×1.72)** | **132 ms (×1.47)** | **36 ms (×1.55)** |
+
+**Correctness.**
+
+- **Kernel checks**: C1 to C4 pass ([section 15](#15-correctness-checks)): the tiled kernel
+  takes SOFA's sweeps and gives its multipliers; the warm start follows SOFA started the
+  same way.
+- **T gives A's answer**: its motion and force differ from A's by no more than A differs
+  from itself between two runs (tool 7 nm, force 0.004% of the peak; the simulation is not
+  bit-reproducible, as atomic sums change order). The solutions checked on the CPU are the
+  same to three digits.
+- **W stops at another point within the tolerance**: force within 0.67% (diaphragm), 0.14%
+  (cuboid) and 0.22% (poke) of the peak, against 0.005 to 0.06% between two A runs. Checked
+  on the CPU, its solutions are as close to a reference solved 10⁵ times tighter as A's
+  (at most 0.03 to 0.04 mm in every scene) and as well converged by SOFA's rule (next-sweep
+  error 0.94 to 1.09 of the tolerance, A 0.98 to 0.99); overlap at most 0.03 mm (A 0.01
+  mm), friction never beyond the cone (1.5e-7). Only about a tenth of the contacts carried
+  a push into the next step (the rest are within the alarm distance with no force and start
+  from zero anyway).
+- **Contact validation tests**: every variant gives the old method's results and SOFA's:
+  incline 10° and 25°, plate force within 0.0005% of the exact answer, grasp at μ 0.25
+  (slips) and 0.5 (lifts), cutting. Every solve of these runs was checked on the CPU.
+- **D is not safe in general.** It cuts the rows by 6 to 26 times (most contacts are on
+  the tool's vertices), but the tool's vertices are then free to sink into the tissue
+  between its vertices. With the 16 mm ball they come to 0.39 mm (diaphragm) and 0.21 mm
+  (cuboid) of the tissue instead of the 0.5 mm kept, and the force changes by 1.5% and
+  5.2%. With the poke's 5 mm probe on a 2 mm mesh **the probe goes through the tissue**:
+  tool vertices more than 1.5 mm deep, the force at 27% of A's. `contactSides` stays `both`
+  by default.
+
+**Gauss-Seidel against the number of contacts.** Every contact step of the three scenes,
+grouped by rows (CUDA events; the time per step, sweeps in brackets):
+
+| Rows | Contacts | Steps | A (old) ms | W ms | T ms | WT ms | A / WT |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1–150 | 34 | 25 | 0.35 (1) | 0.78 (1.0) | 0.42 | **0.78** | ×0.4 |
+| 151–300 | 81 | 74 | 2.27 (14) | 1.21 (4.0) | 1.61 | **1.16** | ×2.0 |
+| 301–450 | 129 | 217 | 13.04 (56) | 1.59 (4.0) | 8.52 | **1.24** | ×10.5 |
+| 451–750 | 161 | 133 | 22.33 (90) | 2.02 (3.4) | 15.41 | **1.82** | ×12.3 |
+| 751–1,050 | 301 | 37 | 21.12 (34) | 4.98 (6.7) | 12.80 | **3.64** | ×5.8 |
+| 1,051–1,350 | 405 | 48 | 38.90 (43) | 8.14 (7.4) | 23.28 | **5.17** | ×7.5 |
+| 1,351–1,650 | 502 | 59 | 51.64 (43) | 11.19 (8.3) | 29.94 | **6.94** | ×7.4 |
+| 1,651–1,950 | 612 | 93 | 75.62 (53) | 15.88 (10.1) | 47.51 | **10.39** | ×7.3 |
+| 1,951–2,200 | 674 | 109 | 95.54 (60) | 7.62 (4.1) | 60.99 | **5.57** | ×17.2 |
+
+- **The old method grows faster than the contacts**: each sweep reads every row of W (so a
+  sweep costs more with every contact: 0.17 ms at 250 rows, 1.6 ms at 2,000) and more
+  contacts need more sweeps (14 at 250 rows, 40 to 60 from 1,000; the tissue poke's steps of
+  300 to 750 rows, its probe pressed into a fine mesh, need up to 90).
+- **The warm start removes most sweeps**: 3 to 10 at every size, fewest while the contacts
+  hold still (4 at full depth, 2,000 rows), most while they move.
+- **The tiled kernel makes each sweep 1.5 to 1.8 times cheaper** from 750 rows on (0.9 ms
+  instead of 1.4 at 1,800 rows).
+- **Below about 150 rows (50 contacts) WT is slower**: one sweep is enough either way, and
+  the warm start's own work (look-up, saving the impulses, one 4-byte read-back) costs about
+  0.4 ms. It matters little: the step there takes 30 to 40 ms.
+
+**Since 2026-11-12, WT is the default** (`warmStart=true`, `solverKernel=tiled`). The
+section 14.4 to 14.8 results were measured with the old method.
+
 ---
 
 ## 15. Correctness checks
@@ -2209,6 +2541,8 @@ meshes):
 | **Gate 2d** | A pair's contacts act only in the collision pass that computed them; after a pass that skipped the pair, its force is exactly 0. | ✅ 30 in its own pass, 0 after. |
 | **C1: constraint solver** | The GPU Gauss-Seidel with friction gives the same answer as SOFA's `BlockGaussSeidelConstraintSolver` on the same problem. | ✅ Exact mode: multipliers within 5e-15 and the same number of sweeps, in all 7 cases (60 to 4,800 rows). Single precision: within 8e-7, same sweeps. |
 | **C2: compliance** | The GPU dense Cholesky compliance equals a double-precision LDLᵀ. | ✅ Within 1e-6 on a 5,400-unknown FEM-like matrix. |
+| **C3: tiled kernel** | The whole-GPU Gauss-Seidel (`solverKernel=tiled`) gives the one-block kernel's and SOFA's answer. | ✅ The same sweeps as both in all 8 cases (60 to 4,800 rows), multipliers within 1.1e-6 of the one-block kernel and 7.4e-7 of SOFA, violations within 1.1e-7, identical on a second run. |
+| **C4: warm start** | Starting from the previous solution (`warmStart`) gives the same solution as starting from zero. | ✅ In all 6 cases, with both kernels, the GPU follows SOFA started the same way: violations within 1.7e-7 and the same sweeps, except the redundant case (rank-deficient W) with the tiled kernel started warm, 3.6e-5 and one sweep more, where float rounding takes another path to the same tolerance and needs as many or fewer sweeps than from zero (41 → 12 on 2,400 rows). Against a reference 10⁵ times tighter, warm and cold stop the same distance from the solution (8.4e-6 and 4.3e-6 on the smallest case; 5.3e-4 and 8.3e-4 on the largest): that distance is set by the stopping rule, not by the start. |
 | **Constraint stages, in the poke** | On every contact step of a whole poke (383 steps), the same contacts give the same rows, violations, W, multipliers and correction through the GPU as through SOFA's CPU pipeline. | ✅ Rows within 2.6e-7, violations 1.4e-9 m, W 8.9e-6 (relative), multipliers 3.8e-5 (3.8e-6 with the same W), the same number of sweeps in 383 of 383 steps, correction within 40 nm (of up to 3.2 mm), force on the probe within 3 µN. With the tissue on the GPU (every 10th contact step, 39 steps): rows 2.3e-7, violations 1.2e-9 m, W 8.7e-6, multipliers 2.9e-5 (2.9e-6 with the same W), the same sweeps in 39 of 39, correction within 13 nm, force within 3 µN. |
 | **Constraint poke, like for like** | A whole poke driven by the GPU response matches one driven by SOFA's CPU response on the same contacts. | ✅ Force within 0.06% of the peak, all along. |
 | **Poke agreement** | The GPU tissue poke matches the CPU one (SOFA's own collision detection and constraint contact) along the whole poke. | ✅ Constraint mode: within 0.6% of the peak force, with the tissue on the CPU or on the GPU. Penalty mode: within about 6%. See [14.4](#144-tissue-poke). |
@@ -2220,7 +2554,7 @@ meshes):
 | **Gate 5** | Nothing is copied from the GPU to the CPU during a frame. | ✅ **Passes in the GPU poke scene** (everything on the GPU): SofaCUDA's copy trace shows 0 state copies either way in every step after the first (240 steps traced, 30 with contact); the plugin itself reads under 200 bytes of numbers per step. ✅ **Passes in the old physics scene**: 0 copies either way in frames 2 to 60 of the copy trace, and no violation in 600 frames of the residency checker. (Before, SOFA's `CollisionPipeline` copied `position` twice a frame to build bounding boxes.) |
 
 Where they run: parity comes from `run_mode_comparison_ab_wsl.sh`, `run_bigcell_parity_wsl.sh`
-and the suite. Gates 1, 1b, 2, 2b, 2c and 2d run in the standalone program; C1 and C2 in
+and the suite. Gates 1, 1b, 2, 2b, 2c and 2d run in the standalone program; C1 to C4 in
 the constraint checks program ([section 12](#12-the-standalone-test-program)). The
 constraint stages come from `SOFA_POKE_RESPONSE=cpu run_tissue_poke_wsl.sh gpu`, whose run
 is also the like-for-like poke. The tissue stages come from
@@ -2324,6 +2658,22 @@ wrong torque ([9.11](#911-gpurigidmapping)).
   because it builds C^(α/2−1) as V D Vᵀ from the general `EigenSolver`'s eigenvectors,
   which are not orthogonal there ([7.9](#79-the-gpu-tissue)). The GPU has the material as
   written. The fix for SOFA is in `patches/SOFA-Ogden-orthonormal-eigenvectors.patch`.
+- **Where the GPU step loses time** (measured stage by stage, [14.7](#147-where-the-time-goes-in-one-step)):
+  - the tissue matrix is factorised from scratch every step, one band block after another
+    (9 to 27 blocks, three library calls each): 30% of a contact step at 2 mm, 63% at
+    0.75 mm, at 2 to 30% of the GPU's peak arithmetic;
+  - the step goes back and forth between the CPU and the GPU: at 2 mm, about 420 kernel
+    launches per step before contact and 590 in contact (16 to 19 µs of CPU time each under
+    WSL), 11 to 17 waits for small read-backs, and the GPU idle while SOFA and Python run;
+  - solves with one right-hand side (the tissue's solve and refinement, the contact's
+    correction) are chains of small cuBLAS calls: 4.9 ms per contact step at 3 mm, 30 ms at
+    0.75 mm, many times what reading the band would take;
+  - the Gauss-Seidel runs in one GPU block: 4.7 to 12.5 ms per contact step;
+  - the compliance's forward solve covers every band block, although its columns are zero
+    above the first touched vertex: 1.1 ms at 3 mm, 43 ms at 0.75 mm;
+  - SOFA hands each event to each Python controller, about 0.14 ms a time even for an empty
+    one: 10 empty controllers made the step 7.9 ms slower, so the scene's 3 controllers cost
+    about 2.4 ms per step.
 - **runSofa 25.12 leaves the camera it makes at the origin.** For a scene without a camera,
   `BaseViewer::load()` creates an `InteractiveCamera` and calls only its `bwdInit()`.
   `BaseCamera::setDefaultView()` moves a camera only if its `init()` ran and found no position,

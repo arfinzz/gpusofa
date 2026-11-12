@@ -40,11 +40,13 @@
 // their order (and with it the Gauss-Seidel sweep order) does not depend on the
 // order the narrow phase happened to emit them in.
 
+#include <cooperative_groups.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <cmath>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#include <thrust/sequence.h>
 #include <thrust/sort.h>
 
 namespace
@@ -293,6 +295,63 @@ __global__ void constraintClaimOwnersKernel(
     }
 }
 
+// A float's order as a signed int (for atomicMin on floats of either sign).
+__device__ __forceinline__ int constraintOrderedFloat(const float f)
+{
+    const int i = __float_as_int(f);
+    return i >= 0 ? i : i ^ 0x7FFFFFFF;
+}
+
+inline float constraintFloatFromOrdered(const int i)
+{
+    const int bits = i >= 0 ? i : i ^ 0x7FFFFFFF;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Diagnostics (countSides): per anchor side (0: body 1's vertices, 1: the tool's), the
+// smallest side-aware separation of each vertex from its own closest face (the contact
+// the claims pick for it, whether or not its side is kept): < 0 = the vertex is behind
+// the other surface. Runs after the claims, before the selection.
+__global__ void constraintRawSeparationKernel(
+    const DeviceProximityContact* __restrict__ contacts,
+    const std::uint32_t* __restrict__ contactCount,
+    const std::uint32_t capacity,
+    const std::uint32_t* __restrict__ firstIndices,
+    const std::uint32_t* __restrict__ secondIndices,
+    const float* __restrict__ firstPositions,
+    const float* __restrict__ secondPositions,
+    const bool swapped,
+    const float contactDistance,
+    const ConstraintVertexCones cones,
+    const unsigned long long* __restrict__ deformableSlots,
+    const unsigned long long* __restrict__ rigidSlots,
+    const std::uint32_t* __restrict__ deformableOwners,
+    const std::uint32_t* __restrict__ rigidOwners,
+    int* __restrict__ minSeparation)
+{
+    const std::uint32_t total = min(*contactCount, capacity);
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride)
+    {
+        const DeviceProximityContact c = contacts[i];
+        if (c.featureKind == 2u) continue;
+        std::uint32_t vertex, tieKey;
+        bool onDeformable;
+        constraintAnchorVertex(c, firstIndices, secondIndices, swapped, vertex, onDeformable, tieKey);
+        const unsigned long long claimed = onDeformable ? deformableSlots[vertex] : rigidSlots[vertex];
+        const std::uint32_t owner = onDeformable ? deformableOwners[vertex] : rigidOwners[vertex];
+        if (claimed != constraintAnchorPriority(c, tieKey) || owner != constraintAnchorOwnKey(c) ||
+            !constraintInVertexCone(c, vertex, cones))
+            continue;
+        float3 direction;
+        float separation;
+        contactSeparation(c, firstPositions, firstIndices, secondPositions, secondIndices, contactDistance, direction, separation);
+        atomicMin(minSeparation + (onDeformable ? 0 : 1), constraintOrderedFloat(separation));
+    }
+}
+
 __global__ void constraintClaimVerticesKernel(
     const DeviceProximityContact* __restrict__ contacts,
     const std::uint32_t* __restrict__ contactCount,
@@ -331,9 +390,11 @@ __global__ void constraintSelectContactsKernel(
     const unsigned long long* __restrict__ rigidSlots,
     const std::uint32_t* __restrict__ deformableOwners,
     const std::uint32_t* __restrict__ rigidOwners,
+    const std::uint32_t sides,                       // bit 0: body-1 vertices, bit 1: tool vertices
     std::uint32_t* __restrict__ selected,
     unsigned long long* __restrict__ sortKeys,
-    std::uint32_t* __restrict__ selectedCount)
+    std::uint32_t* __restrict__ selectedCount,
+    std::uint32_t* __restrict__ sideCounts)          // null, or 2 counters: body-1 anchored, tool anchored
 {
     const std::uint32_t total = min(*contactCount, capacity);
     const std::uint32_t stride = gridDim.x * blockDim.x;
@@ -349,7 +410,8 @@ __global__ void constraintSelectContactsKernel(
             const unsigned long long claimed = onDeformable ? deformableSlots[vertex] : rigidSlots[vertex];
             const std::uint32_t owner = onDeformable ? deformableOwners[vertex] : rigidOwners[vertex];
             keep = (claimed == constraintAnchorPriority(c, tieKey)) && owner == constraintAnchorOwnKey(c) &&
-                   constraintInVertexCone(c, vertex, cones);
+                   constraintInVertexCone(c, vertex, cones) && (sides & (onDeformable ? 1u : 2u)) != 0u;
+            if (keep && sideCounts != nullptr) atomicAdd(sideCounts + (onDeformable ? 0 : 1), 1u);
         }
         if (!keep) continue;
         const std::uint32_t slot = atomicAdd(selectedCount, 1u);
@@ -473,12 +535,25 @@ __global__ void constraintBuildRowsKernel(
     float* __restrict__ dfree,                      // rows
     float* __restrict__ geometry,                   // count*21
     int* __restrict__ contactVertices,              // count*3
-    float* __restrict__ contactWeights)             // count*3
+    float* __restrict__ contactWeights,             // count*3
+    const int bodyIndex,                            // which rigid body (tool) these contacts touch
+    unsigned long long* __restrict__ contactIdentity) // count: (body, side, anchor vertex), for warm starts
 {
     const std::uint32_t stride = gridDim.x * blockDim.x;
     for (std::uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < count; k += stride)
     {
         const DeviceProximityContact c = contacts[selected[k]];
+        {
+            // The same touch keeps this identity from one step to the next even when
+            // its closest face changes; edge-edge contacts (filter 'all') get none that matches.
+            std::uint32_t anchor, tieKey;
+            bool onDeformable;
+            constraintAnchorVertex(c, firstIndices, secondIndices, swapped, anchor, onDeformable, tieKey);
+            contactIdentity[k] = c.featureKind == 2u
+                ? ~0ull
+                : (static_cast<unsigned long long>(bodyIndex & 0xFFFF) << 33) |
+                  (static_cast<unsigned long long>(onDeformable ? 0u : 1u) << 32) | anchor;
+        }
 
         // Direction from the handle's first surface to its second, side-aware.
         float3 direction;
@@ -973,6 +1048,312 @@ __global__ void __launch_bounds__(Threads) constraintGaussSeidelKernel(
     }
 }
 
+// ---- Tiled Gauss-Seidel: the same sweeps on the whole GPU --------------------------
+// A sweep of BlockGaussSeidelConstraintSolver visits the contacts in order and gives
+// each the residual d_j = dfree_j + W_j . lambda, with every earlier contact's new
+// multipliers in lambda. The one-block kernel forms that dot product contact by
+// contact, so a single multiprocessor reads all of W in each sweep. This kernel keeps
+// the residuals instead and splits a sweep into tiles of kTileRows rows:
+//   1. every block: acc = dfree + W lambda for all rows (all of W, once);
+//   2. block 0, warp 0: the tile's contacts in order, with the tile's square of W in
+//      shared memory; each contact's local resolution reads its residual from acc
+//      and adds its change to the tile's residuals, which is exactly what the next
+//      contact's dot product would see;
+//   3. every block: the tile's changes into the residual of every later row.
+// Grid-wide syncs (cooperative launch) separate the steps. The contacts, their order,
+// the local resolution, the error and the stopping rule are the one-block kernel's
+// float mode: the same iterates up to rounding (the sums are taken in another order).
+constexpr int kTileRows = 96;                    // rows per tile: 32 contacts with friction
+constexpr int kTileStride = kTileRows + 1;       // shared column stride: no bank conflicts
+constexpr int kTiledThreads = 256;
+
+inline std::size_t tiledSharedBytes(const int rowsPerContact)
+{
+    return sizeof(float) * (static_cast<std::size_t>(kTileRows) * kTileStride + 3 * kTileRows +
+                            static_cast<std::size_t>(kTileRows / rowsPerContact) * kContactBlockValues);
+}
+
+template <int RowsPerContact>
+__global__ void __launch_bounds__(kTiledThreads) constraintTiledGaussSeidelKernel(
+    const float* __restrict__ W,
+    const float* __restrict__ dfree,
+    const float* __restrict__ blocks,     // contacts * kContactBlockValues
+    const int rows,
+    const float mu,
+    const double tolerance,               // already scaled by rows when SOFA would
+    const int maxIterations,
+    const int allVerified,
+    double* __restrict__ lambda,          // rows: start values in, solution out
+    float* __restrict__ lf,               // rows: the multipliers while solving
+    float* __restrict__ acc,              // rows: dfree + W lambda
+    float* __restrict__ tileDelta,        // kTileRows: the last tile's changes
+    ConstraintSolveState* __restrict__ state)
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ float tiledShared[];
+    float* wT = tiledShared;                                   // [column][row]
+    float* accT = wT + kTileRows * kTileStride;                // the tile's residuals
+    float* lT = accT + kTileRows;                              // the tile's multipliers
+    float* oldT = lT + kTileRows;                              // before the tile; then the changes
+    float* bT = oldT + kTileRows;                              // the tile's contact blocks
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int warpsPerBlock = kTiledThreads / 32;
+    const int globalWarp = blockIdx.x * warpsPerBlock + warp;
+    const int totalWarps = gridDim.x * warpsPerBlock;
+    const int globalThread = blockIdx.x * kTiledThreads + tid;
+    const int totalThreads = gridDim.x * kTiledThreads;
+    const int tiles = (rows + kTileRows - 1) / kTileRows;
+    const float tolF = static_cast<float>(tolerance);
+    volatile ConstraintSolveState* shared = state;
+
+    for (int k = globalThread; k < rows; k += totalThreads) lf[k] = static_cast<float>(lambda[k]);
+    grid.sync();
+
+    while (shared->converged == 0 && shared->iterations < maxIterations)
+    {
+        // 1. acc = dfree + W lf, one warp per row.
+        for (int r = globalWarp; r < rows; r += totalWarps)
+        {
+            const float* wr = W + static_cast<std::size_t>(r) * rows;
+            float sum = 0.0f;
+            for (int k = lane; k < rows; k += 32) sum = fmaf(wr[k], lf[k], sum);
+            sum = constraintWarpSum(sum);
+            if (lane == 0) acc[r] = dfree[r] + sum;
+        }
+        grid.sync();
+
+        float errorF = 0.0f;      // block 0, thread 0
+        bool verified = true;
+        for (int t = 0; t < tiles; ++t)
+        {
+            const int r0 = t * kTileRows;
+            const int nT = min(kTileRows, rows - r0);
+            if (blockIdx.x == 0)
+            {
+                // 2. The tile's contacts, in order.
+                for (int idx = tid; idx < nT * nT; idx += kTiledThreads)
+                {
+                    const int r = idx / nT;
+                    const int col = idx - r * nT;
+                    wT[col * kTileStride + r] = W[static_cast<std::size_t>(r0 + r) * rows + r0 + col];
+                }
+                for (int i = tid; i < nT; i += kTiledThreads)
+                {
+                    accT[i] = acc[r0 + i];
+                    lT[i] = lf[r0 + i];
+                    oldT[i] = lT[i];
+                }
+                const int c0 = r0 / RowsPerContact;
+                const int nc = nT / RowsPerContact;
+                for (int idx = tid; idx < nc * kContactBlockValues; idx += kTiledThreads)
+                    bT[idx] = blocks[static_cast<std::size_t>(c0) * kContactBlockValues + idx];
+                __syncthreads();
+                if (warp == 0)
+                {
+                    for (int c = 0; c < nc; ++c)
+                    {
+                        const int j = c * RowsPerContact;
+                        float delta0 = 0.0f, delta1 = 0.0f, delta2 = 0.0f;
+                        if (lane == 0)
+                        {
+                            // The one-block kernel's float resolution, line for line.
+                            const float* b = bT + c * kContactBlockValues;
+                            const float d0 = accT[j];
+                            const float old0 = lT[j];
+                            float fn = old0 - d0 * b[9];
+                            if (RowsPerContact == 3)
+                            {
+                                float d1 = accT[j + 1], d2 = accT[j + 2];
+                                const float old1 = lT[j + 1], old2 = lT[j + 2];
+                                float ft = old1, fsl = old2;
+                                if (fn < 0.0f)
+                                {
+                                    fn = 0.0f; ft = 0.0f; fsl = 0.0f;
+                                }
+                                else
+                                {
+                                    d1 += b[1] * (fn - old0);
+                                    d2 += b[2] * (fn - old0);
+                                    ft -= d1 * b[10];
+                                    fsl -= d2 * b[10];
+                                    const float normFt = sqrtf(ft * ft + fsl * fsl);
+                                    const float limit = mu * fn;
+                                    if (normFt > limit)
+                                    {
+                                        const float factor = limit / normFt;
+                                        ft *= factor;
+                                        fsl *= factor;
+                                    }
+                                }
+                                lT[j] = fn; lT[j + 1] = ft; lT[j + 2] = fsl;
+                                delta0 = fn - old0; delta1 = ft - old1; delta2 = fsl - old2;
+                                const float df[3] = { delta0, delta1, delta2 };
+                                float contactError = 0.0f;
+                                for (int l = 0; l < 3; ++l)
+                                {
+                                    const float e0 = b[l * 3 + 0] * df[0];
+                                    const float e1 = b[l * 3 + 1] * df[1];
+                                    const float e2 = b[l * 3 + 2] * df[2];
+                                    const float lineError = sqrtf(e0 * e0 + e1 * e1 + e2 * e2);
+                                    if (lineError > tolF) verified = false;
+                                    contactError += lineError;
+                                }
+                                errorF += contactError;
+                            }
+                            else
+                            {
+                                if (fn < 0.0f) fn = 0.0f;
+                                lT[j] = fn;
+                                delta0 = fn - old0;
+                                const float contactError = fabsf(b[0] * delta0);
+                                if (contactError > tolF) verified = false;
+                                errorF += contactError;
+                            }
+                        }
+                        delta0 = __shfl_sync(0xffffffffu, delta0, 0);
+                        if (RowsPerContact == 3)
+                        {
+                            delta1 = __shfl_sync(0xffffffffu, delta1, 0);
+                            delta2 = __shfl_sync(0xffffffffu, delta2, 0);
+                        }
+                        for (int i = lane; i < nT; i += 32)
+                        {
+                            float a = accT[i];
+                            a = fmaf(wT[j * kTileStride + i], delta0, a);
+                            if (RowsPerContact == 3)
+                            {
+                                a = fmaf(wT[(j + 1) * kTileStride + i], delta1, a);
+                                a = fmaf(wT[(j + 2) * kTileStride + i], delta2, a);
+                            }
+                            accT[i] = a;
+                        }
+                        __syncwarp();
+                    }
+                }
+                __syncthreads();
+                for (int i = tid; i < nT; i += kTiledThreads)
+                {
+                    tileDelta[i] = lT[i] - oldT[i];
+                    lf[r0 + i] = lT[i];
+                }
+            }
+            grid.sync();
+            // 3. The tile's changes into every later row's residual.
+            if (r0 + nT < rows)
+            {
+                for (int i = tid; i < nT; i += kTiledThreads) oldT[i] = tileDelta[i];
+                __syncthreads();
+                for (int r = r0 + nT + globalWarp; r < rows; r += totalWarps)
+                {
+                    const float* wr = W + static_cast<std::size_t>(r) * rows + r0;
+                    float sum = 0.0f;
+                    for (int q = lane; q < nT; q += 32) sum = fmaf(wr[q], oldT[q], sum);
+                    sum = constraintWarpSum(sum);
+                    if (lane == 0) acc[r] += sum;
+                }
+                grid.sync();
+            }
+        }
+        if (blockIdx.x == 0 && tid == 0)
+        {
+            state->iterations += 1;
+            state->error = errorF;
+            const bool done = allVerified ? verified : (static_cast<double>(errorF) < tolerance);
+            if (done) state->converged = 1;
+        }
+        grid.sync();
+    }
+    for (int k = globalThread; k < rows; k += totalThreads) lambda[k] = static_cast<double>(lf[k]);
+#endif
+}
+
+// ---- Warm start ----------------------------------------------------------------------
+// After a solve: each contact's multipliers as one world-space impulse (its normal and
+// tangent parts together), so the next step can carry it into that step's contact frame.
+__global__ void constraintContactImpulsesKernel(
+    const int contacts,
+    const int rowsPerContact,
+    const double* __restrict__ lambda,
+    const float* __restrict__ geometry,     // contacts * kContactGeometryValues: ..., n, t, s
+    float* __restrict__ impulses)           // contacts * 3
+{
+    const int stride = gridDim.x * blockDim.x;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < contacts; c += stride)
+    {
+        const float* g = geometry + static_cast<std::size_t>(c) * kContactGeometryValues;
+        const double* l = lambda + static_cast<std::size_t>(c) * rowsPerContact;
+        float3 f = mul3(make_float3(g[12], g[13], g[14]), static_cast<float>(l[0]));
+        if (rowsPerContact == 3)
+        {
+            f = add3(f, mul3(make_float3(g[15], g[16], g[17]), static_cast<float>(l[1])));
+            f = add3(f, mul3(make_float3(g[18], g[19], g[20]), static_cast<float>(l[2])));
+        }
+        impulses[3 * c + 0] = f.x;
+        impulses[3 * c + 1] = f.y;
+        impulses[3 * c + 2] = f.z;
+    }
+}
+
+// Before a solve: each contact's starting multipliers, from the previous solve's contact
+// with the same identity (body, side, anchor vertex): its impulse projected on this
+// step's normal and tangents, the normal part kept non-negative and the tangent part
+// inside the friction cone (both are what the local resolution enforces). No match: zero.
+__global__ void constraintWarmStartKernel(
+    const int contacts,
+    const int rowsPerContact,
+    const float mu,
+    const unsigned long long* __restrict__ identity,       // contacts
+    const float* __restrict__ geometry,
+    const unsigned long long* __restrict__ prevIdentity,   // prevCount, sorted
+    const int* __restrict__ prevOrder,                     // prevCount: index into prevImpulses
+    const float* __restrict__ prevImpulses,
+    const int prevCount,
+    double* __restrict__ lambda,
+    std::uint32_t* __restrict__ matched)
+{
+    const int stride = gridDim.x * blockDim.x;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < contacts; c += stride)
+    {
+        double* l = lambda + static_cast<std::size_t>(c) * rowsPerContact;
+        for (int e = 0; e < rowsPerContact; ++e) l[e] = 0.0;
+        const unsigned long long id = identity[c];
+        if (id == ~0ull) continue;
+        int lo = 0, hi = prevCount;
+        while (lo < hi)
+        {
+            const int mid = (lo + hi) >> 1;
+            if (prevIdentity[mid] < id) lo = mid + 1; else hi = mid;
+        }
+        if (lo >= prevCount || prevIdentity[lo] != id) continue;
+        const float* p = prevImpulses + 3 * static_cast<std::size_t>(prevOrder[lo]);
+        const float3 f = make_float3(p[0], p[1], p[2]);
+        const float* g = geometry + static_cast<std::size_t>(c) * kContactGeometryValues;
+        const float fn = dot3(f, make_float3(g[12], g[13], g[14]));
+        if (!(fn > 0.0f)) continue;
+        l[0] = fn;
+        if (rowsPerContact == 3)
+        {
+            float ft = dot3(f, make_float3(g[15], g[16], g[17]));
+            float fs = dot3(f, make_float3(g[18], g[19], g[20]));
+            const float norm = sqrtf(ft * ft + fs * fs);
+            if (norm > mu * fn)
+            {
+                const float factor = mu * fn / norm;
+                ft *= factor;
+                fs *= factor;
+            }
+            l[1] = ft;
+            l[2] = fs;
+        }
+        atomicAdd(matched, 1u);
+    }
+}
+
 // J^T lambda for both bodies: body 1 into a full DOF vector, body 2 into 6 values
 // (rigidRhs[6] collects the sum of the normal multipliers).
 __global__ void constraintImpulseKernel(
@@ -1158,6 +1539,19 @@ struct ConstraintWorkspace
     bool deviceCorrectionValid { false };   // deformableRhs holds the last device correction's dv
     float* hostCorrectionDevice { nullptr }; std::size_t hostCorrectionCapacity { 0 };
 
+    // Contact sides, warm start and the tiled kernel.
+    std::uint32_t* sideCounts { nullptr };           std::size_t sideCountsCapacity { 0 };
+    unsigned long long* contactIdentity { nullptr }; std::size_t contactIdentityCapacity { 0 };
+    unsigned long long* prevIdentity { nullptr };    std::size_t prevIdentityCapacity { 0 };
+    int* prevOrder { nullptr };                      std::size_t prevOrderCapacity { 0 };
+    float* prevImpulses { nullptr };                 std::size_t prevImpulsesCapacity { 0 };
+    std::uint32_t* warmMatched { nullptr };          std::size_t warmMatchedCapacity { 0 };
+    int prevCount { 0 };                              // contacts of the last solve kept for a warm start
+    bool keepAll { false };                           // this step's filter keeps every contact (no identities)
+    float* tiledLambda { nullptr };                  std::size_t tiledLambdaCapacity { 0 };
+    float* tiledAcc { nullptr };                     std::size_t tiledAccCapacity { 0 };
+    float* tiledDelta { nullptr };                   std::size_t tiledDeltaCapacity { 0 };
+
     ~ConstraintWorkspace()
     {
         if (blas) cublasDestroy(blas);
@@ -1168,7 +1562,8 @@ struct ConstraintWorkspace
             compactToGlobal, freePositions, dofMask, rowVertexCompact, rowVertexGlobal, rowDeformable, rowRigid,
             rowRigidResponse, dfree, geometry, contactVertices, contactWeights, selector, compliance, W,
             lambda, lambdaShadow, lambdaBeforeSweep, contactBlocks, solveState, deformableRhs, rigidRhs,
-            hostCorrectionDevice };
+            hostCorrectionDevice, sideCounts, contactIdentity, prevIdentity, prevOrder, prevImpulses, warmMatched,
+            tiledLambda, tiledAcc, tiledDelta };
         for (void* b : buffers)
         {
             if (b) cudaFree(b);
@@ -1565,6 +1960,7 @@ bool buildContactConstraints(
     }
     if (segments.empty())
     {
+        ws->prevCount = 0;       // a later contact starts from zero
         diagnostic.clear();      // no contacts in this collision pass
         return true;
     }
@@ -1599,6 +1995,20 @@ bool buildContactConstraints(
     launchFill(ws->flags, nd, 0);
 
     const bool keepAll = input.filter == ConstraintContactFilter::All;
+    ws->keepAll = keepAll;
+    std::uint32_t* sideCounts = nullptr;
+    if (input.countSides)
+    {
+        err = ensureDeviceBuffer(ws->sideCounts, ws->sideCountsCapacity, 4);   // 2 counts, 2 ordered separations
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Contact side counters: ") + cudaGetErrorString(err);
+            return false;
+        }
+        launchFill(ws->sideCounts, 2, 0u);
+        launchFill(reinterpret_cast<int*>(ws->sideCounts) + 2, 2, 0x7F7FFFFF);   // +FLT_MAX
+        sideCounts = ws->sideCounts;
+    }
     constexpr unsigned threads = 256;
     std::uint32_t detectedTotal = 0;
     std::uint32_t start = 0;
@@ -1664,11 +2074,22 @@ bool buildContactConstraints(
                 handle->firstIndices, handle->secondIndices, swapped, cones,
                 ws->deformableSlots, ws->rigidSlots, ws->deformableOwners, ws->rigidOwners);
         }
+        if (sideCounts != nullptr && !keepAll)
+        {
+            const float* firstPositions = static_cast<const float*>(swapped ? body.surfacePositions : input.deformableSurfacePositions);
+            const float* secondPositions = static_cast<const float*>(swapped ? input.deformableSurfacePositions : body.surfacePositions);
+            constraintRawSeparationKernel<<<blocks, threads>>>(
+                handle->contacts, handle->countDevice, handle->capacity, handle->firstIndices, handle->secondIndices,
+                firstPositions, secondPositions, swapped, input.contactDistance, cones,
+                ws->deformableSlots, ws->rigidSlots, ws->deformableOwners, ws->rigidOwners,
+                reinterpret_cast<int*>(sideCounts) + 2);
+        }
         constraintSelectContactsKernel<<<blocks, threads>>>(
             handle->contacts, handle->countDevice, handle->capacity,
             handle->firstIndices, handle->secondIndices, swapped, keepAll, cones,
             ws->deformableSlots, ws->rigidSlots, ws->deformableOwners, ws->rigidOwners,
-            ws->selected + start, ws->sortKeys + start, ws->counter);
+            static_cast<std::uint32_t>(input.contactSides), ws->selected + start, ws->sortKeys + start, ws->counter,
+            sideCounts);
 
         std::uint32_t detected = 0;
         std::uint32_t count = 0;
@@ -1688,8 +2109,20 @@ bool buildContactConstraints(
     }
     const std::uint32_t count = start;
     if (stats != nullptr) stats->detectedContacts = detectedTotal;
+    if (sideCounts != nullptr && stats != nullptr)
+    {
+        std::uint32_t sides[4] = { 0u, 0u, 0u, 0u };
+        if (cudaMemcpy(sides, sideCounts, sizeof(sides), cudaMemcpyDeviceToHost) == cudaSuccess)
+        {
+            stats->deformableAnchored = sides[0];
+            stats->rigidAnchored = sides[1];
+            stats->deformableMinSeparation = constraintFloatFromOrdered(static_cast<int>(sides[2]));
+            stats->rigidMinSeparation = constraintFloatFromOrdered(static_cast<int>(sides[3]));
+        }
+    }
     if (count == 0)
     {
+        ws->prevCount = 0;
         if (timings != nullptr) timings->buildMs = timer.finish();
         diagnostic.clear();
         return true;
@@ -1729,6 +2162,7 @@ bool buildContactConstraints(
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->geometry, ws->geometryCapacity, static_cast<std::size_t>(count) * kContactGeometryValues);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->contactVertices, ws->contactVerticesCapacity, static_cast<std::size_t>(count) * 3);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->contactWeights, ws->contactWeightsCapacity, static_cast<std::size_t>(count) * 3);
+    if (err == cudaSuccess) err = ensureDeviceBuffer(ws->contactIdentity, ws->contactIdentityCapacity, static_cast<std::size_t>(count));
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Constraint row buffers: ") + cudaGetErrorString(err);
@@ -1783,7 +2217,8 @@ bool buildContactConstraints(
             ws->rowRigid + r0 * 6, ws->rowRigidResponse + r0 * 6, ws->dfree + r0,
             ws->geometry + static_cast<std::size_t>(segment.start) * kContactGeometryValues,
             ws->contactVertices + static_cast<std::size_t>(segment.start) * 3,
-            ws->contactWeights + static_cast<std::size_t>(segment.start) * 3);
+            ws->contactWeights + static_cast<std::size_t>(segment.start) * 3,
+            segment.body, ws->contactIdentity + segment.start);
         launchFill(ws->rowBody + r0, static_cast<std::size_t>(segment.count) * rowsPerContact, segment.body);
     }
     err = cudaGetLastError();
@@ -1938,11 +2373,51 @@ void launchGaussSeidelSized(
         launchGaussSeidel<RowsPerContact, Exact, 256>(W, dfree, blocks, rows, mu, tolerance, config, sharedForce, lambda, lambdaShadow, lambdaBeforeSweep, state);
 }
 
+// The tiled kernel on every multiprocessor, as one cooperative launch running every
+// sweep. False (and nothing launched) when the device cannot run it; a failed launch
+// sets `err`.
+bool launchTiledGaussSeidel(
+    const float* W, const float* dfree, const float* blocks, int rows, const int rowsPerContact, const double mu,
+    double tolerance, const ConstraintSolveConfig& config, double* lambda, float* lf, float* acc, float* tileDelta,
+    ConstraintSolveState* state, cudaError_t& err)
+{
+    err = cudaSuccess;
+    static int cooperative = -1;
+    static int multiprocessors = 0;
+    if (cooperative < 0)
+    {
+        int device = 0;
+        cooperative = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device) == cudaSuccess)
+            cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
+        if (multiprocessors <= 0) cooperative = 0;
+    }
+    if (cooperative == 0) return false;
+    const std::size_t sharedBytes = tiledSharedBytes(rowsPerContact);
+    const void* kernel = rowsPerContact == 3 ? reinterpret_cast<const void*>(&constraintTiledGaussSeidelKernel<3>)
+                                             : reinterpret_cast<const void*>(&constraintTiledGaussSeidelKernel<1>);
+    int perMultiprocessor = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perMultiprocessor, kernel, kTiledThreads, sharedBytes) != cudaSuccess ||
+        perMultiprocessor < 1)
+        return false;
+    float muF = static_cast<float>(mu);
+    int maxIterations = config.maxIterations;
+    int allVerified = config.allVerified ? 1 : 0;
+    void* args[] = { &W, &dfree, &blocks, &rows, &muF, &tolerance, &maxIterations, &allVerified,
+                     &lambda, &lf, &acc, &tileDelta, &state };
+    err = cudaLaunchCooperativeKernel(kernel, multiprocessors * perMultiprocessor, kTiledThreads, args, sharedBytes, 0);
+    return true;
+}
+
 // lambdaShadow: `rows` floats of device memory, used only above the shared-memory limit.
+// fromInitial: start from the multipliers already in `lambda` (a warm start), else from zero.
+// tiledScratch: rows, rows and kTileRows floats for the tiled kernel (lf, acc, tileDelta); null: one block.
 bool runGaussSeidel(
     const float* W, const float* dfree, float* blocks, const int rows, const int rowsPerContact, const double mu,
     const ConstraintSolveConfig& config, double* lambda, float* lambdaShadow, double* lambdaBeforeSweep,
-    ConstraintSolveState* state, ConstraintSolveStats* stats, std::string& diagnostic)
+    ConstraintSolveState* state, ConstraintSolveStats* stats, std::string& diagnostic,
+    const bool fromInitial = false, float* const* tiledScratch = nullptr)
 {
     const double tolerance = (config.scaleTolerance && !config.allVerified) ? config.tolerance * rows : config.tolerance;
     const std::size_t sharedBytes = static_cast<std::size_t>(rows) * (sizeof(double) + sizeof(float));
@@ -1958,7 +2433,7 @@ bool runGaussSeidel(
     constraintContactBlocksKernel<<<std::max(1, std::min((contacts + 255) / 256, 1024)), 256>>>(W, rows, rowsPerContact, blocks);
     ConstraintSolveState initial { 0, 0, 0.0 };
     cudaError_t err = cudaMemcpy(state, &initial, sizeof(initial), cudaMemcpyHostToDevice);
-    if (err == cudaSuccess) err = cudaMemset(lambda, 0, sizeof(double) * rows);
+    if (err == cudaSuccess && !fromInitial) err = cudaMemset(lambda, 0, sizeof(double) * rows);
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Gauss-Seidel setup: ") + cudaGetErrorString(err);
@@ -1966,7 +2441,20 @@ bool runGaussSeidel(
     }
 
     ConstraintSolveState host {};
-    while (true)
+    bool tiled = false;
+    if (config.kernel == ConstraintSolverKernel::Tiled && tiledScratch != nullptr && !config.doubleAccumulation &&
+        config.sor == 1.0)
+    {
+        tiled = launchTiledGaussSeidel(W, dfree, blocks, rows, rowsPerContact, mu, tolerance, config, lambda,
+                                       tiledScratch[0], tiledScratch[1], tiledScratch[2], state, err);
+        if (tiled && err == cudaSuccess) err = cudaMemcpy(&host, state, sizeof(host), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Tiled Gauss-Seidel kernel: ") + cudaGetErrorString(err);
+            return false;
+        }
+    }
+    while (!tiled)
     {
         if (rowsPerContact == 3)
         {
@@ -1996,6 +2484,7 @@ bool runGaussSeidel(
         stats->error = host.error;
         stats->converged = host.converged != 0;
         stats->gpuMilliseconds = timer.finish();
+        stats->tiled = tiled;
     }
     diagnostic.clear();
     return true;
@@ -2026,15 +2515,64 @@ bool solveContactConstraints(
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->solveState, ws->solveStateCapacity, 1);
     if (err == cudaSuccess) err = ensureDeviceBuffer(ws->contactBlocks, ws->contactBlocksCapacity,
                                                      static_cast<std::size_t>(ws->contacts) * kContactBlockValues);
+    const bool tiled = config.kernel == ConstraintSolverKernel::Tiled;
+    if (err == cudaSuccess && tiled) err = ensureDeviceBuffer(ws->tiledLambda, ws->tiledLambdaCapacity, rows);
+    if (err == cudaSuccess && tiled) err = ensureDeviceBuffer(ws->tiledAcc, ws->tiledAccCapacity, rows);
+    if (err == cudaSuccess && tiled) err = ensureDeviceBuffer(ws->tiledDelta, ws->tiledDeltaCapacity, static_cast<std::size_t>(kTileRows));
+    const bool warm = config.warmStart && !ws->keepAll;
+    if (err == cudaSuccess && warm) err = ensureDeviceBuffer(ws->warmMatched, ws->warmMatchedCapacity, 1);
     if (err != cudaSuccess)
     {
         diagnostic = std::string("Solve buffers: ") + cudaGetErrorString(err);
         return false;
     }
+    const int contacts = ws->contacts;
+    const unsigned contactGrid = static_cast<unsigned>(std::max(1, std::min((contacts + 255) / 256, 1024)));
+    bool fromInitial = false;
+    std::uint32_t warmStarted = 0;
+    if (warm && ws->prevCount > 0)
+    {
+        launchFill(ws->warmMatched, 1, 0u);
+        constraintWarmStartKernel<<<contactGrid, 256>>>(
+            contacts, ws->rowsPerContact, static_cast<float>(ws->mu), ws->contactIdentity, ws->geometry,
+            ws->prevIdentity, ws->prevOrder, ws->prevImpulses, ws->prevCount, ws->lambda, ws->warmMatched);
+        err = cudaMemcpy(&warmStarted, ws->warmMatched, sizeof(warmStarted), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Warm start: ") + cudaGetErrorString(err);
+            return false;
+        }
+        fromInitial = true;
+    }
+    float* const tiledScratch[3] = { ws->tiledLambda, ws->tiledAcc, ws->tiledDelta };
     if (!runGaussSeidel(ws->W, ws->dfree, ws->contactBlocks, ws->rows, ws->rowsPerContact, ws->mu, config,
-                        ws->lambda, ws->lambdaShadow, ws->lambdaBeforeSweep, ws->solveState, stats, diagnostic))
+                        ws->lambda, ws->lambdaShadow, ws->lambdaBeforeSweep, ws->solveState, stats, diagnostic,
+                        fromInitial, tiled ? tiledScratch : nullptr))
     {
         return false;
+    }
+    if (stats != nullptr) stats->warmStarted = static_cast<int>(warmStarted);
+    ws->prevCount = 0;
+    if (warm)
+    {
+        // This solve's impulses, sorted by contact identity, for the next step.
+        err = ensureDeviceBuffer(ws->prevIdentity, ws->prevIdentityCapacity, static_cast<std::size_t>(contacts));
+        if (err == cudaSuccess) err = ensureDeviceBuffer(ws->prevOrder, ws->prevOrderCapacity, static_cast<std::size_t>(contacts));
+        if (err == cudaSuccess) err = ensureDeviceBuffer(ws->prevImpulses, ws->prevImpulsesCapacity, 3 * static_cast<std::size_t>(contacts));
+        if (err == cudaSuccess)
+        {
+            constraintContactImpulsesKernel<<<contactGrid, 256>>>(contacts, ws->rowsPerContact, ws->lambda, ws->geometry,
+                                                                  ws->prevImpulses);
+            err = cudaMemcpy(ws->prevIdentity, ws->contactIdentity, sizeof(unsigned long long) * contacts, cudaMemcpyDeviceToDevice);
+        }
+        if (err != cudaSuccess)
+        {
+            diagnostic = std::string("Warm start (keeping this solve): ") + cudaGetErrorString(err);
+            return false;
+        }
+        thrust::sequence(thrust::device, ws->prevOrder, ws->prevOrder + contacts);
+        thrust::sort_by_key(thrust::device, ws->prevIdentity, ws->prevIdentity + contacts, ws->prevOrder);
+        ws->prevCount = contacts;
     }
     ws->solved = true;
     if (timings != nullptr) timings->solveMs = timer.finish();
@@ -2307,10 +2845,16 @@ bool solveFrictionProblemOnGpu(
     const ConstraintSolveConfig& config,
     std::vector<double>& lambda,
     ConstraintSolveStats* stats,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    const std::vector<double>* initialLambda)
 {
     lambda.assign(static_cast<std::size_t>(std::max(rows, 0)), 0.0);
     if (rows <= 0) { diagnostic.clear(); return true; }
+    if (initialLambda != nullptr && initialLambda->size() != static_cast<std::size_t>(rows))
+    {
+        diagnostic = "Friction problem: the start values have the wrong size.";
+        return false;
+    }
     if ((rowsPerContact != 1 && rowsPerContact != 3) || rows % rowsPerContact != 0 ||
         W.size() != static_cast<std::size_t>(rows) * rows || dfree.size() != static_cast<std::size_t>(rows))
     {
@@ -2326,6 +2870,7 @@ bool solveFrictionProblemOnGpu(
     float* dShadow = nullptr;
     double* dBefore = nullptr;
     ConstraintSolveState* dState = nullptr;
+    float* dTiled[3] = { nullptr, nullptr, nullptr };
     cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&dW), sizeof(float) * Wf.size());
     if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dDfree), sizeof(float) * rows);
     if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dBlocks), sizeof(float) * kContactBlockValues * (rows / rowsPerContact));
@@ -2335,15 +2880,22 @@ bool solveFrictionProblemOnGpu(
     if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dState), sizeof(ConstraintSolveState));
     if (err == cudaSuccess) err = cudaMemcpy(dW, Wf.data(), sizeof(float) * Wf.size(), cudaMemcpyHostToDevice);
     if (err == cudaSuccess) err = cudaMemcpy(dDfree, dfreeF.data(), sizeof(float) * rows, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dTiled[0]), sizeof(float) * rows);
+    if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dTiled[1]), sizeof(float) * rows);
+    if (err == cudaSuccess) err = cudaMalloc(reinterpret_cast<void**>(&dTiled[2]), sizeof(float) * kTileRows);
+    if (err == cudaSuccess && initialLambda != nullptr)
+        err = cudaMemcpy(dLambda, initialLambda->data(), sizeof(double) * rows, cudaMemcpyHostToDevice);
     bool ok = err == cudaSuccess;
     if (!ok) diagnostic = std::string("Friction problem upload: ") + cudaGetErrorString(err);
-    if (ok) ok = runGaussSeidel(dW, dDfree, dBlocks, rows, rowsPerContact, mu, config, dLambda, dShadow, dBefore, dState, stats, diagnostic);
+    if (ok) ok = runGaussSeidel(dW, dDfree, dBlocks, rows, rowsPerContact, mu, config, dLambda, dShadow, dBefore, dState, stats,
+                                diagnostic, initialLambda != nullptr, dTiled);
     if (ok)
     {
         err = cudaMemcpy(lambda.data(), dLambda, sizeof(double) * rows, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) { ok = false; diagnostic = std::string("Friction problem download: ") + cudaGetErrorString(err); }
     }
     cudaFree(dW); cudaFree(dDfree); cudaFree(dBlocks); cudaFree(dLambda); cudaFree(dShadow); cudaFree(dBefore); cudaFree(dState);
+    for (float* b : dTiled) cudaFree(b);
     return ok;
 }
 

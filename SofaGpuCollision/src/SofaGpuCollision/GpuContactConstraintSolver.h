@@ -120,6 +120,11 @@ public:
     sofa::core::objectmodel::Data<std::string> d_compareFile;
     sofa::core::objectmodel::Data<std::string> d_dumpContactsFile;
     sofa::core::objectmodel::Data<bool> d_measureTimes;
+    sofa::core::objectmodel::Data<bool> d_warmStart;
+    sofa::core::objectmodel::Data<std::string> d_solverKernel;
+    sofa::core::objectmodel::Data<std::string> d_contactSides;
+    sofa::core::objectmodel::Data<int> d_verifyEvery;
+    sofa::core::objectmodel::Data<std::string> d_verifyFile;
 
     // Outputs (read-only).
     sofa::core::objectmodel::Data<int> d_currentContacts;
@@ -130,6 +135,9 @@ public:
     sofa::core::objectmodel::Data<Wrench> d_rigidContactForce;
     sofa::core::objectmodel::Data<SReal> d_stepGpuMilliseconds;
     sofa::core::objectmodel::Data<sofa::type::vector<SReal>> d_stageMilliseconds;
+    sofa::core::objectmodel::Data<int> d_warmStartedContacts;
+    sofa::core::objectmodel::Data<sofa::type::vector<int>> d_contactSideCounts;
+    sofa::core::objectmodel::Data<sofa::type::vector<SReal>> d_contactSideMinSeparation;
 
     // The two bodies.
     sofa::core::objectmodel::SingleLink<GpuContactConstraintSolver, sofa::core::behavior::MechanicalState<DeformableTypes>,
@@ -188,6 +196,8 @@ private:
     bool runCpuPipeline(const sofa::core::ConstraintParams* cParams, bool apply, bool writeRow);
     void reportFailure(const std::string& stage, const std::string& diagnostic,
                        const std::string& consequence = "the bodies keep their free motion this step");
+    // verifyEvery: checks this step's solution on the CPU, in double (verifyFile).
+    void verifySolution(double tolerance);
 
     backend::ConstraintWorkspace* m_workspace { nullptr };
     sofa::core::behavior::MechanicalState<SurfaceTypes>* m_gpuState { nullptr };   // body 1's state in GPU mode
@@ -242,7 +252,9 @@ private:
     std::unique_ptr<CpuReference> m_cpu;
     std::ofstream m_compareStream;
     std::ofstream m_dumpStream;
+    std::ofstream m_verifyStream;
     int m_contactSteps { 0 };
+    int m_solvedSteps { 0 };
     std::set<std::string> m_warnedStages;
 };
 

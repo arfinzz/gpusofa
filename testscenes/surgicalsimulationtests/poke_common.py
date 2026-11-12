@@ -305,11 +305,11 @@ class TissueMesh:
 
 
 class ProbeMesh:
-    """Closed round-tip rod in its own frame: tip at the origin, shaft along +y."""
+    """Closed round-tip rod in its own frame: tip at the origin, shaft along +y.
+    The defaults are the poke's probe; other scenes pass their own size."""
 
-    def __init__(self):
-        r, length = PROBE_RADIUS, PROBE_LENGTH
-        n, rings = PROBE_SEGMENTS, PROBE_TIP_RINGS
+    def __init__(self, radius=PROBE_RADIUS, length=PROBE_LENGTH, segments=PROBE_SEGMENTS, rings=PROBE_TIP_RINGS):
+        r, n = radius, segments
         positions = [[0.0, 0.0, 0.0]]                         # tip pole
         ring_start = []
         for ring in range(1, rings + 1):                      # round tip, up to its equator

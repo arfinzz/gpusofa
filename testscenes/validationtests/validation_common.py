@@ -532,6 +532,17 @@ CONSTRAINT_MAX_ITERATIONS = int(os.environ.get("SOFA_VALIDATION_MAX_ITERATIONS",
 # on each other; in these tests the block then drifted sideways on a level floor and fell
 # through it, and the plate pushed through the block.
 CPU_CONTACT_MODELS = os.environ.get("SOFA_VALIDATION_CPU_MODELS", "point_triangle")
+# GPU contact solver variants (GpuContactConstraintSolver), for A/B runs:
+#   SOFA_CONTACT_WARM_START=0             start each Gauss-Seidel from zero (default 1: from the previous step)
+#   SOFA_CONTACT_SOLVER_KERNEL=oneBlock   the one-block Gauss-Seidel (default tiled: the whole GPU)
+#   SOFA_CONTACT_SIDES=deformable         contacts on body 1's vertices only (default both; not safe in general)
+#   SOFA_CONTACT_VERIFY_EVERY=N           check every N-th solve on the CPU (<label>_contact_verify.csv)
+CONTACT_SOLVER_VARIANT = {
+    "warmStart": os.environ.get("SOFA_CONTACT_WARM_START", "1") == "1",
+    "solverKernel": os.environ.get("SOFA_CONTACT_SOLVER_KERNEL", "tiled"),
+    "contactSides": os.environ.get("SOFA_CONTACT_SIDES", "both"),
+    "verifyEvery": int(os.environ.get("SOFA_CONTACT_VERIFY_EVERY", "0")),
+}
 
 
 def _add_cpu_collision_models(surface, group=None):
@@ -542,13 +553,14 @@ def _add_cpu_collision_models(surface, group=None):
     surface.addObject("TriangleCollisionModel", **extra)
 
 
-def add_contact_pipeline(root, friction, bounds, cell=0.005):
+def add_contact_pipeline(root, friction, bounds, cell=0.005, max_contacts=200000):
     """The animation loop and collision pipeline for constraint contact.
     cpu: FreeMotionAnimationLoop, BlockGaussSeidelConstraintSolver, SOFA's collision
          pipeline (BruteForce + BVH + LocalMinDistance), FrictionContactConstraint.
     gpu: FreeMotionAnimationLoop with GpuContactConstraintSolver (add_gpu_contact_solver),
          GpuCollisionPipeline + GpuCollisionBroadPhase/NarrowPhase over `bounds`
-         ((xmin, ymin, zmin), (xmax, ymax, zmax)) with cells of about `cell` metres."""
+         ((xmin, ymin, zmin), (xmax, ymax, zmax)) with cells of about `cell` metres and room
+         for `max_contacts` raw contacts (before the contact solver keeps one per vertex)."""
     if SIDE == "cpu":
         root.addObject("FreeMotionAnimationLoop")
         # SOFA_VALIDATION_CPU_SOLVER: BlockGaussSeidel (default, what the GPU solver follows),
@@ -583,7 +595,7 @@ def add_contact_pipeline(root, friction, bounds, cell=0.005):
                    cacheTriangleTopology=True, copyContactsToHost=False,
                    useFeatureBasedProximity=True, useBigCellFusedGeneration=True,
                    proximityComputeBarycentrics=True, proximityKeepContactsOnDevice=True,
-                   proximityReadContactCounter=False, proximityMaxContacts=200000,
+                   proximityReadContactCounter=False, proximityMaxContacts=max_contacts,
                    minGPUPairCount=1, contactDistance=ALARM_DISTANCE,
                    gridMinX=x0, gridMaxX=x1, gridMinY=y0, gridMaxY=y1, gridMinZ=z0, gridMaxZ=z1,
                    gridResolutionX=res[0], gridResolutionY=res[1], gridResolutionZ=res[2],
@@ -654,7 +666,8 @@ def add_gpu_contact_solver(root, tissue, tissue_surface, rigid, rigid_surface, f
         compareFile=os.path.join(log_dir(), f"{label}_contact_compare.csv"),
         dumpContactsFile=(os.path.join(log_dir(), f"{label}_contacts.csv")
                           if os.environ.get("SOFA_VALIDATION_DUMP_CONTACTS", "0") == "1" else ""),
-        **extra)
+        verifyFile=os.path.join(log_dir(), f"{label}_contact_verify.csv"),
+        **CONTACT_SOLVER_VARIANT, **extra)
 
 
 class LoadRamp(Sofa.Core.Controller):
